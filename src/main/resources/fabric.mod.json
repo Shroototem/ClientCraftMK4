@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "clientcraftmk4",
+  "version": "${version}",
+  "name": "ClientCraftMK4",
+  "description": "A recipe-book-style UI that shows all craftable items recursively and auto-crafts them with one click.",
+  "authors": ["Shroototem"],
+  "contributors": ["Claude Opus 4.6"],
+  "contact": {},
+  "license": "MIT",
+  "icon": "assets/clientcraftmk4/icon.png",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "com.clientcraftmk4.ClientCraftMod"
+    ]
+  },
+  "mixins": [
+    "clientcraftmk4.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.18.4",
+    "minecraft": "1.21.10",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
