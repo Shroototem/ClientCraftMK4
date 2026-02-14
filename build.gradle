@@ -12,6 +12,7 @@ base {
 
 repositories {
     mavenCentral()
+    maven { url "https://maven.terraformersmc.com/" }
 }
 
 dependencies {
@@ -24,6 +25,9 @@ dependencies {
 
     // Fabric API
     modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+
+    // Mod Menu (optional)
+    modImplementation "com.terraformersmc:modmenu:14.0.0-beta.1"
 }
 
 processResources {
