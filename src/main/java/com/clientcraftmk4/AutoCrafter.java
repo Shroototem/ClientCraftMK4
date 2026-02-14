@@ -4,7 +4,6 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.minecraft.client.gui.screen.ingame.CraftingScreen;
 import net.minecraft.client.gui.screen.ingame.InventoryScreen;
 import net.minecraft.client.MinecraftClient;
-import net.minecraft.item.ItemStack;
 import net.minecraft.recipe.NetworkRecipeId;
 import net.minecraft.recipe.RecipeDisplayEntry;
 import net.minecraft.screen.AbstractCraftingScreenHandler;
@@ -21,24 +20,7 @@ public class AutoCrafter {
         if (craftCycles != null) return;
         if (getHandler() == null) return;
 
-        ItemStack output = RecipeResolver.resolveResult(target.display());
-        int outputCount = output.getCount();
-        int maxCraftable = RecipeResolver.countMaxRepeats(target);
-        int totalRepeats;
-
-        switch (mode) {
-            case ONCE -> totalRepeats = Math.min(1, maxCraftable);
-            case STACK -> {
-                int stackRepeats = (output.getMaxCount() + outputCount - 1) / outputCount;
-                totalRepeats = Math.min(stackRepeats, maxCraftable);
-            }
-            case ALL -> totalRepeats = maxCraftable;
-            default -> totalRepeats = 0;
-        }
-
-        if (totalRepeats <= 0) return;
-
-        List<List<NetworkRecipeId>> cycles = RecipeResolver.buildAllCraftCycles(target, totalRepeats);
+        List<List<NetworkRecipeId>> cycles = RecipeResolver.buildCraftCyclesForMode(target, mode);
         if (cycles == null || cycles.isEmpty()) return;
 
         craftCycles = cycles;
