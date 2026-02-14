@@ -7,6 +7,7 @@ import net.minecraft.client.gui.screen.recipebook.RecipeResultCollection;
 import net.minecraft.client.recipebook.ClientRecipeBook;
 import net.minecraft.client.recipebook.RecipeBookType;
 import net.minecraft.component.DataComponentTypes;
+import net.minecraft.component.type.ContainerComponent;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.recipe.NetworkRecipeId;
@@ -30,9 +31,13 @@ public class RecipeResolver {
     private static boolean recipeIndexDirty = true;
     private static int currentGridSize = 3;
     private static Map<NetworkRecipeId, Integer> craftCounts = Map.of();
+    private static Set<NetworkRecipeId> containerCraftable = Set.of();
+    private static Set<Item> containerAvailableItems = Set.of();
+    private static Map<RecipeResultCollection, Integer> collectionRanks = Map.of();
     private static Set<RecipeResultCollection> autoCraftCollections = Set.of();
 
     private static Map<Item, Integer> cachedInventory = Map.of();
+    private static Map<Item, Integer> cachedContainerInventory = Map.of();
     private static long inventorySnapshotTick = -1;
 
     private static Map<Item, String> lowerCaseNameCache = new HashMap<>();
@@ -42,10 +47,13 @@ public class RecipeResolver {
 
     public static class IngredientGrid {
         private final ItemStack[] items = new ItemStack[9];
+        private final SlotDisplay[] slots = new SlotDisplay[9];
         private final boolean[] craftable = new boolean[9];
+        private final boolean[] inContainer = new boolean[9];
 
         public ItemStack get(int index) { return items[index]; }
         public boolean hasCraftable(int index) { return craftable[index]; }
+        public boolean isInContainer(int index) { return inContainer[index]; }
     }
 
     public static IngredientGrid getActiveIngredientGrid() { return activeIngredientGrid; }
@@ -63,13 +71,26 @@ public class RecipeResolver {
         long tick = client.world.getTime();
         if (tick != inventorySnapshotTick) {
             Map<Item, Integer> snapshot = new HashMap<>();
+            Map<Item, Integer> containerSnapshot = new HashMap<>();
             var inv = client.player.getInventory();
             for (int i = 0; i < inv.size(); i++) {
                 ItemStack stack = inv.getStack(i);
-                if (!stack.isEmpty() && !stack.contains(DataComponentTypes.CUSTOM_NAME))
-                    snapshot.merge(stack.getItem(), stack.getCount(), Integer::sum);
+                if (stack.isEmpty()) continue;
+
+                if (ClientCraftConfig.searchContainers) {
+                    ContainerComponent container = stack.get(DataComponentTypes.CONTAINER);
+                    if (container != null) {
+                        for (ItemStack contained : container.iterateNonEmpty()) {
+                            containerSnapshot.merge(contained.getItem(), contained.getCount(), Integer::sum);
+                        }
+                    }
+                }
+
+                if (stack.contains(DataComponentTypes.CUSTOM_NAME)) continue;
+                snapshot.merge(stack.getItem(), stack.getCount(), Integer::sum);
             }
             cachedInventory = snapshot;
+            cachedContainerInventory = containerSnapshot;
             inventorySnapshotTick = tick;
         }
         return cachedInventory;
@@ -117,21 +138,52 @@ public class RecipeResolver {
 
         List<RecipeResultCollection> result = new ArrayList<>();
         Map<NetworkRecipeId, Integer> counts = new HashMap<>();
+        Set<NetworkRecipeId> containerSet = new HashSet<>();
+        Map<RecipeResultCollection, Integer> ranks = new IdentityHashMap<>();
+
+        Map<Item, Integer> combined = null;
+        if (ClientCraftConfig.searchContainers && !cachedContainerInventory.isEmpty()) {
+            combined = new HashMap<>(inventory);
+            for (Map.Entry<Item, Integer> e : cachedContainerInventory.entrySet()) {
+                combined.merge(e.getKey(), e.getValue(), Integer::sum);
+            }
+        }
+        Set<Item> containerItemSet = combined != null ? new HashSet<>(cachedContainerInventory.keySet()) : Set.of();
+
+        // Shared scratch maps to avoid per-recipe allocation
+        Map<Item, Integer> scratch = new HashMap<>();
+        Set<Item> scratchSet = new HashSet<>();
 
         for (RecipeResultCollection coll : allCrafting) {
             List<RecipeDisplayEntry> allEntries = new ArrayList<>();
             List<RecipeDisplayEntry> craftable = new ArrayList<>();
+            boolean hasDirect = false;
+            boolean hasContainer = false;
 
             for (RecipeDisplayEntry entry : coll.getAllRecipes()) {
                 if (!fitsInGrid(entry.display(), gridSize)) continue;
                 if (hasCircularDependency(entry)) continue;
                 allEntries.add(entry);
 
-                Map<Item, Integer> simulated = new HashMap<>(inventory);
-                if (resolve(entry, simulated, null, new HashSet<>(), 0)) {
+                scratch.clear();
+                scratch.putAll(inventory);
+                scratchSet.clear();
+                if (resolve(entry, scratch, null, scratchSet, 0)) {
                     craftable.add(entry);
-                    int repeats = estimateRepeats(entry, inventory, simulated);
+                    hasDirect = true;
+                    int repeats = countRepeats(entry, inventory);
                     counts.put(entry.id(), repeats * getOutputCount(entry.display()));
+                } else if (combined != null) {
+                    scratch.clear();
+                    scratch.putAll(combined);
+                    scratchSet.clear();
+                    if (resolve(entry, scratch, null, scratchSet, 0)) {
+                        containerSet.add(entry.id());
+                        craftable.add(entry);
+                        hasContainer = true;
+                        Item out = getOutputItem(entry.display());
+                        if (out != null) containerItemSet.add(out);
+                    }
                 }
             }
 
@@ -140,12 +192,18 @@ public class RecipeResolver {
                 RecipeResultCollectionAccessor acc = (RecipeResultCollectionAccessor) nc;
                 for (RecipeDisplayEntry e : allEntries) acc.getDisplayableRecipes().add(e.id());
                 for (RecipeDisplayEntry e : craftable) acc.getCraftableRecipes().add(e.id());
+                ranks.put(nc, hasDirect ? 0 : hasContainer ? 1 : 2);
                 result.add(nc);
             }
         }
 
         craftCounts = counts;
+        containerCraftable = containerSet;
+        collectionRanks = ranks;
         autoCraftCollections = new HashSet<>(result);
+
+        containerAvailableItems = containerItemSet;
+
         cachedResults = result;
         return result;
     }
@@ -195,6 +253,14 @@ public class RecipeResolver {
         return autoCraftCollections.contains(collection);
     }
 
+    public static boolean isContainerCraftable(NetworkRecipeId id) {
+        return containerCraftable.contains(id);
+    }
+
+    public static int getCollectionRank(RecipeResultCollection coll) {
+        return collectionRanks.getOrDefault(coll, 2);
+    }
+
     public static String getLowerCaseName(Item item) {
         return lowerCaseNameCache.computeIfAbsent(item,
                 i -> new ItemStack(i).getName().getString().toLowerCase(Locale.ROOT));
@@ -202,7 +268,6 @@ public class RecipeResolver {
 
     /**
      * Builds the ingredient grid for a recipe and stores it for the render mixin.
-     * Returns a fake RecipeResultCollection with 9 entries so vanilla sizes the widget as 3x3.
      */
     public static RecipeResultCollection buildIngredientCollection(RecipeDisplayEntry originalEntry) {
         RecipeDisplay display = originalEntry.display();
@@ -223,8 +288,12 @@ public class RecipeResolver {
         recipesByOutput = Map.of();
         recipeIndexDirty = true;
         craftCounts = Map.of();
+        containerCraftable = Set.of();
+        containerAvailableItems = Set.of();
+        collectionRanks = Map.of();
         autoCraftCollections = Set.of();
         cachedInventory = Map.of();
+        cachedContainerInventory = Map.of();
         inventorySnapshotTick = -1;
         lastCacheKey = 0;
         activeIngredientGrid = null;
@@ -253,7 +322,9 @@ public class RecipeResolver {
         if (rootOutput == null) rootOutput = outputItem;
 
         // Track changes for rollback on failure
-        List<Map.Entry<Item, Integer>> savedEntries = new ArrayList<>();
+        int savedCount = 0;
+        Item[] savedItems = null;
+        int[] savedValues = null;
         int stepsStart = stepsOut != null ? stepsOut.size() : 0;
 
         boolean success = true;
@@ -265,7 +336,10 @@ public class RecipeResolver {
 
             int have = available.getOrDefault(item, 0);
             if (have >= 1) {
-                savedEntries.add(Map.entry(item, have));
+                if (savedItems == null) { savedItems = new Item[9]; savedValues = new int[9]; }
+                savedItems[savedCount] = item;
+                savedValues[savedCount] = have;
+                savedCount++;
                 available.put(item, have - 1);
                 continue;
             }
@@ -277,9 +351,8 @@ public class RecipeResolver {
         }
 
         if (!success) {
-            // Rollback direct consumption changes
-            for (Map.Entry<Item, Integer> saved : savedEntries) {
-                available.put(saved.getKey(), saved.getValue());
+            for (int i = 0; i < savedCount; i++) {
+                available.put(savedItems[i], savedValues[i]);
             }
             if (stepsOut != null) {
                 while (stepsOut.size() > stepsStart) stepsOut.removeLast();
@@ -296,7 +369,10 @@ public class RecipeResolver {
     private static boolean trySubCraft(
             Item item, Map<Item, Integer> working, List<NetworkRecipeId> stepsOut,
             Set<Item> inProgress, int depth, Item rootOutput) {
-        for (RecipeDisplayEntry sub : recipesByOutput.getOrDefault(item, List.of())) {
+        List<RecipeDisplayEntry> subs = recipesByOutput.get(item);
+        if (subs == null) return false;
+        for (int i = 0, len = subs.size(); i < len; i++) {
+            RecipeDisplayEntry sub = subs.get(i);
             if (!fitsInGrid(sub.display(), currentGridSize)) continue;
             int subOutput = getOutputCount(sub.display());
             if (subOutput <= 0) continue;
@@ -316,21 +392,16 @@ public class RecipeResolver {
         return false;
     }
 
-    // --- Repeat estimation ---
+    // --- Repeat counting ---
 
-    /**
-     * Estimates max repeats from the net consumption of a single resolve pass.
-     * Uses the delta between the original inventory and post-resolve inventory.
-     */
-    private static int estimateRepeats(RecipeDisplayEntry target, Map<Item, Integer> original, Map<Item, Integer> afterOne) {
-        int maxByMath = MAX_REPEATS;
-        for (Map.Entry<Item, Integer> e : original.entrySet()) {
-            int consumed = e.getValue() - afterOne.getOrDefault(e.getKey(), 0);
-            if (consumed > 0) {
-                maxByMath = Math.min(maxByMath, e.getValue() / consumed);
-            }
+    private static int countRepeats(RecipeDisplayEntry target, Map<Item, Integer> inventory) {
+        Map<Item, Integer> sim = new HashMap<>(inventory);
+        int count = 0;
+        while (count < MAX_REPEATS) {
+            if (!resolve(target, sim, null, new HashSet<>(), 0)) break;
+            count++;
         }
-        return Math.max(1, maxByMath);
+        return count;
     }
 
     // --- Circular dependency detection ---
@@ -371,9 +442,10 @@ public class RecipeResolver {
         if (display instanceof ShapedCraftingRecipeDisplay s) {
             return s.width() <= gridSize && s.height() <= gridSize;
         } else if (display instanceof ShapelessCraftingRecipeDisplay s) {
+            List<SlotDisplay> ingredients = s.ingredients();
             int count = 0;
-            for (SlotDisplay d : s.ingredients()) {
-                if (!(d instanceof SlotDisplay.EmptySlotDisplay)) count++;
+            for (int i = 0, len = ingredients.size(); i < len; i++) {
+                if (!(ingredients.get(i) instanceof SlotDisplay.EmptySlotDisplay)) count++;
             }
             return count <= gridSize * gridSize;
         }
@@ -385,7 +457,10 @@ public class RecipeResolver {
     }
 
     private static int getOutputCount(RecipeDisplay display) {
-        ItemStack out = resolveSlot(display.result());
+        SlotDisplay result = display.result();
+        if (result instanceof SlotDisplay.StackSlotDisplay d) return d.stack().getCount();
+        if (result instanceof SlotDisplay.ItemSlotDisplay) return 1;
+        ItemStack out = resolveSlot(result);
         return (out != null && !out.isEmpty()) ? out.getCount() : 0;
     }
 
@@ -437,7 +512,6 @@ public class RecipeResolver {
     private static ItemStack resolveSlot(SlotDisplay display, Map<Item, Integer> inventory) {
         if (display instanceof SlotDisplay.ItemSlotDisplay d) return new ItemStack(d.item());
         if (display instanceof SlotDisplay.StackSlotDisplay d) {
-            // Strip custom names/NBT - return clean ItemStack
             return new ItemStack(d.stack().getItem(), d.stack().getCount());
         }
         if (display instanceof SlotDisplay.TagSlotDisplay d) {
@@ -468,18 +542,24 @@ public class RecipeResolver {
                 for (int col = 0; col < w; col++) {
                     int srcIdx = row * w + col;
                     if (srcIdx < slots.size()) {
-                        ItemStack resolved = resolveSlotStack(slots.get(srcIdx));
-                        if (resolved != null) grid.items[row * 3 + col] = resolved;
+                        SlotDisplay slot = slots.get(srcIdx);
+                        ItemStack resolved = resolveSlotStack(slot);
+                        int gridIdx = row * 3 + col;
+                        if (resolved != null) {
+                            grid.items[gridIdx] = resolved;
+                            grid.slots[gridIdx] = slot;
+                        }
                     }
                 }
             }
         } else {
             int idx = 0;
-            for (SlotDisplay slot : slots) {
-                if (idx >= 9) break;
+            for (int i = 0, len = slots.size(); i < len && idx < 9; i++) {
+                SlotDisplay slot = slots.get(i);
                 ItemStack resolved = resolveSlotStack(slot);
                 if (resolved != null) {
                     grid.items[idx] = resolved;
+                    grid.slots[idx] = slot;
                     idx++;
                 } else if (!(slot instanceof SlotDisplay.EmptySlotDisplay)) {
                     idx++;
@@ -497,6 +577,8 @@ public class RecipeResolver {
     private static void computeGridCraftability(IngredientGrid grid) {
         Map<Item, Integer> remaining = new HashMap<>(getOrSnapshotInventory());
         ensureIndex();
+        boolean hasContainer = !containerAvailableItems.isEmpty();
+
         for (int i = 0; i < 9; i++) {
             ItemStack stack = grid.items[i];
             if (stack.isEmpty()) {
@@ -508,10 +590,42 @@ public class RecipeResolver {
             if (have >= 1) {
                 remaining.put(item, have - 1);
                 grid.craftable[i] = true;
+            } else if (hasContainer) {
+                Item found = findInSet(grid.slots[i], item, containerAvailableItems);
+                if (found != null) {
+                    grid.inContainer[i] = true;
+                    if (found != item) grid.items[i] = new ItemStack(found);
+                } else {
+                    grid.craftable[i] = recipesByOutput.containsKey(item);
+                }
             } else {
                 grid.craftable[i] = recipesByOutput.containsKey(item);
             }
         }
+    }
+
+    private static Item findInSet(SlotDisplay slot, Item resolved, Set<Item> items) {
+        if (items.contains(resolved)) return resolved;
+        // For tag slots, check all variants in the tag
+        if (slot instanceof SlotDisplay.TagSlotDisplay tag) {
+            MinecraftClient client = MinecraftClient.getInstance();
+            if (client.world == null) return null;
+            var regOpt = client.world.getRegistryManager().getOptional(RegistryKeys.ITEM);
+            if (regOpt.isEmpty()) return null;
+            var entriesOpt = regOpt.get().getOptional(tag.tag());
+            if (entriesOpt.isEmpty()) return null;
+            for (var entry : entriesOpt.get()) {
+                if (items.contains(entry.value())) return entry.value();
+            }
+        } else if (slot instanceof SlotDisplay.CompositeSlotDisplay comp) {
+            for (SlotDisplay sub : comp.contents()) {
+                Item item = findInSet(sub, resolved, items);
+                if (item != null) return item;
+            }
+        } else if (slot instanceof SlotDisplay.WithRemainderSlotDisplay rem) {
+            return findInSet(rem.input(), resolved, items);
+        }
+        return null;
     }
 
     private static RecipeResultCollection buildFakeCollection(IngredientGrid grid, RecipeDisplayEntry originalEntry) {

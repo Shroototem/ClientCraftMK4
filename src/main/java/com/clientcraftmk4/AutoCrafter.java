@@ -15,6 +15,8 @@ public class AutoCrafter {
     public enum Mode { ONCE, STACK, ALL }
 
     private static List<List<NetworkRecipeId>> craftCycles;
+    private static int cycleIndex;
+    private static int tickCounter;
 
     public static void execute(RecipeDisplayEntry target, Mode mode) {
         if (craftCycles != null) return;
@@ -24,6 +26,8 @@ public class AutoCrafter {
         if (cycles == null || cycles.isEmpty()) return;
 
         craftCycles = cycles;
+        cycleIndex = 0;
+        tickCounter = 0;
     }
 
     public static void registerTickHandler() {
@@ -33,14 +37,29 @@ public class AutoCrafter {
             AbstractCraftingScreenHandler handler = getHandler();
             if (handler == null || client.interactionManager == null) { craftCycles = null; return; }
 
-            for (List<NetworkRecipeId> cycle : craftCycles) {
-                for (NetworkRecipeId step : cycle) {
-                    client.interactionManager.clickRecipe(handler.syncId, step, false);
-                    client.interactionManager.clickSlot(handler.syncId, 0, 0, SlotActionType.QUICK_MOVE, client.player);
+            int delay = ClientCraftConfig.delayTicks;
+            if (delay <= 0) {
+                for (List<NetworkRecipeId> cycle : craftCycles) {
+                    executeCycle(client, handler, cycle);
+                }
+                craftCycles = null;
+            } else {
+                if (tickCounter++ >= delay) {
+                    tickCounter = 0;
+                    if (cycleIndex < craftCycles.size()) {
+                        executeCycle(client, handler, craftCycles.get(cycleIndex++));
+                    }
+                    if (cycleIndex >= craftCycles.size()) craftCycles = null;
                 }
             }
-            craftCycles = null;
         });
+    }
+
+    private static void executeCycle(MinecraftClient client, AbstractCraftingScreenHandler handler, List<NetworkRecipeId> cycle) {
+        for (NetworkRecipeId step : cycle) {
+            client.interactionManager.clickRecipe(handler.syncId, step, false);
+            client.interactionManager.clickSlot(handler.syncId, 0, 0, SlotActionType.QUICK_MOVE, client.player);
+        }
     }
 
     private static AbstractCraftingScreenHandler getHandler() {

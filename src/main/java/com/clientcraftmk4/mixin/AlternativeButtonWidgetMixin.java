@@ -63,8 +63,9 @@ public class AlternativeButtonWidgetMixin {
         int gridW = cols * tileSize;
         int gridH = rows * tileSize;
 
-        int haveColor = 0xFF8B8B8B;    // Light grey — player has this item
-        int missingColor = 0xFF555555;  // Dark grey — player doesn't have it
+        int haveColor = 0xFF8B8B8B;       // Light grey — player has this item
+        int containerColor = 0xFF7B2FBE;  // Purple — item is in a carried container
+        int missingColor = 0xFF555555;     // Dark grey — player doesn't have it
 
         // Fill each tile with the appropriate shade
         for (int row = 0; row < 3; row++) {
@@ -72,7 +73,10 @@ public class AlternativeButtonWidgetMixin {
                 int idx = row * 3 + col;
                 int tileX = gridX + col * tileSize;
                 int tileY = gridY + row * tileSize;
-                int color = grid.hasCraftable(idx) ? haveColor : missingColor;
+                int color;
+                if (grid.hasCraftable(idx)) color = haveColor;
+                else if (grid.isInContainer(idx)) color = containerColor;
+                else color = missingColor;
                 context.fill(tileX, tileY, tileX + tileSize, tileY + tileSize, color);
             }
         }
