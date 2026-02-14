@@ -9,6 +9,7 @@ import net.minecraft.client.gui.screen.recipebook.RecipeBookWidget;
 import net.minecraft.client.gui.screen.recipebook.RecipeGroupButtonWidget;
 import net.minecraft.client.gui.screen.recipebook.RecipeResultCollection;
 import net.minecraft.client.gui.widget.TextFieldWidget;
+import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.recipe.NetworkRecipeId;
 import net.minecraft.recipe.RecipeDisplayEntry;
@@ -41,7 +42,6 @@ public class RecipeBookWidgetMixin {
     private void clientcraft$onSelect(RecipeResultCollection results, NetworkRecipeId recipeId, boolean craftAll, CallbackInfoReturnable<Boolean> cir) {
         if (currentTab == null || !(currentTab.getCategory() instanceof ClientCraftTab)) return;
 
-        // Ignore clicks on our fake ingredient tiles (negative IDs)
         if (recipeId.index() < 0) {
             cir.setReturnValue(false);
             return;
@@ -52,10 +52,6 @@ public class RecipeBookWidgetMixin {
             if (entry.id().equals(recipeId)) { target = entry; break; }
         }
         if (target == null) return;
-
-        // Verify the recipe is craftable before starting
-        List<NetworkRecipeId> sequence = RecipeResolver.buildCraftSequence(target);
-        if (sequence == null || sequence.isEmpty()) return;
 
         AutoCrafter.Mode mode;
         long window = MinecraftClient.getInstance().getWindow().getHandle();
@@ -73,11 +69,6 @@ public class RecipeBookWidgetMixin {
         cir.setReturnValue(true);
     }
 
-    /**
-     * Override search filtering for the ClientCraft tab.
-     * Vanilla's search uses a search manager index that doesn't contain our custom collections,
-     * so we filter by matching the search text against recipe output item names ourselves.
-     */
     @Inject(method = "refreshResults", at = @At("HEAD"), cancellable = true)
     private void clientcraft$refreshResults(boolean resetCurrentPage, boolean filteringCraftable, CallbackInfo ci) {
         if (currentTab == null || !(currentTab.getCategory() instanceof ClientCraftTab)) return;
@@ -90,14 +81,13 @@ public class RecipeBookWidgetMixin {
         List<RecipeResultCollection> filtered = new ArrayList<>(list);
         filtered.removeIf(coll -> !coll.hasDisplayableRecipes());
 
-        // Apply our own search filtering
         String query = searchField != null ? searchField.getText().toLowerCase(Locale.ROOT) : "";
         if (!query.isEmpty()) {
             filtered.removeIf(coll -> {
                 for (RecipeDisplayEntry entry : coll.getAllRecipes()) {
                     ItemStack result = RecipeResolver.resolveResult(entry.display());
                     if (!result.isEmpty()) {
-                        String name = result.getName().getString().toLowerCase(Locale.ROOT);
+                        String name = RecipeResolver.getLowerCaseName(result.getItem());
                         if (name.contains(query)) return false;
                     }
                 }
