@@ -30,10 +30,17 @@ public abstract class AnimatedResultButtonMixin {
     private void clientcraft$renderCraftCount(DrawContext context, int mouseX, int mouseY, float deltaTicks, CallbackInfo ci) {
         if (!RecipeResolver.isAutoCraftCollection(getResultCollection())) return;
 
+        AnimatedResultButton self = (AnimatedResultButton) (Object) this;
+
+        if (RecipeResolver.isContainerCraftable(getCurrentId())) {
+            int x = self.getX();
+            int y = self.getY();
+            context.fill(x, y, x + self.getWidth(), y + self.getHeight(), 0x807B2FBE);
+        }
+
         int count = RecipeResolver.getCraftCount(getCurrentId());
         if (count <= 0) return;
 
-        AnimatedResultButton self = (AnimatedResultButton) (Object) this;
         TextRenderer textRenderer = MinecraftClient.getInstance().textRenderer;
         context.drawStackOverlay(textRenderer, getDisplayStack(), self.getX() + 4, self.getY() + 4, String.valueOf(count));
     }

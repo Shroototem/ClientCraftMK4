@@ -9,7 +9,6 @@ import net.minecraft.client.gui.screen.recipebook.RecipeBookWidget;
 import net.minecraft.client.gui.screen.recipebook.RecipeGroupButtonWidget;
 import net.minecraft.client.gui.screen.recipebook.RecipeResultCollection;
 import net.minecraft.client.gui.widget.TextFieldWidget;
-import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.recipe.NetworkRecipeId;
 import net.minecraft.recipe.RecipeDisplayEntry;
@@ -22,6 +21,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 
@@ -96,8 +96,16 @@ public class RecipeBookWidgetMixin {
         }
 
         if (filteringCraftable) {
-            filtered.removeIf(coll -> !coll.hasCraftableRecipes());
+            filtered.removeIf(coll -> {
+                if (coll.hasCraftableRecipes()) return false;
+                for (RecipeDisplayEntry entry : coll.getAllRecipes()) {
+                    if (RecipeResolver.isContainerCraftable(entry.id())) return false;
+                }
+                return true;
+            });
         }
+
+        filtered.sort(Comparator.comparingInt(RecipeResolver::getCollectionRank));
 
         recipesArea.setResults(filtered, resetCurrentPage, filteringCraftable);
         ci.cancel();

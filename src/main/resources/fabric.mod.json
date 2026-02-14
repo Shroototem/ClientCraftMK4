@@ -13,6 +13,9 @@
   "entrypoints": {
     "client": [
       "com.clientcraftmk4.ClientCraftMod"
+    ],
+    "modmenu": [
+      "com.clientcraftmk4.ClientCraftModMenuIntegration"
     ]
   },
   "mixins": [
@@ -23,5 +26,8 @@
     "minecraft": "1.21.10",
     "java": ">=21",
     "fabric-api": "*"
+  },
+  "suggests": {
+    "modmenu": "*"
   }
 }
