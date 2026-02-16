@@ -15,6 +15,7 @@ import net.minecraft.recipe.RecipeDisplayEntry;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
@@ -37,6 +38,9 @@ public class RecipeBookWidgetMixin {
     @Shadow
     @Final
     private RecipeBookResults recipesArea;
+
+    @Unique
+    private boolean clientcraft$hasAutoSwitched = false;
 
     @Inject(method = "select", at = @At("HEAD"), cancellable = true)
     private void clientcraft$onSelect(RecipeResultCollection results, NetworkRecipeId recipeId, boolean craftAll, CallbackInfoReturnable<Boolean> cir) {
@@ -65,7 +69,27 @@ public class RecipeBookWidgetMixin {
 
     @Inject(method = "refreshResults", at = @At("HEAD"), cancellable = true)
     private void clientcraft$refreshResults(boolean resetCurrentPage, boolean filteringCraftable, CallbackInfo ci) {
-        if (currentTab == null || !(currentTab.getCategory() instanceof ClientCraftTab)) return;
+        // Auto-switch to ClientCraft tab once per screen open if it was the last used tab
+        if (!clientcraft$hasAutoSwitched && RecipeResolver.lastTabWasClientCraft
+                && currentTab != null && !(currentTab.getCategory() instanceof ClientCraftTab)) {
+            clientcraft$hasAutoSwitched = true;
+            List<RecipeGroupButtonWidget> tabs = ((RecipeBookWidgetAccessor) this).getTabButtons();
+            for (RecipeGroupButtonWidget tab : tabs) {
+                if (tab.getCategory() instanceof ClientCraftTab) {
+                    currentTab.setToggled(false);
+                    currentTab = tab;
+                    currentTab.setToggled(true);
+                    break;
+                }
+            }
+        }
+
+        if (currentTab == null || !(currentTab.getCategory() instanceof ClientCraftTab)) {
+            RecipeResolver.lastTabWasClientCraft = false;
+            return;
+        }
+
+        RecipeResolver.lastTabWasClientCraft = true;
 
         // Register callback so background thread can refresh UI when done
         final boolean fc = filteringCraftable;
