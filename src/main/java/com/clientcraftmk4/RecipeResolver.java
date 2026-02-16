@@ -17,10 +17,15 @@ import net.minecraft.recipe.display.ShapedCraftingRecipeDisplay;
 import net.minecraft.recipe.display.ShapelessCraftingRecipeDisplay;
 import net.minecraft.recipe.display.SlotDisplay;
 import net.minecraft.registry.RegistryKeys;
+import net.minecraft.registry.tag.TagKey;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.*;
 
 public class RecipeResolver {
+    private static final Logger LOG = LoggerFactory.getLogger("ClientCraftMK4");
     private static final int MAX_DEPTH = 10;
     private static final int MAX_REPEATS = 999;
 
@@ -42,6 +47,18 @@ public class RecipeResolver {
 
     private static Map<Item, String> lowerCaseNameCache = new HashMap<>();
     private static IngredientGrid activeIngredientGrid = null;
+
+    // --- Tag cache ---
+    private static Set<TagKey<Item>> knownTags = new HashSet<>();
+    private static Map<Item, Set<TagKey<Item>>> itemToTags = new HashMap<>();
+    private static Set<Item> tagComputedItems = new HashSet<>();
+    private static Map<TagKey<Item>, Set<Item>> inventoryTagIndex = new HashMap<>();
+    private static Map<TagKey<Item>, Set<Item>> containerTagIndex = new HashMap<>();
+    private static Map<TagKey<Item>, List<Item>> tagMembersCache = new HashMap<>();
+    private static Map<TagKey<Item>, Item> tagFallbackItem = new HashMap<>();
+    private static Map<TagKey<Item>, List<Item>> craftableTagIndex = new HashMap<>();
+    private static Set<Item> lastInventoryKeySet = Set.of();
+    private static Set<Item> lastContainerKeySet = Set.of();
 
     // --- IngredientGrid ---
 
@@ -91,6 +108,7 @@ public class RecipeResolver {
             }
             cachedInventory = snapshot;
             cachedContainerInventory = containerSnapshot;
+            rebuildInventoryTagIndex();
             inventorySnapshotTick = tick;
         }
         return cachedInventory;
@@ -101,14 +119,18 @@ public class RecipeResolver {
         MinecraftClient client = MinecraftClient.getInstance();
         if (client.player == null) return;
         Map<Item, List<RecipeDisplayEntry>> index = new HashMap<>();
+        knownTags.clear();
         for (RecipeResultCollection coll : client.player.getRecipeBook().getResultsForCategory(RecipeBookType.CRAFTING)) {
             for (RecipeDisplayEntry entry : coll.getAllRecipes()) {
                 Item out = getOutputItem(entry.display());
                 if (out != null) index.computeIfAbsent(out, k -> new ArrayList<>()).add(entry);
+                List<SlotDisplay> slots = getSlots(entry.display());
+                if (slots != null) for (SlotDisplay slot : slots) collectTags(slot);
             }
         }
         recipesByOutput = index;
         recipeIndexDirty = false;
+        for (Item item : index.keySet()) computeTagsForItem(item);
     }
 
     private static void prepareContext() {
@@ -121,6 +143,150 @@ public class RecipeResolver {
         Map<Item, Integer> m = new HashMap<>(a);
         b.forEach((k, v) -> m.merge(k, v, Integer::sum));
         return m;
+    }
+
+    // --- Tag cache ---
+
+    private static void collectTags(SlotDisplay slot) {
+        if (slot instanceof SlotDisplay.TagSlotDisplay d) knownTags.add(d.tag());
+        else if (slot instanceof SlotDisplay.CompositeSlotDisplay d) {
+            for (SlotDisplay sub : d.contents()) collectTags(sub);
+        } else if (slot instanceof SlotDisplay.WithRemainderSlotDisplay d) collectTags(d.input());
+    }
+
+    private static Set<TagKey<Item>> computeTagsForItem(Item item) {
+        Set<TagKey<Item>> existing = itemToTags.get(item);
+        if (existing != null) return existing;
+        if (tagComputedItems.contains(item)) return Set.of();
+
+        Set<TagKey<Item>> tags = new HashSet<>();
+        ItemStack stack = new ItemStack(item);
+        for (TagKey<Item> tag : knownTags) {
+            if (stack.isIn(tag)) tags.add(tag);
+        }
+        tagComputedItems.add(item);
+        if (!tags.isEmpty()) itemToTags.put(item, tags);
+        return tags;
+    }
+
+    private static void rebuildInventoryTagIndex() {
+        Set<Item> currentInvKeys = cachedInventory.keySet();
+        Set<Item> currentContKeys = cachedContainerInventory.keySet();
+        if (currentInvKeys.equals(lastInventoryKeySet) && currentContKeys.equals(lastContainerKeySet)) return;
+
+        inventoryTagIndex.clear();
+        for (Item item : currentInvKeys) {
+            for (TagKey<Item> tag : computeTagsForItem(item)) {
+                inventoryTagIndex.computeIfAbsent(tag, k -> new HashSet<>()).add(item);
+            }
+        }
+
+        containerTagIndex.clear();
+        for (Item item : currentContKeys) {
+            for (TagKey<Item> tag : computeTagsForItem(item)) {
+                containerTagIndex.computeIfAbsent(tag, k -> new HashSet<>()).add(item);
+            }
+        }
+
+        lastInventoryKeySet = new HashSet<>(currentInvKeys);
+        lastContainerKeySet = new HashSet<>(currentContKeys);
+
+        LOG.info("[CC] inventoryTagIndex rebuilt: {} tags, inv items: {}", inventoryTagIndex.size(),
+                currentInvKeys.stream().map(i -> net.minecraft.registry.Registries.ITEM.getId(i).getPath()).toList());
+
+        // Build craftableTagIndex: tag → recipe output items matching that tag
+        // Items whose direct recipe inputs are in inventory/inventoryTagIndex sort first
+        craftableTagIndex.clear();
+        for (TagKey<Item> tag : knownTags) {
+            List<Item> hasInputs = null;
+            List<Item> noInputs = null;
+            for (Item item : recipesByOutput.keySet()) {
+                if (!computeTagsForItem(item).contains(tag)) continue;
+                if (hasDirectInputs(item)) {
+                    if (hasInputs == null) hasInputs = new ArrayList<>();
+                    hasInputs.add(item);
+                } else {
+                    if (noInputs == null) noInputs = new ArrayList<>();
+                    noInputs.add(item);
+                }
+            }
+            if (hasInputs != null || noInputs != null) {
+                List<Item> combined = new ArrayList<>();
+                if (hasInputs != null) combined.addAll(hasInputs);
+                if (noInputs != null) combined.addAll(noInputs);
+                craftableTagIndex.put(tag, combined);
+            }
+        }
+
+        LOG.info("[CC] craftableTagIndex rebuilt: {} tags", craftableTagIndex.size());
+        for (var e : craftableTagIndex.entrySet()) {
+            String tagName = e.getKey().id().toString();
+            if (tagName.contains("plank") || tagName.contains("chest") || tagName.contains("trap") || tagName.contains("ender")) {
+                LOG.info("[CC]   {} -> {}", tagName,
+                        e.getValue().stream().limit(5).map(i -> net.minecraft.registry.Registries.ITEM.getId(i).getPath()).toList());
+            }
+        }
+    }
+
+    private static List<Item> getOrComputeTagMembers(TagKey<Item> tag) {
+        List<Item> cached = tagMembersCache.get(tag);
+        if (cached != null) return cached;
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.world == null) return null;
+        var regOpt = client.world.getRegistryManager().getOptional(RegistryKeys.ITEM);
+        if (regOpt.isEmpty()) return null;
+        var entriesOpt = regOpt.get().getOptional(tag);
+        if (entriesOpt.isEmpty()) return null;
+        List<Item> items = new ArrayList<>();
+        for (var entry : entriesOpt.get()) items.add(entry.value());
+        tagMembersCache.put(tag, items);
+        return items;
+    }
+
+    private static boolean hasDirectInputs(Item item) {
+        List<RecipeDisplayEntry> recipes = recipesByOutput.get(item);
+        if (recipes == null) return false;
+        outer: for (RecipeDisplayEntry entry : recipes) {
+            List<SlotDisplay> slots = getSlots(entry.display());
+            if (slots == null) continue;
+            for (SlotDisplay slot : slots) {
+                if (slot instanceof SlotDisplay.EmptySlotDisplay) continue;
+                if (slot instanceof SlotDisplay.TagSlotDisplay t) {
+                    if (inventoryTagIndex.containsKey(t.tag())) continue;
+                    continue outer;
+                }
+                if (slot instanceof SlotDisplay.CompositeSlotDisplay d) {
+                    boolean found = false;
+                    for (SlotDisplay sub : d.contents()) {
+                        ItemStack r = resolveSlot(sub, cachedInventory);
+                        if (!r.isEmpty() && cachedInventory.getOrDefault(r.getItem(), 0) > 0) { found = true; break; }
+                    }
+                    if (found) continue;
+                    continue outer;
+                }
+                if (slot instanceof SlotDisplay.WithRemainderSlotDisplay d) {
+                    SlotDisplay inner = d.input();
+                    if (inner instanceof SlotDisplay.TagSlotDisplay t) {
+                        if (inventoryTagIndex.containsKey(t.tag())) continue;
+                        continue outer;
+                    }
+                }
+                ItemStack r = resolveSlot(slot, cachedInventory);
+                if (!r.isEmpty() && cachedInventory.getOrDefault(r.getItem(), 0) > 0) continue;
+                continue outer;
+            }
+            return true; // all slots satisfied
+        }
+        return false;
+    }
+
+    private static ItemStack getAnyTagMember(TagKey<Item> tag) {
+        Item cached = tagFallbackItem.get(tag);
+        if (cached != null) return new ItemStack(cached);
+        List<Item> members = getOrComputeTagMembers(tag);
+        if (members == null || members.isEmpty()) return ItemStack.EMPTY;
+        tagFallbackItem.put(tag, members.getFirst());
+        return new ItemStack(members.getFirst());
     }
 
     // --- Public API ---
@@ -255,6 +421,7 @@ public class RecipeResolver {
     }
 
     public static RecipeResultCollection buildIngredientCollection(RecipeDisplayEntry originalEntry) {
+        prepareContext();
         RecipeDisplay display = originalEntry.display();
         List<SlotDisplay> slots = getSlots(display);
         if (slots == null || slots.isEmpty()) return null;
@@ -283,6 +450,16 @@ public class RecipeResolver {
         lastCacheKey = 0;
         activeIngredientGrid = null;
         lowerCaseNameCache.clear();
+        knownTags.clear();
+        itemToTags.clear();
+        tagComputedItems.clear();
+        inventoryTagIndex.clear();
+        containerTagIndex.clear();
+        tagMembersCache.clear();
+        tagFallbackItem.clear();
+        craftableTagIndex.clear();
+        lastInventoryKeySet = Set.of();
+        lastContainerKeySet = Set.of();
     }
 
     // --- Resolution engine ---
@@ -303,24 +480,35 @@ public class RecipeResolver {
         Map<Item, Integer> snapshot = new HashMap<>(available);
         int stepsStart = stepsOut != null ? stepsOut.size() : 0;
 
+        boolean debug = depth == 0 && outputItem != null
+                && net.minecraft.registry.Registries.ITEM.getId(outputItem).getPath().contains("inventory_interface");
+
         boolean success = true;
         for (SlotDisplay slot : slots) {
             if (slot instanceof SlotDisplay.EmptySlotDisplay) continue;
 
             ItemStack resolved = resolveSlot(slot, available);
-            if (resolved.isEmpty()) { success = false; break; }
+            if (resolved.isEmpty()) {
+                if (debug) LOG.info("[CC] FAIL: resolveSlot returned EMPTY for slot {}", slot);
+                success = false; break;
+            }
             Item item = resolved.getItem();
 
             int have = available.getOrDefault(item, 0);
             if (have >= 1) {
                 available.put(item, have - 1);
+                if (debug) LOG.info("[CC] OK: {} (have {})", net.minecraft.registry.Registries.ITEM.getId(item), have);
                 continue;
             }
 
-            if (!trySubCraft(item, available, stepsOut, inProgress, depth, rootOutput)) {
+            if (debug) LOG.info("[CC] NEED subcraft: {} (slot: {})", net.minecraft.registry.Registries.ITEM.getId(item), slot.getClass().getSimpleName());
+            if (!trySubCraft(item, available, stepsOut, inProgress, depth, rootOutput)
+                    && !(depth <= 1 && tryTagFallback(slot, item, available, stepsOut, inProgress, depth, rootOutput))) {
+                if (debug) LOG.info("[CC] FAIL: subcraft failed for {}", net.minecraft.registry.Registries.ITEM.getId(item));
                 success = false;
                 break;
             }
+            if (debug) LOG.info("[CC] OK: subcrafted {}", net.minecraft.registry.Registries.ITEM.getId(item));
         }
 
         if (!success) {
@@ -334,6 +522,48 @@ public class RecipeResolver {
         if (stepsOut != null) stepsOut.add(entry.id());
         if (outputItem != null) inProgress.remove(outputItem);
         return true;
+    }
+
+    private static boolean tryTagFallback(
+            SlotDisplay slot, Item alreadyTried, Map<Item, Integer> working,
+            List<NetworkRecipeId> stepsOut, Set<Item> inProgress, int depth, Item rootOutput) {
+        // Unwrap remainder displays
+        if (slot instanceof SlotDisplay.WithRemainderSlotDisplay d)
+            return tryTagFallback(d.input(), alreadyTried, working, stepsOut, inProgress, depth, rootOutput);
+
+        if (slot instanceof SlotDisplay.TagSlotDisplay d) {
+            TagKey<Item> tag = d.tag();
+            // First: check working map for items already available that match this tag
+            for (Map.Entry<Item, Integer> e : working.entrySet()) {
+                if (e.getKey().equals(alreadyTried)) continue;
+                if (e.getValue() >= 1 && computeTagsForItem(e.getKey()).contains(tag)) {
+                    working.put(e.getKey(), e.getValue() - 1);
+                    return true;
+                }
+            }
+            // Second: try sub-crafting from pre-computed list
+            List<Item> craftable = craftableTagIndex.get(tag);
+            if (craftable != null) {
+                for (Item alt : craftable) {
+                    if (alt.equals(alreadyTried)) continue;
+                    if (trySubCraft(alt, working, stepsOut, inProgress, depth, rootOutput)) return true;
+                }
+            }
+            return false;
+        }
+
+        if (slot instanceof SlotDisplay.CompositeSlotDisplay d) {
+            for (SlotDisplay sub : d.contents()) {
+                ItemStack r = resolveSlot(sub, working);
+                if (r.isEmpty() || r.getItem().equals(alreadyTried)) continue;
+                int have = working.getOrDefault(r.getItem(), 0);
+                if (have >= 1) { working.put(r.getItem(), have - 1); return true; }
+                if (trySubCraft(r.getItem(), working, stepsOut, inProgress, depth, rootOutput)) return true;
+            }
+            return false;
+        }
+
+        return false;
     }
 
     private static boolean trySubCraft(
@@ -429,19 +659,25 @@ public class RecipeResolver {
             return new ItemStack(d.stack().getItem(), d.stack().getCount());
         }
         if (display instanceof SlotDisplay.TagSlotDisplay d) {
-            MinecraftClient client = MinecraftClient.getInstance();
-            if (client.world == null) return ItemStack.EMPTY;
-            var regOpt = client.world.getRegistryManager().getOptional(RegistryKeys.ITEM);
-            if (regOpt.isEmpty()) return ItemStack.EMPTY;
-            var entriesOpt = regOpt.get().getOptional(d.tag());
-            if (entriesOpt.isEmpty()) return ItemStack.EMPTY;
-            Item fallback = null;
-            for (var entry : entriesOpt.get()) {
-                Item item = entry.value();
-                if (fallback == null) fallback = item;
-                if (inventory.getOrDefault(item, 0) > 0) return new ItemStack(item);
+            TagKey<Item> tag = d.tag();
+            // 1. Check inventory items matching this tag
+            Set<Item> matches = inventoryTagIndex.get(tag);
+            if (matches != null) {
+                for (Item item : matches) {
+                    if (inventory.getOrDefault(item, 0) > 0) return new ItemStack(item);
+                }
             }
-            return fallback != null ? new ItemStack(fallback) : ItemStack.EMPTY;
+            // 2. Check working map (resolve() decrements counts into working copies)
+            if (inventory != cachedInventory) {
+                for (Item item : inventory.keySet()) {
+                    if (inventory.get(item) > 0 && computeTagsForItem(item).contains(tag)) return new ItemStack(item);
+                }
+            }
+            // 3. Return a sub-craftable item so trySubCraft() can handle it
+            List<Item> craftable = craftableTagIndex.get(tag);
+            if (craftable != null) return new ItemStack(craftable.getFirst());
+            // 4. Fallback for display purposes
+            return getAnyTagMember(tag);
         }
         if (display instanceof SlotDisplay.WithRemainderSlotDisplay d) return resolveSlot(d.input(), inventory);
         if (display instanceof SlotDisplay.CompositeSlotDisplay d) {
@@ -495,9 +731,27 @@ public class RecipeResolver {
         ItemStack direct = resolveSlot(slot, cachedInventory);
         if (!direct.isEmpty() && cachedInventory.getOrDefault(direct.getItem(), 0) > 0) return direct;
 
-        // Second try: find a member we can actually sub-craft
+        // Second try: find an item we can sub-craft that satisfies this slot
+        ItemStack craftable = findCraftableForSlot(slot);
+        if (craftable != null) return craftable;
+
+        // Fallback: return whatever resolveSlot gives
+        return direct.isEmpty() ? resolveSlot(slot) : direct;
+    }
+
+    private static ItemStack findCraftableForSlot(SlotDisplay slot) {
         if (slot instanceof SlotDisplay.TagSlotDisplay d) {
-            return resolveByCraftability(d);
+            TagKey<Item> tag = d.tag();
+            Set<Item> invMatches = inventoryTagIndex.get(tag);
+            if (invMatches != null && !invMatches.isEmpty()) {
+                return new ItemStack(invMatches.iterator().next());
+            }
+            List<Item> craftable = craftableTagIndex.get(tag);
+            if (craftable != null) {
+                for (Item item : craftable) {
+                    if (canSubCraft(item, cachedInventory)) return new ItemStack(item);
+                }
+            }
         } else if (slot instanceof SlotDisplay.CompositeSlotDisplay d) {
             ItemStack fallback = ItemStack.EMPTY;
             for (SlotDisplay sub : d.contents()) {
@@ -507,31 +761,11 @@ public class RecipeResolver {
                 if (cachedInventory.getOrDefault(r.getItem(), 0) > 0) return r;
                 if (canSubCraft(r.getItem(), cachedInventory)) return r;
             }
-            return fallback;
+            if (!fallback.isEmpty()) return fallback;
         } else if (slot instanceof SlotDisplay.WithRemainderSlotDisplay d) {
-            return resolveGridSlot(d.input());
+            return findCraftableForSlot(d.input());
         }
-
-        // Fallback: return whatever resolveSlot gives
-        return direct.isEmpty() ? resolveSlot(slot) : direct;
-    }
-
-    private static ItemStack resolveByCraftability(SlotDisplay.TagSlotDisplay d) {
-        MinecraftClient client = MinecraftClient.getInstance();
-        if (client.world == null) return ItemStack.EMPTY;
-        var regOpt = client.world.getRegistryManager().getOptional(RegistryKeys.ITEM);
-        if (regOpt.isEmpty()) return ItemStack.EMPTY;
-        var entriesOpt = regOpt.get().getOptional(d.tag());
-        if (entriesOpt.isEmpty()) return ItemStack.EMPTY;
-
-        Item fallback = null;
-        for (var entry : entriesOpt.get()) {
-            Item item = entry.value();
-            if (fallback == null) fallback = item;
-            if (cachedInventory.getOrDefault(item, 0) > 0) return new ItemStack(item);
-            if (canSubCraft(item, cachedInventory)) return new ItemStack(item);
-        }
-        return fallback != null ? new ItemStack(fallback) : ItemStack.EMPTY;
+        return null;
     }
 
     private static void computeGridCraftability(IngredientGrid grid) {
@@ -577,15 +811,14 @@ public class RecipeResolver {
 
     private static Item findInSet(SlotDisplay slot, Item resolved, Set<Item> items) {
         if (items.contains(resolved)) return resolved;
-        if (slot instanceof SlotDisplay.TagSlotDisplay tag) {
-            MinecraftClient client = MinecraftClient.getInstance();
-            if (client.world == null) return null;
-            var regOpt = client.world.getRegistryManager().getOptional(RegistryKeys.ITEM);
-            if (regOpt.isEmpty()) return null;
-            var entriesOpt = regOpt.get().getOptional(tag.tag());
-            if (entriesOpt.isEmpty()) return null;
-            for (var entry : entriesOpt.get()) {
-                if (items.contains(entry.value())) return entry.value();
+        if (slot instanceof SlotDisplay.TagSlotDisplay d) {
+            Set<Item> contMatches = containerTagIndex.get(d.tag());
+            if (contMatches != null) {
+                for (Item item : contMatches) if (items.contains(item)) return item;
+            }
+            List<Item> members = getOrComputeTagMembers(d.tag());
+            if (members != null) {
+                for (Item member : members) if (items.contains(member)) return member;
             }
         } else if (slot instanceof SlotDisplay.CompositeSlotDisplay comp) {
             for (SlotDisplay sub : comp.contents()) {
