@@ -7,6 +7,7 @@ import net.minecraft.client.gui.screen.recipebook.RecipeResultCollection;
 import net.minecraft.client.recipebook.ClientRecipeBook;
 import net.minecraft.client.recipebook.RecipeBookType;
 import net.minecraft.component.DataComponentTypes;
+import net.minecraft.component.type.BundleContentsComponent;
 import net.minecraft.component.type.ContainerComponent;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
@@ -43,6 +44,7 @@ public class RecipeResolver {
     private static volatile Runnable onResultsPublished = null;
 
     public static void setOnResultsPublished(Runnable callback) { onResultsPublished = callback; }
+    public static boolean lastTabWasClientCraft = false;
 
     private static Map<Item, List<RecipeDisplayEntry>> recipesByOutput = Map.of();
     private static boolean recipeIndexDirty = true;
@@ -111,6 +113,12 @@ public class RecipeResolver {
                     ContainerComponent container = stack.get(DataComponentTypes.CONTAINER);
                     if (container != null) {
                         for (ItemStack contained : container.iterateNonEmpty()) {
+                            containerSnapshot.merge(contained.getItem(), contained.getCount(), Integer::sum);
+                        }
+                    }
+                    BundleContentsComponent bundle = stack.get(DataComponentTypes.BUNDLE_CONTENTS);
+                    if (bundle != null) {
+                        for (ItemStack contained : bundle.iterate()) {
                             containerSnapshot.merge(contained.getItem(), contained.getCount(), Integer::sum);
                         }
                     }
@@ -495,6 +503,8 @@ public class RecipeResolver {
     }
 
     public static void clearCache() {
+        resolving = false;
+        onResultsPublished = null;
         cachedResults = List.of();
         recipesByOutput = Map.of();
         recipeIndexDirty = true;
@@ -688,7 +698,7 @@ public class RecipeResolver {
             int crafts = inventory.getOrDefault(e.getKey(), 0) / e.getValue();
             if (crafts < maxCrafts) maxCrafts = crafts;
         }
-        return maxCrafts;
+        return maxCrafts > 0 ? maxCrafts : -1;
     }
 
     // --- Recipe helpers ---
