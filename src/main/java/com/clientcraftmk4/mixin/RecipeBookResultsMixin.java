@@ -45,30 +45,35 @@ public class RecipeBookResultsMixin {
             RecipeResultCollection collection = button.getResultCollection();
             if (!RecipeResolver.isAutoCraftCollection(collection)) return;
 
-            // Find the current recipe entry
+            // Prefer a craftable recipe variant, fall back to the displayed one
+            RecipeDisplayEntry best = null;
             for (RecipeDisplayEntry entry : collection.getAllRecipes()) {
-                if (entry.id().equals(button.getCurrentId())) {
-                    // Build fake collection with 9 entries (one per grid slot)
-                    RecipeResultCollection ingredientCollection = RecipeResolver.buildIngredientCollection(entry);
-                    if (ingredientCollection == null) return;
-
-                    ContextParameterMap context = SlotDisplayContexts.createParameters(
-                            MinecraftClient.getInstance().world);
-
-                    alternatesWidget.showAlternativesForResult(
-                            ingredientCollection,
-                            context,
-                            false,
-                            button.getX(),
-                            button.getY(),
-                            left + width / 2,
-                            top + 13 + height / 2,
-                            button.getWidth()
-                    );
-
-                    cir.setReturnValue(true);
-                    return;
+                if (collection.isCraftable(entry.id()) || RecipeResolver.isContainerCraftable(entry.id())) {
+                    best = entry;
+                    break;
                 }
+                if (best == null && entry.id().equals(button.getCurrentId())) best = entry;
+            }
+            if (best != null) {
+                RecipeResultCollection ingredientCollection = RecipeResolver.buildIngredientCollection(best);
+                if (ingredientCollection == null) return;
+
+                ContextParameterMap context = SlotDisplayContexts.createParameters(
+                        MinecraftClient.getInstance().world);
+
+                alternatesWidget.showAlternativesForResult(
+                        ingredientCollection,
+                        context,
+                        false,
+                        button.getX(),
+                        button.getY(),
+                        left + width / 2,
+                        top + 13 + height / 2,
+                        button.getWidth()
+                );
+
+                cir.setReturnValue(true);
+                return;
             }
         }
     }

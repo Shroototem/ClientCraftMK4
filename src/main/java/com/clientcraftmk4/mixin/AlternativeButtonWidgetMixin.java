@@ -27,20 +27,11 @@ public class AlternativeButtonWidgetMixin {
 
     private static final Identifier OVERLAY_RECIPE = Identifier.ofVanilla("recipe_book/overlay_recipe");
 
-    /**
-     * Clear the ingredient grid when the widget is hidden.
-     */
     @Inject(method = "setVisible", at = @At("HEAD"))
     private void clientcraft$onSetVisible(boolean visible, CallbackInfo ci) {
-        if (!visible) {
-            RecipeResolver.clearActiveIngredientGrid();
-        }
+        if (!visible) RecipeResolver.clearActiveIngredientGrid();
     }
 
-    /**
-     * When our ingredient grid is active, completely override rendering
-     * to draw a 3x3 grid with full-size items in each tile.
-     */
     @Inject(method = "render", at = @At("HEAD"), cancellable = true)
     private void clientcraft$renderIngredientGrid(DrawContext context, int mouseX, int mouseY, float deltaTicks, CallbackInfo ci) {
         if (!this.visible) return;
@@ -48,58 +39,30 @@ public class AlternativeButtonWidgetMixin {
         RecipeResolver.IngredientGrid grid = RecipeResolver.getActiveIngredientGrid();
         if (grid == null) return;
 
-        int cols = 3;
-        int rows = 3;
         int tileSize = 24;
-        int bgW = cols * tileSize + 8;
-        int bgH = rows * tileSize + 8;
-
-        // Draw the popup background
-        context.drawGuiTexture(RenderPipelines.GUI_TEXTURED, OVERLAY_RECIPE,
-                this.buttonX, this.buttonY, bgW, bgH);
-
         int gridX = this.buttonX + 4;
         int gridY = this.buttonY + 4;
-        int gridW = cols * tileSize;
-        int gridH = rows * tileSize;
+        int lineColor = 0xFF373737;
 
-        int haveColor = 0xFF8B8B8B;       // Light grey — player has this item
-        int containerColor = 0xFF7B2FBE;  // Purple — item is in a carried container
-        int missingColor = 0xFF555555;     // Dark grey — player doesn't have it
+        context.drawGuiTexture(RenderPipelines.GUI_TEXTURED, OVERLAY_RECIPE,
+                this.buttonX, this.buttonY, 3 * tileSize + 8, 3 * tileSize + 8);
 
-        // Fill each tile with the appropriate shade
         for (int row = 0; row < 3; row++) {
             for (int col = 0; col < 3; col++) {
                 int idx = row * 3 + col;
                 int tileX = gridX + col * tileSize;
                 int tileY = gridY + row * tileSize;
-                int color;
-                if (grid.hasCraftable(idx)) color = haveColor;
-                else if (grid.isInContainer(idx)) color = containerColor;
-                else color = missingColor;
+
+                int color = grid.hasCraftable(idx) ? 0xFF8B8B8B
+                          : grid.isInContainer(idx) ? 0xFF7B2FBE : 0xFF555555;
                 context.fill(tileX, tileY, tileX + tileSize, tileY + tileSize, color);
-            }
-        }
 
-        // Draw separator lines between tiles
-        int lineColor = 0xFF373737;
-        for (int i = 1; i < cols; i++) {
-            int lx = gridX + i * tileSize;
-            context.fill(lx, gridY, lx + 1, gridY + gridH, lineColor);
-        }
-        for (int i = 1; i < rows; i++) {
-            int ly = gridY + i * tileSize;
-            context.fill(gridX, ly, gridX + gridW, ly + 1, lineColor);
-        }
+                if (col > 0) context.fill(tileX, tileY, tileX + 1, tileY + tileSize, lineColor);
+                if (row > 0) context.fill(tileX, tileY, tileX + tileSize, tileY + 1, lineColor);
 
-        // Draw items
-        for (int row = 0; row < 3; row++) {
-            for (int col = 0; col < 3; col++) {
-                int idx = row * 3 + col;
                 ItemStack stack = grid.get(idx);
                 if (!stack.isEmpty()) {
-                    int ix = gridX + col * tileSize + 4;
-                    int iy = gridY + row * tileSize + 4;
+                    int ix = tileX + 4, iy = tileY + 4;
                     context.drawItem(stack, ix, iy);
                     context.drawStackOverlay(MinecraftClient.getInstance().textRenderer, stack, ix, iy);
                 }

@@ -53,17 +53,11 @@ public class RecipeBookWidgetMixin {
         }
         if (target == null) return;
 
-        AutoCrafter.Mode mode;
         long window = MinecraftClient.getInstance().getWindow().getHandle();
         boolean ctrlHeld = org.lwjgl.glfw.GLFW.glfwGetKey(window, org.lwjgl.glfw.GLFW.GLFW_KEY_LEFT_CONTROL) == org.lwjgl.glfw.GLFW.GLFW_PRESS
                 || org.lwjgl.glfw.GLFW.glfwGetKey(window, org.lwjgl.glfw.GLFW.GLFW_KEY_RIGHT_CONTROL) == org.lwjgl.glfw.GLFW.GLFW_PRESS;
-        if (craftAll && ctrlHeld) {
-            mode = AutoCrafter.Mode.ALL;
-        } else if (craftAll) {
-            mode = AutoCrafter.Mode.STACK;
-        } else {
-            mode = AutoCrafter.Mode.ONCE;
-        }
+        AutoCrafter.Mode mode = !craftAll ? AutoCrafter.Mode.ONCE
+                : ctrlHeld ? AutoCrafter.Mode.ALL : AutoCrafter.Mode.STACK;
 
         AutoCrafter.execute(target, mode);
         cir.setReturnValue(true);
