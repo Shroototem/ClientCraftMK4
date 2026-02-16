@@ -67,6 +67,15 @@ public class RecipeBookWidgetMixin {
     private void clientcraft$refreshResults(boolean resetCurrentPage, boolean filteringCraftable, CallbackInfo ci) {
         if (currentTab == null || !(currentTab.getCategory() instanceof ClientCraftTab)) return;
 
+        // Register callback so background thread can refresh UI when done
+        final boolean fc = filteringCraftable;
+        RecipeResolver.setOnResultsPublished(() -> applyFilteredResults(false, fc));
+
+        applyFilteredResults(resetCurrentPage, filteringCraftable);
+        ci.cancel();
+    }
+
+    private void applyFilteredResults(boolean resetCurrentPage, boolean filteringCraftable) {
         MinecraftClient client = MinecraftClient.getInstance();
         if (client.player == null) return;
 
@@ -102,6 +111,5 @@ public class RecipeBookWidgetMixin {
         filtered.sort(Comparator.comparingInt(RecipeResolver::getCollectionRank));
 
         recipesArea.setResults(filtered, resetCurrentPage, filteringCraftable);
-        ci.cancel();
     }
 }
