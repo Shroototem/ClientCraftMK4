@@ -66,7 +66,6 @@ public class RecipeResolver {
     // --- Tag cache ---
     private static Set<TagKey<Item>> knownTags = new HashSet<>();
     private static Map<Item, Set<TagKey<Item>>> itemToTags = new HashMap<>();
-    private static Set<Item> tagComputedItems = new HashSet<>();
     private static Map<TagKey<Item>, Set<Item>> inventoryTagIndex = new HashMap<>();
     private static Map<TagKey<Item>, Set<Item>> containerTagIndex = new HashMap<>();
     private static Map<TagKey<Item>, List<Item>> tagMembersCache = new ConcurrentHashMap<>();
@@ -181,16 +180,15 @@ public class RecipeResolver {
     private static Set<TagKey<Item>> computeTagsForItem(Item item) {
         Set<TagKey<Item>> existing = itemToTags.get(item);
         if (existing != null) return existing;
-        if (tagComputedItems.contains(item)) return Set.of();
 
         Set<TagKey<Item>> tags = new HashSet<>();
         ItemStack stack = new ItemStack(item);
         for (TagKey<Item> tag : knownTags) {
             if (stack.isIn(tag)) tags.add(tag);
         }
-        tagComputedItems.add(item);
-        if (!tags.isEmpty()) itemToTags.put(item, tags);
-        return tags;
+        Set<TagKey<Item>> result = tags.isEmpty() ? Set.of() : tags;
+        itemToTags.put(item, result);
+        return result;
     }
 
     private static void rebuildInventoryTagIndex() {
@@ -215,13 +213,6 @@ public class RecipeResolver {
         lastInventoryKeySet = new HashSet<>(currentInvKeys);
         lastContainerKeySet = new HashSet<>(currentContKeys);
 
-        LOG.info("[CC] inventoryTagIndex rebuilt: {} tags, inv items: {}", inventoryTagIndex.size(),
-                currentInvKeys.stream().map(i -> net.minecraft.registry.Registries.ITEM.getId(i).getPath()).toList());
-
-        // Build craftableTagIndex: tag → recipe output items matching that tag
-        // Items whose direct recipe inputs are in inventory/inventoryTagIndex sort first
-        // Flipped loop: iterate items once (calling hasDirectInputs once per item)
-        // instead of iterating tags × items (calling hasDirectInputs per tag match)
         craftableTagIndex.clear();
         Map<TagKey<Item>, List<Item>> hasInputsMap = new HashMap<>();
         Map<TagKey<Item>, List<Item>> noInputsMap = new HashMap<>();
@@ -245,14 +236,6 @@ public class RecipeResolver {
             }
         }
 
-        LOG.info("[CC] craftableTagIndex rebuilt: {} tags", craftableTagIndex.size());
-        for (var e : craftableTagIndex.entrySet()) {
-            String tagName = e.getKey().id().toString();
-            if (tagName.contains("plank") || tagName.contains("chest") || tagName.contains("trap") || tagName.contains("ender")) {
-                LOG.info("[CC]   {} -> {}", tagName,
-                        e.getValue().stream().limit(5).map(i -> net.minecraft.registry.Registries.ITEM.getId(i).getPath()).toList());
-            }
-        }
     }
 
     private static List<Item> getOrComputeTagMembers(TagKey<Item> tag) {
@@ -463,7 +446,7 @@ public class RecipeResolver {
 
     public static ItemStack resolveResult(RecipeDisplay display) {
         ItemStack out = resolveSlot(display.result());
-        return (out != null && !out.isEmpty()) ? out : ItemStack.EMPTY;
+        return out.isEmpty() ? ItemStack.EMPTY : out;
     }
 
     public static int getCraftCount(NetworkRecipeId id) {
@@ -522,7 +505,6 @@ public class RecipeResolver {
         lowerCaseNameCache.clear();
         knownTags.clear();
         itemToTags.clear();
-        tagComputedItems.clear();
         inventoryTagIndex.clear();
         containerTagIndex.clear();
         tagMembersCache.clear();
@@ -550,35 +532,25 @@ public class RecipeResolver {
         Map<Item, Integer> snapshot = new HashMap<>(available);
         int stepsStart = stepsOut != null ? stepsOut.size() : 0;
 
-        boolean debug = depth == 0 && outputItem != null
-                && net.minecraft.registry.Registries.ITEM.getId(outputItem).getPath().contains("inventory_interface");
-
         boolean success = true;
         for (SlotDisplay slot : slots) {
             if (slot instanceof SlotDisplay.EmptySlotDisplay) continue;
 
             ItemStack resolved = resolveSlot(slot, available);
-            if (resolved.isEmpty()) {
-                if (debug) LOG.info("[CC] FAIL: resolveSlot returned EMPTY for slot {}", slot);
-                success = false; break;
-            }
+            if (resolved.isEmpty()) { success = false; break; }
             Item item = resolved.getItem();
 
             int have = available.getOrDefault(item, 0);
             if (have >= 1) {
                 available.put(item, have - 1);
-                if (debug) LOG.info("[CC] OK: {} (have {})", net.minecraft.registry.Registries.ITEM.getId(item), have);
                 continue;
             }
 
-            if (debug) LOG.info("[CC] NEED subcraft: {} (slot: {})", net.minecraft.registry.Registries.ITEM.getId(item), slot.getClass().getSimpleName());
             if (!trySubCraft(item, available, stepsOut, inProgress, depth, rootOutput)
                     && !(depth <= 1 && tryTagFallback(slot, item, available, stepsOut, inProgress, depth, rootOutput))) {
-                if (debug) LOG.info("[CC] FAIL: subcraft failed for {}", net.minecraft.registry.Registries.ITEM.getId(item));
                 success = false;
                 break;
             }
-            if (debug) LOG.info("[CC] OK: subcrafted {}", net.minecraft.registry.Registries.ITEM.getId(item));
         }
 
         if (!success) {
@@ -698,7 +670,14 @@ public class RecipeResolver {
             int crafts = inventory.getOrDefault(e.getKey(), 0) / e.getValue();
             if (crafts < maxCrafts) maxCrafts = crafts;
         }
-        return maxCrafts > 0 ? maxCrafts : -1;
+        // If the bottleneck ingredient can be sub-crafted, bail to simulation
+        for (var e : needed.entrySet()) {
+            if (inventory.getOrDefault(e.getKey(), 0) / e.getValue() == maxCrafts
+                    && recipesByOutput.containsKey(e.getKey())) {
+                return -1;
+            }
+        }
+        return maxCrafts;
     }
 
     // --- Recipe helpers ---
