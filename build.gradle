@@ -1,56 +1,63 @@
 plugins {
-    id "fabric-loom" version "${loom_version}"
-    id "maven-publish"
+    id "fabric-loom" version "${loom_version}" apply false
 }
 
-version = project.mod_version
-group = project.maven_group
-
-base {
-    archivesName = project.archives_base_name
+tasks.register("buildAll") {
+    dependsOn subprojects.findAll { it.hasProperty("minecraft_version") }.collect { it.tasks.named("build") }
 }
 
-repositories {
-    mavenCentral()
-    maven { url "https://maven.terraformersmc.com/" }
-}
+subprojects {
+    // Skip intermediate 'versions' container project — only configure leaf subprojects
+    if (!project.hasProperty("minecraft_version")) return
 
-dependencies {
-    // Minecraft
-    minecraft "com.mojang:minecraft:${project.minecraft_version}"
-    mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+    apply plugin: "fabric-loom"
 
-    // Fabric Loader
-    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    group = rootProject.property("maven_group")
+    version = rootProject.property("mod_version")
 
-    // Fabric API
-    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
-
-    // Mod Menu (optional)
-    modImplementation "com.terraformersmc:modmenu:14.0.0-beta.1"
-}
-
-processResources {
-    inputs.property "version", project.version
-
-    filesMatching("fabric.mod.json") {
-        expand "version": project.version
+    base {
+        archivesName = "${rootProject.property('archives_base_name')}-${project.property('minecraft_version')}"
     }
-}
 
-tasks.withType(JavaCompile).configureEach {
-    it.options.release = 21
-}
+    repositories {
+        mavenCentral()
+        maven { url "https://maven.terraformersmc.com/" }
+    }
 
-java {
-    withSourcesJar()
+    dependencies {
+        minecraft "com.mojang:minecraft:${project.property('minecraft_version')}"
+        mappings "net.fabricmc:yarn:${project.property('yarn_mappings')}:v2"
+        modImplementation "net.fabricmc:fabric-loader:${rootProject.property('loader_version')}"
+        modImplementation "net.fabricmc.fabric-api:fabric-api:${project.property('fabric_api_version')}"
+        modImplementation "com.terraformersmc:modmenu:${project.property('modmenu_version')}"
+    }
 
-    sourceCompatibility = JavaVersion.VERSION_21
-    targetCompatibility = JavaVersion.VERSION_21
-}
+    sourceSets {
+        main {
+            java { srcDir rootProject.file("common/java") }
+        }
+    }
 
-jar {
-    from("LICENSE") {
-        rename { "${it}_${project.base.archivesName.get()}" }
+    processResources {
+        inputs.property "version", project.version
+        filesMatching("fabric.mod.json") {
+            expand "version": project.version
+        }
+    }
+
+    tasks.withType(JavaCompile).configureEach {
+        it.options.release = 21
+    }
+
+    java {
+        withSourcesJar()
+        sourceCompatibility = JavaVersion.VERSION_21
+        targetCompatibility = JavaVersion.VERSION_21
+    }
+
+    jar {
+        from(rootProject.file("LICENSE")) {
+            rename { "${it}_${project.base.archivesName.get()}" }
+        }
     }
 }

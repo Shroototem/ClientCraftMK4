@@ -7,3 +7,6 @@ pluginManagement {
 }
 
 rootProject.name = "clientcraftmk4"
+
+include "versions:1.21.10"
+include "versions:1.21.1"
