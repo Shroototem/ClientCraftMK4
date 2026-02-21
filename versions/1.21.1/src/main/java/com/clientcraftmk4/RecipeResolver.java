@@ -444,7 +444,7 @@ public class RecipeResolver {
         return cachedResults;
     }
 
-    public static List<List<RecipeEntry<?>>> buildCraftCyclesForMode(RecipeEntry<?> target, AutoCrafter.Mode mode) {
+    public static AutoCrafter.CraftPlan buildCraftCyclesForMode(RecipeEntry<?> target, AutoCrafter.Mode mode) {
         MinecraftClient client = MinecraftClient.getInstance();
         if (client.player == null) return null;
         prepareContext();
@@ -456,25 +456,44 @@ public class RecipeResolver {
         List<RecipeEntry<?>> firstSteps = new ArrayList<>();
         if (!resolve(target, available, firstSteps, new HashSet<>(), 0, null, registryManager)) return null;
 
+        // A "direct" recipe has exactly 1 step (no sub-crafting required).
+        // For ALL mode with direct recipes, use craftAll to fill the grid with
+        // full stacks — like Shift+Click in the vanilla recipe book — so each
+        // click produces up to a full stack of output instead of one craft.
+        boolean directCraft = mode == AutoCrafter.Mode.ALL && firstSteps.size() == 1;
+
         ItemStack output = resolveResult(target);
         int outputCount = output.getCount();
 
-        int maxRepeats = switch (mode) {
-            case ONCE -> 1;
-            case STACK -> (output.getMaxCount() + outputCount - 1) / outputCount;
-            case ALL -> MAX_REPEATS;
-        };
+        int maxRepeats;
+        if (directCraft) {
+            int craftsPerClick = output.getMaxCount() / outputCount;
+            int total = countRepeats(target, new HashMap<>(cachedInventory), registryManager, outputCount);
+            maxRepeats = Math.max(1, (total + craftsPerClick - 1) / craftsPerClick);
+        } else {
+            maxRepeats = switch (mode) {
+                case ONCE -> 1;
+                case STACK -> (output.getMaxCount() + outputCount - 1) / outputCount;
+                case ALL -> MAX_REPEATS;
+            };
+        }
         if (maxRepeats <= 0) return null;
 
         List<List<RecipeEntry<?>>> cycles = new ArrayList<>();
         cycles.add(firstSteps);
 
-        for (int r = 1; r < maxRepeats; r++) {
-            List<RecipeEntry<?>> steps = new ArrayList<>();
-            if (!resolve(target, available, steps, new HashSet<>(), 0, null, registryManager)) break;
-            cycles.add(steps);
+        if (directCraft) {
+            for (int r = 1; r < maxRepeats; r++) {
+                cycles.add(List.of(firstSteps.getFirst()));
+            }
+        } else {
+            for (int r = 1; r < maxRepeats; r++) {
+                List<RecipeEntry<?>> steps = new ArrayList<>();
+                if (!resolve(target, available, steps, new HashSet<>(), 0, null, registryManager)) break;
+                cycles.add(steps);
+            }
         }
-        return cycles;
+        return new AutoCrafter.CraftPlan(cycles, directCraft);
     }
 
     public static ItemStack resolveResult(RecipeEntry<?> entry) {
