@@ -14,7 +14,11 @@ import java.util.List;
 public class AutoCrafter {
     public enum Mode { ONCE, STACK, ALL }
 
+    /** Result from buildCraftCyclesForMode containing the step list and whether craftAll can be used. */
+    public record CraftPlan(List<List<RecipeEntry<?>>> cycles, boolean directCraft) {}
+
     private static List<RecipeEntry<?>> steps;
+    private static boolean craftAll;
     private static int stepIndex;
     private static int tickCounter;
 
@@ -22,13 +26,14 @@ public class AutoCrafter {
         if (steps != null) return;
         if (getHandler() == null) return;
 
-        List<List<RecipeEntry<?>>> cycles = RecipeResolver.buildCraftCyclesForMode(target, mode);
-        if (cycles == null || cycles.isEmpty()) return;
+        CraftPlan plan = RecipeResolver.buildCraftCyclesForMode(target, mode);
+        if (plan == null || plan.cycles().isEmpty()) return;
 
         List<RecipeEntry<?>> flat = new ArrayList<>();
-        for (List<RecipeEntry<?>> cycle : cycles) flat.addAll(cycle);
+        for (List<RecipeEntry<?>> cycle : plan.cycles()) flat.addAll(cycle);
 
         steps = flat;
+        craftAll = plan.directCraft();
         stepIndex = 0;
         tickCounter = 0;
     }
@@ -63,7 +68,7 @@ public class AutoCrafter {
     }
 
     private static void executeStep(MinecraftClient client, AbstractRecipeScreenHandler handler, RecipeEntry<?> step) {
-        client.interactionManager.clickRecipe(handler.syncId, step, false);
+        client.interactionManager.clickRecipe(handler.syncId, step, craftAll);
         client.interactionManager.clickSlot(handler.syncId, 0, 0, SlotActionType.QUICK_MOVE, client.player);
     }
 
