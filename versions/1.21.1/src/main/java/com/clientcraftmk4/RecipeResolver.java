@@ -395,11 +395,17 @@ public class RecipeResolver {
                         allEntries.add(entry);
 
                         int outputCount = Math.max(1, outputStack.getCount());
-                        int repeats = countRepeats(entry, invSnapshot, bgRegistryManager, outputCount);
+                        int repeats;
+                        if (ClientCraftConfig.quickCountMode) {
+                            Map<Item, Integer> temp = new HashMap<>(invSnapshot);
+                            repeats = resolve(entry, temp, null, new HashSet<>(), 0, null, bgRegistryManager) ? 1 : 0;
+                        } else {
+                            repeats = countRepeats(entry, invSnapshot, bgRegistryManager, outputCount);
+                        }
                         if (repeats > 0) {
                             craftable.add(entry);
                             hasDirect = true;
-                            counts.put(entry.id(), Math.min(repeats * outputCount, MAX_REPEATS));
+                            counts.put(entry.id(), ClientCraftConfig.quickCountMode ? outputCount : Math.min(repeats * outputCount, MAX_REPEATS));
                         } else if (combined != null) {
                             Map<Item, Integer> temp = new HashMap<>(combined);
                             if (resolve(entry, temp, null, new HashSet<>(), 0, null, bgRegistryManager)) {
