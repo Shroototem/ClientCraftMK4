@@ -2,10 +2,8 @@ package com.clientcraftmk4.tree;
 
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.recipebook.RecipeResultCollection;
-import net.minecraft.client.recipebook.RecipeBookType;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
-import net.minecraft.recipe.NetworkRecipeId;
 import net.minecraft.recipe.RecipeDisplayEntry;
 import net.minecraft.recipe.display.RecipeDisplay;
 import net.minecraft.recipe.display.ShapedCraftingRecipeDisplay;
@@ -24,11 +22,9 @@ public class RecipeTreeBuilder {
 
         // Phase 1: Index all recipes by output item
         Map<Item, List<RecipeDisplayEntry>> recipesByOutput = new HashMap<>();
-        Map<NetworkRecipeId, RecipeDisplayEntry> entryById = new HashMap<>();
 
         for (RecipeResultCollection coll : allCrafting) {
             for (RecipeDisplayEntry entry : coll.getAllRecipes()) {
-                entryById.put(entry.id(), entry);
                 Item out = getOutputItem(entry.display());
                 if (out != null) {
                     recipesByOutput.computeIfAbsent(out, k -> new ArrayList<>()).add(entry);
@@ -211,7 +207,7 @@ public class RecipeTreeBuilder {
             }
         }
 
-        return new RecipeTree(resolved, allRecipesMap, dependents, topologicalOrder, baseResources, entryById);
+        return new RecipeTree(resolved, allRecipesMap, dependents, topologicalOrder);
     }
 
     private static CraftedItem buildBestNode(
