@@ -10,11 +10,7 @@ public class CraftCalculator {
             RecipeTree tree, Map<Item, Integer> inventory,
             Map<Item, Integer> containerInventory, int gridSize) {
 
-        Map<Item, Integer> combined = new HashMap<>(inventory);
-        if (containerInventory != null) {
-            containerInventory.forEach((k, v) -> combined.merge(k, v, Integer::sum));
-        }
-
+        Map<Item, Integer> combined = combinedInventory(inventory, containerInventory);
         Map<Item, long[]> memo = new HashMap<>();
         Map<Item, Integer> results = new HashMap<>();
 
@@ -35,23 +31,9 @@ public class CraftCalculator {
 
     public static int maxCraftable(RecipeNode node, RecipeTree tree, Map<Item, Integer> inventory,
                                    Map<Item, Integer> containerInventory, int gridSize) {
-        Map<Item, Integer> combined = new HashMap<>(inventory);
-        if (containerInventory != null) {
-            containerInventory.forEach((k, v) -> combined.merge(k, v, Integer::sum));
-        }
+        Map<Item, Integer> combined = combinedInventory(inventory, containerInventory);
         Map<Item, long[]> memo = new HashMap<>();
         return clampInt(computeMemo(node, tree, inventory, combined, gridSize, memo));
-    }
-
-    public static boolean isContainerOnly(RecipeNode node, Map<Item, Integer> inventory,
-                                          Map<Item, Integer> combined, int gridSize,
-                                          RecipeTree tree, Map<Item, long[]> memo) {
-        long[] cached = memo.get(node.item());
-        if (cached != null) return cached[1] == 1;
-
-        computeMemo(node, tree, inventory, combined, gridSize, memo);
-        cached = memo.get(node.item());
-        return cached != null && cached[1] == 1;
     }
 
     private static long computeMemo(RecipeNode node, RecipeTree tree, Map<Item, Integer> inventory,
@@ -99,7 +81,7 @@ public class CraftCalculator {
             // Determine container-only status from best result
             containerOnly = result > 0
                     && inventory.getOrDefault(node.item(), 0) == 0
-                    && isRecipeContainerOnly(crafted, inventory, combined, gridSize, tree, memo);
+                    && isRecipeContainerOnly(crafted, memo);
 
             if (containerOnly) {
                 long directOps = calculateDirectOps(crafted, inventory, gridSize, memo);
@@ -151,9 +133,7 @@ public class CraftCalculator {
         return maxOps * crafted.outputCount() + alreadyHave;
     }
 
-    private static boolean isRecipeContainerOnly(CraftedItem crafted, Map<Item, Integer> inventory,
-                                                  Map<Item, Integer> combined, int gridSize,
-                                                  RecipeTree tree, Map<Item, long[]> memo) {
+    private static boolean isRecipeContainerOnly(CraftedItem crafted, Map<Item, long[]> memo) {
         for (IngredientEdge edge : crafted.ingredients()) {
             boolean edgeContainerOnly = true;
             boolean edgeHasAvailability = false;
@@ -216,10 +196,7 @@ public class CraftCalculator {
             Map<Item, Integer> containerInventory, int gridSize,
             Set<Item> affectedItems, Map<Item, Integer> existingCounts) {
 
-        Map<Item, Integer> combined = new HashMap<>(inventory);
-        if (containerInventory != null) {
-            containerInventory.forEach((k, v) -> combined.merge(k, v, Integer::sum));
-        }
+        Map<Item, Integer> combined = combinedInventory(inventory, containerInventory);
 
         Map<Item, long[]> memo = new HashMap<>();
         for (Map.Entry<Item, Integer> e : existingCounts.entrySet()) {
@@ -243,6 +220,12 @@ public class CraftCalculator {
                 existingCounts.remove(item);
             }
         }
+    }
+
+    private static Map<Item, Integer> combinedInventory(Map<Item, Integer> inventory, Map<Item, Integer> containerInventory) {
+        Map<Item, Integer> combined = new HashMap<>(inventory);
+        if (containerInventory != null) containerInventory.forEach((k, v) -> combined.merge(k, v, Integer::sum));
+        return combined;
     }
 
     private static int clampInt(long val) {

@@ -16,6 +16,10 @@ public class InventoryTracker {
     private long generation = 0;
     private long lastSnapshotTick = -1;
 
+    /**
+     * Take a new inventory snapshot. Returns the set of items whose counts changed.
+     * Returns null if called on the same tick (no snapshot taken).
+     */
     public Set<Item> snapshot(PlayerInventory inventory, long worldTick) {
         if (worldTick == lastSnapshotTick) return null;
         lastSnapshotTick = worldTick;
@@ -51,30 +55,23 @@ public class InventoryTracker {
         }
 
         Set<Item> changed = new HashSet<>();
-
-        for (Map.Entry<Item, Integer> e : current.entrySet()) {
-            Integer old = lastInventory.get(e.getKey());
-            if (old == null || !old.equals(e.getValue())) {
-                changed.add(e.getKey());
-            }
-        }
-        for (Item item : lastInventory.keySet()) {
-            if (!current.containsKey(item)) changed.add(item);
-        }
-
-        for (Map.Entry<Item, Integer> e : currentContainer.entrySet()) {
-            Integer old = lastContainerInventory.get(e.getKey());
-            if (old == null || !old.equals(e.getValue())) changed.add(e.getKey());
-        }
-        for (Item item : lastContainerInventory.keySet()) {
-            if (!currentContainer.containsKey(item)) changed.add(item);
-        }
+        collectChanges(current, lastInventory, changed);
+        collectChanges(currentContainer, lastContainerInventory, changed);
 
         lastInventory = current;
         lastContainerInventory = currentContainer;
         generation++;
 
         return changed;
+    }
+
+    private static void collectChanges(Map<Item, Integer> current, Map<Item, Integer> old, Set<Item> changed) {
+        for (Map.Entry<Item, Integer> e : current.entrySet()) {
+            if (!Objects.equals(old.get(e.getKey()), e.getValue())) changed.add(e.getKey());
+        }
+        for (Item item : old.keySet()) {
+            if (!current.containsKey(item)) changed.add(item);
+        }
     }
 
     public Map<Item, Integer> getInventory() { return lastInventory; }

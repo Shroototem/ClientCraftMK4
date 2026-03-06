@@ -46,6 +46,7 @@ public class RecipeResolver {
     private static Set<RecipeResultCollection> autoCraftCollections = Set.of();
     private static int lastGridSize = -1;
     private static long lastGeneration = -1;
+    private static int lastRecipeCount = -1;
 
     private static volatile Runnable onResultsPublished = null;
     public static boolean lastTabWasClientCraft = false;
@@ -85,6 +86,7 @@ public class RecipeResolver {
                 building = true;
                 List<RecipeResultCollection> allCrafting = new ArrayList<>(
                         recipeBook.getResultsForCategory(RecipeBookType.CRAFTING));
+                lastRecipeCount = allCrafting.size();
 
                 // Build placeholder results
                 List<RecipeResultCollection> placeholder = new ArrayList<>();
@@ -101,11 +103,14 @@ public class RecipeResolver {
 
                 RESOLVER_EXECUTOR.submit(() -> {
                     try {
+                        long startTime = System.nanoTime();
                         RecipeTree built = RecipeTreeBuilder.build(allCrafting);
+                        long elapsed = (System.nanoTime() - startTime) / 1_000_000;
                         client.execute(() -> {
                             tree = built;
                             building = false;
                             lastGeneration = -1; // Force full recalculation
+                            LOG.info("[CC] Tree built in {}ms ({} recipe groups)", elapsed, lastRecipeCount);
                             Runnable cb = onResultsPublished;
                             if (cb != null) cb.run();
                         });
@@ -118,24 +123,36 @@ public class RecipeResolver {
             return cachedResults;
         }
 
-        // Tree exists — snapshot inventory and check delta
+        // Same-tick optimization
         Set<Item> changed = tracker.snapshot(client.player.getInventory(), client.world.getTime());
+        if (changed == null) {
+            return cachedResults;
+        }
+
         boolean gridChanged = gridSize != lastGridSize;
         lastGridSize = gridSize;
 
-        if (changed != null && changed.isEmpty() && !gridChanged
+        // Check if recipes changed (new recipes unlocked)
+        List<RecipeResultCollection> allCrafting = new ArrayList<>(
+                client.player.getRecipeBook().getResultsForCategory(RecipeBookType.CRAFTING));
+        if (allCrafting.size() != lastRecipeCount) {
+            clearCache();
+            return resolveForTab(recipeBook);
+        }
+
+        if (changed.isEmpty() && !gridChanged
                 && tracker.getGeneration() == lastGeneration && !cachedResults.isEmpty()) {
-            return cachedResults; // Nothing changed, instant return
+            return cachedResults;
         }
 
         // Recalculate counts
+        long resolveStart = System.nanoTime();
         Map<Item, Integer> inventory = tracker.getInventory();
         Map<Item, Integer> containerInv = ClientCraftConfig.searchContainers
                 ? tracker.getContainerInventory() : null;
         boolean hasContainers = containerInv != null && !containerInv.isEmpty();
 
-        if (gridChanged || craftCountsByItem.isEmpty() || changed == null
-                || changed.size() > 50) {
+        if (gridChanged || craftCountsByItem.isEmpty() || changed.size() > 50) {
             // Full recalculation
             craftCountsByItem = CraftCalculator.calculateAllCounts(tree, inventory, containerInv, gridSize);
         } else if (!changed.isEmpty()) {
@@ -164,9 +181,6 @@ public class RecipeResolver {
         }
 
         // Build tab results
-        List<RecipeResultCollection> allCrafting = new ArrayList<>(
-                client.player.getRecipeBook().getResultsForCategory(RecipeBookType.CRAFTING));
-
         List<RecipeResultCollection> result = new ArrayList<>();
         Map<RecipeResultCollection, Integer> ranks = new IdentityHashMap<>();
         Set<RecipeResultCollection> autoCraft = new HashSet<>();
@@ -189,10 +203,11 @@ public class RecipeResolver {
                 int alreadyHave = inventory.getOrDefault(out, 0);
                 if (hasContainers) alreadyHave += containerInv.getOrDefault(out, 0);
                 int craftableCount = totalCount - alreadyHave;
-                if (craftableCount > 0 && isRecipeCraftable(out, entry.id(), inventory, containerInv, gridSize)) {
+                if (craftableCount > 0) {
+                    int displayCount = simulateCraftableCount(out, entry.id(), inventory, containerInv, gridSize);
+                    if (displayCount <= 0) continue;
                     craftable.add(entry);
-                    int displayCount = Math.min(999, craftableCount);
-                    counts.put(entry.id(), displayCount);
+                    counts.put(entry.id(), Math.min(999, displayCount));
 
                     if (containerOnlyItems.contains(out)) {
                         containerSet.add(entry.id());
@@ -220,6 +235,7 @@ public class RecipeResolver {
         autoCraftCollections = autoCraft;
         cachedResults = result;
 
+        LOG.info("[CC] resolveForTab: {}ms ({} craftable)", (System.nanoTime() - resolveStart) / 1_000_000, counts.size());
         return cachedResults;
     }
 
@@ -433,6 +449,7 @@ public class RecipeResolver {
         autoCraftCollections = Set.of();
         lastGridSize = -1;
         lastGeneration = -1;
+        lastRecipeCount = -1;
         activeIngredientGrid = null;
         lowerCaseNameCache.clear();
         tracker.clear();
@@ -455,19 +472,26 @@ public class RecipeResolver {
         return recipes.getFirst();
     }
 
-    private static boolean isRecipeCraftable(Item outputItem, NetworkRecipeId recipeId,
-                                             Map<Item, Integer> inventory,
-                                             Map<Item, Integer> containerInv, int gridSize) {
-        if (tree == null) return true;
+    private static int simulateCraftableCount(Item outputItem, NetworkRecipeId recipeId,
+                                              Map<Item, Integer> inventory,
+                                              Map<Item, Integer> containerInv, int gridSize) {
+        if (tree == null) return 0;
         CraftedItem recipe = findMatchingCraftedItem(outputItem, recipeId);
-        if (recipe == null) return false;
-        if (recipe.gridSize() > gridSize) return false;
+        if (recipe == null || recipe.gridSize() > gridSize) return 0;
 
         Map<Item, Integer> sim = new HashMap<>(inventory);
         if (containerInv != null) containerInv.forEach((k, v) -> sim.merge(k, v, Integer::sum));
 
-        return simulateCraft(recipe, sim, new ArrayList<>(), gridSize,
-                new HashSet<>(), new HashSet<>());
+        int total = 0;
+        for (int i = 0; i < 999; i++) {
+            int before = sim.getOrDefault(outputItem, 0);
+            if (!simulateCraft(recipe, sim, new ArrayList<>(), gridSize,
+                    new HashSet<>(), new HashSet<>())) break;
+            int gained = sim.getOrDefault(outputItem, 0) - before;
+            if (gained <= 0) break;
+            total += gained;
+        }
+        return total;
     }
 
     private static int getGridSize() {
