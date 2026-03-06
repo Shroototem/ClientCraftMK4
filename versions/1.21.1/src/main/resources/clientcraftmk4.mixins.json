@@ -8,6 +8,7 @@
         "ClientRecipeBookMixin",
         "RecipeBookGroupMixin",
         "RecipeBookResultsMixin",
+        "RecipeBookWidgetAccessor",
         "RecipeBookWidgetMixin",
         "RecipeResultCollectionAccessor",
         "RecipeResultCollectionMixin"
