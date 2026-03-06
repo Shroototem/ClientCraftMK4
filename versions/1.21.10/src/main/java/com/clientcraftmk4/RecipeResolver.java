@@ -186,12 +186,12 @@ public class RecipeResolver {
                 allEntries.add(entry);
 
                 int totalCount = craftCountsByItem.getOrDefault(out, 0);
-                if (totalCount > 0 && isRecipeCraftable(out, entry.id(), craftCountsByItem, gridSize)) {
+                int alreadyHave = inventory.getOrDefault(out, 0);
+                if (hasContainers) alreadyHave += containerInv.getOrDefault(out, 0);
+                int craftableCount = totalCount - alreadyHave;
+                if (craftableCount > 0 && isRecipeCraftable(out, entry.id(), inventory, containerInv, gridSize)) {
                     craftable.add(entry);
-                    // Show how many more can be crafted, not total available
-                    int alreadyHave = inventory.getOrDefault(out, 0);
-                    if (hasContainers) alreadyHave += containerInv.getOrDefault(out, 0);
-                    int displayCount = Math.min(999, Math.max(1, totalCount - alreadyHave));
+                    int displayCount = Math.min(999, craftableCount);
                     counts.put(entry.id(), displayCount);
 
                     if (containerOnlyItems.contains(out)) {
@@ -456,26 +456,18 @@ public class RecipeResolver {
     }
 
     private static boolean isRecipeCraftable(Item outputItem, NetworkRecipeId recipeId,
-                                             Map<Item, Integer> craftCountsByItem, int gridSize) {
+                                             Map<Item, Integer> inventory,
+                                             Map<Item, Integer> containerInv, int gridSize) {
         if (tree == null) return true;
-        List<CraftedItem> recipes = tree.getAllRecipes(outputItem);
-        if (recipes == null || recipes.isEmpty()) return craftCountsByItem.getOrDefault(outputItem, 0) > 0;
-        for (CraftedItem recipe : recipes) {
-            if (!recipe.recipeId().equals(recipeId)) continue;
-            if (recipe.gridSize() > gridSize) return false;
-            for (IngredientEdge edge : recipe.ingredients()) {
-                boolean edgeAvailable = false;
-                for (IngredientOption option : edge.options()) {
-                    if (craftCountsByItem.getOrDefault(option.item(), 0) > 0) {
-                        edgeAvailable = true;
-                        break;
-                    }
-                }
-                if (!edgeAvailable) return false;
-            }
-            return true;
-        }
-        return craftCountsByItem.getOrDefault(outputItem, 0) > 0;
+        CraftedItem recipe = findMatchingCraftedItem(outputItem, recipeId);
+        if (recipe == null) return false;
+        if (recipe.gridSize() > gridSize) return false;
+
+        Map<Item, Integer> sim = new HashMap<>(inventory);
+        if (containerInv != null) containerInv.forEach((k, v) -> sim.merge(k, v, Integer::sum));
+
+        return simulateCraft(recipe, sim, new ArrayList<>(), gridSize,
+                new HashSet<>(), new HashSet<>());
     }
 
     private static int getGridSize() {
