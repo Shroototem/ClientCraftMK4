@@ -1,12 +1,14 @@
 package com.clientcraftmk4;
 
 import com.clientcraftmk4.mixin.RecipeResultCollectionAccessor;
-import com.clientcraftmk4.tree.*;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.ingame.CraftingScreen;
 import net.minecraft.client.gui.screen.recipebook.RecipeResultCollection;
 import net.minecraft.client.recipebook.ClientRecipeBook;
 import net.minecraft.client.recipebook.RecipeBookType;
+import net.minecraft.component.DataComponentTypes;
+import net.minecraft.component.type.BundleContentsComponent;
+import net.minecraft.component.type.ContainerComponent;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.recipe.NetworkRecipeId;
@@ -22,37 +24,55 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public class RecipeResolver {
     private static final Logger LOG = LoggerFactory.getLogger("ClientCraftMK4");
+    private static final int MAX_DEPTH = 10;
+    private static final int MAX_REPEATS = 999;
     private static final ExecutorService RESOLVER_EXECUTOR = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "ClientCraft-Resolver");
         t.setDaemon(true);
         return t;
     });
 
-    // --- State ---
-    private static RecipeTree tree = null;
-    private static volatile boolean building = false;
-    private static final InventoryTracker tracker = new InventoryTracker();
-
     private static List<RecipeResultCollection> cachedResults = List.of();
+    private static long lastCacheKey = 0;
+    private static volatile boolean resolving = false;
+    private static volatile Runnable onResultsPublished = null;
+
+    public static void setOnResultsPublished(Runnable callback) { onResultsPublished = callback; }
+    public static boolean lastTabWasClientCraft = false;
+
+    private static Map<Item, List<RecipeDisplayEntry>> recipesByOutput = Map.of();
+    private static boolean recipeIndexDirty = true;
+    private static int currentGridSize = 3;
     private static Map<NetworkRecipeId, Integer> craftCounts = Map.of();
-    private static Map<Item, Integer> craftCountsByItem = new HashMap<>();
     private static Set<NetworkRecipeId> containerCraftable = Set.of();
+    private static Set<Item> containerAvailableItems = Set.of();
     private static Map<RecipeResultCollection, Integer> collectionRanks = Map.of();
     private static Set<RecipeResultCollection> autoCraftCollections = Set.of();
-    private static int lastGridSize = -1;
-    private static long lastGeneration = -1;
-    private static int lastRecipeCount = -1;
 
-    private static volatile Runnable onResultsPublished = null;
-    public static boolean lastTabWasClientCraft = false;
+    private static Map<Item, Integer> cachedInventory = Map.of();
+    private static Map<Item, Integer> cachedContainerInventory = Map.of();
+    private static long inventorySnapshotTick = -1;
+    private static long inventoryGeneration = 0;
 
     private static Map<Item, String> lowerCaseNameCache = new HashMap<>();
     private static IngredientGrid activeIngredientGrid = null;
+
+    // --- Tag cache ---
+    private static Set<TagKey<Item>> knownTags = new HashSet<>();
+    private static Map<Item, Set<TagKey<Item>>> itemToTags = new HashMap<>();
+    private static Map<TagKey<Item>, Set<Item>> inventoryTagIndex = new HashMap<>();
+    private static Map<TagKey<Item>, Set<Item>> containerTagIndex = new HashMap<>();
+    private static Map<TagKey<Item>, List<Item>> tagMembersCache = new ConcurrentHashMap<>();
+    private static Map<TagKey<Item>, Item> tagFallbackItem = new ConcurrentHashMap<>();
+    private static Map<TagKey<Item>, List<Item>> craftableTagIndex = new HashMap<>();
+    private static Set<Item> lastInventoryKeySet = Set.of();
+    private static Set<Item> lastContainerKeySet = Set.of();
 
     // --- IngredientGrid ---
 
@@ -70,7 +90,214 @@ public class RecipeResolver {
     public static IngredientGrid getActiveIngredientGrid() { return activeIngredientGrid; }
     public static void clearActiveIngredientGrid() { activeIngredientGrid = null; }
 
-    public static void setOnResultsPublished(Runnable callback) { onResultsPublished = callback; }
+    // --- Shared helpers ---
+
+    private static int getGridSize() {
+        return (MinecraftClient.getInstance().currentScreen instanceof CraftingScreen) ? 3 : 2;
+    }
+
+    private static Map<Item, Integer> getOrSnapshotInventory() {
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.world == null || client.player == null) return Map.of();
+        long tick = client.world.getTime();
+        if (tick != inventorySnapshotTick) {
+            Map<Item, Integer> snapshot = new HashMap<>();
+            Map<Item, Integer> containerSnapshot = new HashMap<>();
+            var inv = client.player.getInventory();
+            for (int i = 0; i < inv.size(); i++) {
+                ItemStack stack = inv.getStack(i);
+                if (stack.isEmpty()) continue;
+
+                if (ClientCraftConfig.searchContainers) {
+                    ContainerComponent container = stack.get(DataComponentTypes.CONTAINER);
+                    if (container != null) {
+                        for (ItemStack contained : container.iterateNonEmpty()) {
+                            containerSnapshot.merge(contained.getItem(), contained.getCount(), Integer::sum);
+                        }
+                    }
+                    BundleContentsComponent bundle = stack.get(DataComponentTypes.BUNDLE_CONTENTS);
+                    if (bundle != null) {
+                        for (ItemStack contained : bundle.iterate()) {
+                            containerSnapshot.merge(contained.getItem(), contained.getCount(), Integer::sum);
+                        }
+                    }
+                }
+
+                if (stack.contains(DataComponentTypes.CUSTOM_NAME)) continue;
+                snapshot.merge(stack.getItem(), stack.getCount(), Integer::sum);
+            }
+            inventorySnapshotTick = tick;
+            if (!resolving && (!snapshot.equals(cachedInventory) || !containerSnapshot.equals(cachedContainerInventory))) {
+                cachedInventory = snapshot;
+                cachedContainerInventory = containerSnapshot;
+                rebuildInventoryTagIndex();
+                inventoryGeneration++;
+            }
+        }
+        return cachedInventory;
+    }
+
+    private static void ensureIndex() {
+        if (!recipeIndexDirty && !recipesByOutput.isEmpty()) return;
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.player == null) return;
+        Map<Item, List<RecipeDisplayEntry>> index = new HashMap<>();
+        knownTags.clear();
+        for (RecipeResultCollection coll : client.player.getRecipeBook().getResultsForCategory(RecipeBookType.CRAFTING)) {
+            for (RecipeDisplayEntry entry : coll.getAllRecipes()) {
+                Item out = getOutputItem(entry.display());
+                if (out != null) index.computeIfAbsent(out, k -> new ArrayList<>()).add(entry);
+                List<SlotDisplay> slots = getSlots(entry.display());
+                if (slots != null) for (SlotDisplay slot : slots) collectTags(slot);
+            }
+        }
+        recipesByOutput = index;
+        recipeIndexDirty = false;
+        for (Item item : index.keySet()) computeTagsForItem(item);
+    }
+
+    private static void prepareContext() {
+        currentGridSize = getGridSize();
+        ensureIndex();
+        getOrSnapshotInventory();
+    }
+
+    private static Map<Item, Integer> mergeMaps(Map<Item, Integer> a, Map<Item, Integer> b) {
+        Map<Item, Integer> m = new HashMap<>(a);
+        b.forEach((k, v) -> m.merge(k, v, Integer::sum));
+        return m;
+    }
+
+    // --- Tag cache ---
+
+    private static void collectTags(SlotDisplay slot) {
+        if (slot instanceof SlotDisplay.TagSlotDisplay d) knownTags.add(d.tag());
+        else if (slot instanceof SlotDisplay.CompositeSlotDisplay d) {
+            for (SlotDisplay sub : d.contents()) collectTags(sub);
+        } else if (slot instanceof SlotDisplay.WithRemainderSlotDisplay d) collectTags(d.input());
+    }
+
+    private static Set<TagKey<Item>> computeTagsForItem(Item item) {
+        Set<TagKey<Item>> existing = itemToTags.get(item);
+        if (existing != null) return existing;
+
+        Set<TagKey<Item>> tags = new HashSet<>();
+        ItemStack stack = new ItemStack(item);
+        for (TagKey<Item> tag : knownTags) {
+            if (stack.isIn(tag)) tags.add(tag);
+        }
+        Set<TagKey<Item>> result = tags.isEmpty() ? Set.of() : tags;
+        itemToTags.put(item, result);
+        return result;
+    }
+
+    private static void rebuildInventoryTagIndex() {
+        Set<Item> currentInvKeys = cachedInventory.keySet();
+        Set<Item> currentContKeys = cachedContainerInventory.keySet();
+        if (currentInvKeys.equals(lastInventoryKeySet) && currentContKeys.equals(lastContainerKeySet)) return;
+
+        inventoryTagIndex.clear();
+        for (Item item : currentInvKeys) {
+            for (TagKey<Item> tag : computeTagsForItem(item)) {
+                inventoryTagIndex.computeIfAbsent(tag, k -> new HashSet<>()).add(item);
+            }
+        }
+
+        containerTagIndex.clear();
+        for (Item item : currentContKeys) {
+            for (TagKey<Item> tag : computeTagsForItem(item)) {
+                containerTagIndex.computeIfAbsent(tag, k -> new HashSet<>()).add(item);
+            }
+        }
+
+        lastInventoryKeySet = new HashSet<>(currentInvKeys);
+        lastContainerKeySet = new HashSet<>(currentContKeys);
+
+        craftableTagIndex.clear();
+        Map<TagKey<Item>, List<Item>> hasInputsMap = new HashMap<>();
+        Map<TagKey<Item>, List<Item>> noInputsMap = new HashMap<>();
+        for (Item item : recipesByOutput.keySet()) {
+            Set<TagKey<Item>> tags = computeTagsForItem(item);
+            if (tags.isEmpty()) continue;
+            boolean directInputs = hasDirectInputs(item);
+            Map<TagKey<Item>, List<Item>> target = directInputs ? hasInputsMap : noInputsMap;
+            for (TagKey<Item> tag : tags) {
+                target.computeIfAbsent(tag, k -> new ArrayList<>()).add(item);
+            }
+        }
+        for (TagKey<Item> tag : knownTags) {
+            List<Item> has = hasInputsMap.get(tag);
+            List<Item> no = noInputsMap.get(tag);
+            if (has != null || no != null) {
+                List<Item> combined = new ArrayList<>();
+                if (has != null) combined.addAll(has);
+                if (no != null) combined.addAll(no);
+                craftableTagIndex.put(tag, combined);
+            }
+        }
+
+    }
+
+    private static List<Item> getOrComputeTagMembers(TagKey<Item> tag) {
+        List<Item> cached = tagMembersCache.get(tag);
+        if (cached != null) return cached;
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.world == null) return null;
+        var regOpt = client.world.getRegistryManager().getOptional(RegistryKeys.ITEM);
+        if (regOpt.isEmpty()) return null;
+        var entriesOpt = regOpt.get().getOptional(tag);
+        if (entriesOpt.isEmpty()) return null;
+        List<Item> items = new ArrayList<>();
+        for (var entry : entriesOpt.get()) items.add(entry.value());
+        tagMembersCache.put(tag, items);
+        return items;
+    }
+
+    private static boolean hasDirectInputs(Item item) {
+        List<RecipeDisplayEntry> recipes = recipesByOutput.get(item);
+        if (recipes == null) return false;
+        outer: for (RecipeDisplayEntry entry : recipes) {
+            List<SlotDisplay> slots = getSlots(entry.display());
+            if (slots == null) continue;
+            for (SlotDisplay slot : slots) {
+                if (slot instanceof SlotDisplay.EmptySlotDisplay) continue;
+                if (slot instanceof SlotDisplay.TagSlotDisplay t) {
+                    if (inventoryTagIndex.containsKey(t.tag())) continue;
+                    continue outer;
+                }
+                if (slot instanceof SlotDisplay.CompositeSlotDisplay d) {
+                    boolean found = false;
+                    for (SlotDisplay sub : d.contents()) {
+                        ItemStack r = resolveSlot(sub, cachedInventory);
+                        if (!r.isEmpty() && cachedInventory.getOrDefault(r.getItem(), 0) > 0) { found = true; break; }
+                    }
+                    if (found) continue;
+                    continue outer;
+                }
+                if (slot instanceof SlotDisplay.WithRemainderSlotDisplay d) {
+                    SlotDisplay inner = d.input();
+                    if (inner instanceof SlotDisplay.TagSlotDisplay t) {
+                        if (inventoryTagIndex.containsKey(t.tag())) continue;
+                        continue outer;
+                    }
+                }
+                ItemStack r = resolveSlot(slot, cachedInventory);
+                if (!r.isEmpty() && cachedInventory.getOrDefault(r.getItem(), 0) > 0) continue;
+                continue outer;
+            }
+            return true; // all slots satisfied
+        }
+        return false;
+    }
+
+    private static ItemStack getAnyTagMember(TagKey<Item> tag) {
+        Item cached = tagFallbackItem.get(tag);
+        if (cached != null) return new ItemStack(cached);
+        List<Item> members = getOrComputeTagMembers(tag);
+        if (members == null || members.isEmpty()) return ItemStack.EMPTY;
+        tagFallbackItem.put(tag, members.getFirst());
+        return new ItemStack(members.getFirst());
+    }
 
     // --- Public API ---
 
@@ -79,319 +306,171 @@ public class RecipeResolver {
         if (client.player == null || client.world == null) return List.of();
 
         int gridSize = getGridSize();
+        currentGridSize = gridSize;
+        ensureIndex();
+        Map<Item, Integer> inventory = getOrSnapshotInventory();
 
-        // Build tree if needed (background thread for first build)
-        if (tree == null) {
-            if (!building) {
-                building = true;
-                List<RecipeResultCollection> allCrafting = new ArrayList<>(
-                        recipeBook.getResultsForCategory(RecipeBookType.CRAFTING));
-                lastRecipeCount = allCrafting.size();
+        long cacheKey = inventoryGeneration * 7L + gridSize;
+        if (cacheKey == lastCacheKey && !cachedResults.isEmpty()) return cachedResults;
+        if (resolving) return cachedResults;
+        if (recipesByOutput.isEmpty()) return List.of();
 
-                // Build placeholder results
-                List<RecipeResultCollection> placeholder = new ArrayList<>();
-                for (RecipeResultCollection coll : allCrafting) {
-                    List<RecipeDisplayEntry> entries = coll.getAllRecipes();
-                    if (!entries.isEmpty()) {
-                        RecipeResultCollection nc = new RecipeResultCollection(entries);
-                        RecipeResultCollectionAccessor acc = (RecipeResultCollectionAccessor) nc;
-                        for (RecipeDisplayEntry e : entries) acc.getDisplayableRecipes().add(e.id());
-                        placeholder.add(nc);
-                    }
-                }
-                cachedResults = placeholder;
-
-                RESOLVER_EXECUTOR.submit(() -> {
-                    try {
-                        long startTime = System.nanoTime();
-                        RecipeTree built = RecipeTreeBuilder.build(allCrafting);
-                        long elapsed = (System.nanoTime() - startTime) / 1_000_000;
-                        client.execute(() -> {
-                            tree = built;
-                            building = false;
-                            lastGeneration = -1; // Force full recalculation
-                            LOG.info("[CC] Tree built in {}ms ({} recipe groups)", elapsed, lastRecipeCount);
-                            Runnable cb = onResultsPublished;
-                            if (cb != null) cb.run();
-                        });
-                    } catch (Exception e) {
-                        LOG.error("[CC] Tree build failed", e);
-                        client.execute(() -> building = false);
-                    }
-                });
-            }
-            return cachedResults;
-        }
-
-        // Same-tick optimization
-        Set<Item> changed = tracker.snapshot(client.player.getInventory(), client.world.getTime());
-        if (changed == null) {
-            return cachedResults;
-        }
-
-        boolean gridChanged = gridSize != lastGridSize;
-        lastGridSize = gridSize;
-
-        // Check if recipes changed (new recipes unlocked)
         List<RecipeResultCollection> allCrafting = new ArrayList<>(
-                client.player.getRecipeBook().getResultsForCategory(RecipeBookType.CRAFTING));
-        if (allCrafting.size() != lastRecipeCount) {
-            clearCache();
-            return resolveForTab(recipeBook);
-        }
+                recipeBook.getResultsForCategory(RecipeBookType.CRAFTING));
+        if (allCrafting.isEmpty()) return List.of();
 
-        if (changed.isEmpty() && !gridChanged
-                && tracker.getGeneration() == lastGeneration && !cachedResults.isEmpty()) {
-            return cachedResults;
-        }
+        Map<Item, Integer> invSnapshot = new HashMap<>(inventory);
+        Map<Item, Integer> contSnapshot = new HashMap<>(cachedContainerInventory);
+        boolean checkContainers = ClientCraftConfig.searchContainers && !contSnapshot.isEmpty();
+        int snapGridSize = gridSize;
+        long snapCacheKey = cacheKey;
 
-        // Recalculate counts
-        long resolveStart = System.nanoTime();
-        Map<Item, Integer> inventory = tracker.getInventory();
-        Map<Item, Integer> containerInv = ClientCraftConfig.searchContainers
-                ? tracker.getContainerInventory() : null;
-        boolean hasContainers = containerInv != null && !containerInv.isEmpty();
-
-        if (gridChanged || craftCountsByItem.isEmpty() || changed.size() > 50) {
-            // Full recalculation
-            craftCountsByItem = CraftCalculator.calculateAllCounts(tree, inventory, containerInv, gridSize);
-        } else if (!changed.isEmpty()) {
-            // Delta recalculation
-            Set<Item> affected = CraftCalculator.computeAffectedItems(tree, changed);
-            CraftCalculator.updateCounts(tree, inventory, containerInv, gridSize, affected, craftCountsByItem);
-        }
-
-        lastGeneration = tracker.getGeneration();
-
-        // Build container-craftable set and recipe-id counts
-        Map<NetworkRecipeId, Integer> counts = new HashMap<>();
-        Set<NetworkRecipeId> containerSet = new HashSet<>();
-
-        // Compute container-only for items
-        Set<Item> containerOnlyItems = new HashSet<>();
-        if (hasContainers) {
-            for (Map.Entry<Item, Integer> e : craftCountsByItem.entrySet()) {
-                int directCount = CraftCalculator.maxCraftable(
-                        tree.getNode(e.getKey()) != null ? tree.getNode(e.getKey()) : new BaseResource(e.getKey()),
-                        tree, inventory, null, gridSize);
-                if (directCount <= 0 && e.getValue() > 0) {
-                    containerOnlyItems.add(e.getKey());
+        // Build placeholder results so tab is visible while background computes
+        if (cachedResults.isEmpty()) {
+            List<RecipeResultCollection> placeholder = new ArrayList<>();
+            for (RecipeResultCollection coll : allCrafting) {
+                List<RecipeDisplayEntry> entries = coll.getAllRecipes();
+                if (!entries.isEmpty()) {
+                    RecipeResultCollection nc = new RecipeResultCollection(entries);
+                    RecipeResultCollectionAccessor acc = (RecipeResultCollectionAccessor) nc;
+                    for (RecipeDisplayEntry e : entries) acc.getDisplayableRecipes().add(e.id());
+                    placeholder.add(nc);
                 }
             }
+            cachedResults = placeholder;
         }
 
-        // Build tab results
-        List<RecipeResultCollection> result = new ArrayList<>();
-        Map<RecipeResultCollection, Integer> ranks = new IdentityHashMap<>();
-        Set<RecipeResultCollection> autoCraft = new HashSet<>();
+        resolving = true;
 
-        for (RecipeResultCollection coll : allCrafting) {
-            List<RecipeDisplayEntry> allEntries = new ArrayList<>();
-            List<RecipeDisplayEntry> craftable = new ArrayList<>();
-            boolean hasDirect = false;
-            boolean hasContainer = false;
+        RESOLVER_EXECUTOR.submit(() -> {
+            try {
+                List<RecipeResultCollection> result = new ArrayList<>();
+                Map<NetworkRecipeId, Integer> counts = new HashMap<>();
+                Set<NetworkRecipeId> containerSet = new HashSet<>();
+                Map<RecipeResultCollection, Integer> ranks = new IdentityHashMap<>();
 
-            for (RecipeDisplayEntry entry : coll.getAllRecipes()) {
-                if (!RecipeTreeBuilder.fitsInGrid(entry.display(), gridSize)) continue;
-                Item out = RecipeTreeBuilder.getOutputItem(entry.display());
-                if (out == null) continue;
-                if (RecipeTreeBuilder.isSelfConsuming(entry, out)) continue;
+                Map<Item, Integer> combined = checkContainers ? mergeMaps(invSnapshot, contSnapshot) : null;
+                Set<Item> containerItemSet = checkContainers ? new HashSet<>(contSnapshot.keySet()) : Set.of();
 
-                allEntries.add(entry);
+                for (RecipeResultCollection coll : allCrafting) {
+                    List<RecipeDisplayEntry> allEntries = new ArrayList<>();
+                    List<RecipeDisplayEntry> craftable = new ArrayList<>();
+                    boolean hasDirect = false;
+                    boolean hasContainer = false;
 
-                int totalCount = craftCountsByItem.getOrDefault(out, 0);
-                int alreadyHave = inventory.getOrDefault(out, 0);
-                if (hasContainers) alreadyHave += containerInv.getOrDefault(out, 0);
-                int craftableCount = totalCount - alreadyHave;
-                if (craftableCount > 0) {
-                    int displayCount = simulateCraftableCount(out, entry.id(), inventory, containerInv, gridSize);
-                    if (displayCount <= 0) continue;
-                    craftable.add(entry);
-                    counts.put(entry.id(), Math.min(999, displayCount));
+                    for (RecipeDisplayEntry entry : coll.getAllRecipes()) {
+                        if (!fitsInGrid(entry.display(), snapGridSize)) continue;
+                        ItemStack outputStack = resolveSlot(entry.display().result());
+                        Item out = outputStack.isEmpty() ? null : outputStack.getItem();
+                        if (out != null && recipeConsumesItem(entry, out)) continue;
+                        allEntries.add(entry);
 
-                    if (containerOnlyItems.contains(out)) {
-                        containerSet.add(entry.id());
-                        hasContainer = true;
-                    } else {
-                        hasDirect = true;
+                        int outputCount = Math.max(1, outputStack.getCount());
+                        int repeats;
+                        if (ClientCraftConfig.quickCountMode) {
+                            Map<Item, Integer> temp = new HashMap<>(invSnapshot);
+                            repeats = resolve(entry, temp, null, new HashSet<>(), 0, null) ? 1 : 0;
+                        } else {
+                            repeats = countRepeats(entry, invSnapshot, outputCount);
+                        }
+                        if (repeats > 0) {
+                            craftable.add(entry);
+                            hasDirect = true;
+                            counts.put(entry.id(), ClientCraftConfig.quickCountMode ? outputCount : Math.min(repeats * outputCount, MAX_REPEATS));
+                        } else if (combined != null) {
+                            Map<Item, Integer> temp = new HashMap<>(combined);
+                            if (resolve(entry, temp, null, new HashSet<>(), 0, null)) {
+                                containerSet.add(entry.id());
+                                craftable.add(entry);
+                                hasContainer = true;
+                                if (out != null) containerItemSet.add(out);
+                            }
+                        }
+                    }
+
+                    if (!allEntries.isEmpty()) {
+                        RecipeResultCollection nc = new RecipeResultCollection(allEntries);
+                        RecipeResultCollectionAccessor acc = (RecipeResultCollectionAccessor) nc;
+                        for (RecipeDisplayEntry e : allEntries) acc.getDisplayableRecipes().add(e.id());
+                        for (RecipeDisplayEntry e : craftable) acc.getCraftableRecipes().add(e.id());
+                        ranks.put(nc, hasDirect ? 0 : hasContainer ? 1 : 2);
+                        result.add(nc);
                     }
                 }
+
+                Set<Item> finalContainerItemSet = containerItemSet;
+                MinecraftClient.getInstance().execute(() -> {
+                    craftCounts = counts;
+                    containerCraftable = containerSet;
+                    collectionRanks = ranks;
+                    autoCraftCollections = new HashSet<>(result);
+                    containerAvailableItems = finalContainerItemSet;
+                    cachedResults = result;
+                    lastCacheKey = snapCacheKey;
+                    resolving = false;
+
+                    Runnable callback = onResultsPublished;
+                    if (callback != null) callback.run();
+                });
+            } catch (Exception e) {
+                LOG.error("[CC] Background resolve failed", e);
+                MinecraftClient.getInstance().execute(() -> resolving = false);
             }
+        });
 
-            if (!allEntries.isEmpty()) {
-                RecipeResultCollection nc = new RecipeResultCollection(allEntries);
-                RecipeResultCollectionAccessor acc = (RecipeResultCollectionAccessor) nc;
-                for (RecipeDisplayEntry e : allEntries) acc.getDisplayableRecipes().add(e.id());
-                for (RecipeDisplayEntry e : craftable) acc.getCraftableRecipes().add(e.id());
-                ranks.put(nc, hasDirect ? 0 : hasContainer ? 1 : 2);
-                autoCraft.add(nc);
-                result.add(nc);
-            }
-        }
-
-        craftCounts = counts;
-        containerCraftable = containerSet;
-        collectionRanks = ranks;
-        autoCraftCollections = autoCraft;
-        cachedResults = result;
-
-        LOG.info("[CC] resolveForTab: {}ms ({} craftable)", (System.nanoTime() - resolveStart) / 1_000_000, counts.size());
         return cachedResults;
     }
 
     public static AutoCrafter.CraftPlan buildCraftCyclesForMode(RecipeDisplayEntry target, AutoCrafter.Mode mode) {
-        MinecraftClient client = MinecraftClient.getInstance();
-        if (client.player == null || client.world == null || tree == null) {
-            LOG.warn("[CC] buildCraftCycles: null client/player/world/tree");
-            return null;
-        }
+        if (MinecraftClient.getInstance().player == null) return null;
+        prepareContext();
 
-        int gridSize = getGridSize();
-        tracker.snapshot(client.player.getInventory(), client.world.getTime());
-        Map<Item, Integer> inventory = new HashMap<>(tracker.getInventory());
-        Map<Item, Integer> containerInv = ClientCraftConfig.searchContainers
-                ? tracker.getContainerInventory() : null;
-
-        if (containerInv != null && !containerInv.isEmpty()) {
-            containerInv.forEach((k, v) -> inventory.merge(k, v, Integer::sum));
-        }
-
-        Item outputItem = RecipeTreeBuilder.getOutputItem(target.display());
-        if (outputItem == null) {
-            LOG.warn("[CC] buildCraftCycles: outputItem is null for {}", target.id());
-            return null;
-        }
-
-        CraftedItem crafted = findMatchingCraftedItem(outputItem, target.id());
-        if (crafted == null) return null;
-
-        int outputCount = RecipeTreeBuilder.getOutputCount(target.display());
-        if (outputCount <= 0) outputCount = 1;
-
-        int maxAvailable = CraftCalculator.maxCraftable(crafted, tree, tracker.getInventory(),
-                ClientCraftConfig.searchContainers ? tracker.getContainerInventory() : null, gridSize);
-        if (maxAvailable <= 0) return null;
-
-        // Check if this is a direct recipe (no sub-crafting needed)
-        long startTime = System.nanoTime();
-        Set<Item> uncraftable = new HashSet<>();
+        Map<Item, Integer> available = new HashMap<>(cachedInventory);
         List<NetworkRecipeId> firstSteps = new ArrayList<>();
-        Map<Item, Integer> sim = new HashMap<>(inventory);
-        boolean canDirect = simulateCraft(crafted, sim, firstSteps, gridSize, new HashSet<>(), uncraftable);
+        if (!resolve(target, available, firstSteps, new HashSet<>(), 0, null)) return null;
 
-        boolean directCraft = canDirect && mode == AutoCrafter.Mode.ALL && firstSteps.size() == 1;
+        // A "direct" recipe has exactly 1 step (no sub-crafting required).
+        // For ALL mode with direct recipes, use craftAll to fill the grid with
+        // full stacks — like Shift+Click in the vanilla recipe book — so each
+        // click produces up to a full stack of output instead of one craft.
+        boolean directCraft = mode == AutoCrafter.Mode.ALL && firstSteps.size() == 1;
 
-        ItemStack output = RecipeTreeBuilder.resolveOutputSlot(target.display().result());
+        ItemStack output = resolveResult(target.display());
+        int outputCount = output.getCount();
+
         int maxRepeats;
         if (directCraft) {
             int craftsPerClick = output.getMaxCount() / outputCount;
-            int total = maxAvailable / outputCount;
+            int total = countRepeats(target, new HashMap<>(cachedInventory), outputCount);
             maxRepeats = Math.max(1, (total + craftsPerClick - 1) / craftsPerClick);
         } else {
             maxRepeats = switch (mode) {
                 case ONCE -> 1;
                 case STACK -> (output.getMaxCount() + outputCount - 1) / outputCount;
-                case ALL -> maxAvailable / outputCount;
+                case ALL -> MAX_REPEATS;
             };
         }
         if (maxRepeats <= 0) return null;
 
-        // Build step lists
         List<List<NetworkRecipeId>> cycles = new ArrayList<>();
-        sim = new HashMap<>(inventory);
+        cycles.add(firstSteps);
 
-        for (int r = 0; r < maxRepeats; r++) {
-            List<NetworkRecipeId> steps = new ArrayList<>();
-            if (!simulateCraft(crafted, sim, steps, gridSize, new HashSet<>(), uncraftable)) break;
-            cycles.add(steps);
+        if (directCraft) {
+            for (int r = 1; r < maxRepeats; r++) {
+                cycles.add(List.of(firstSteps.getFirst()));
+            }
+        } else {
+            for (int r = 1; r < maxRepeats; r++) {
+                List<NetworkRecipeId> steps = new ArrayList<>();
+                if (!resolve(target, available, steps, new HashSet<>(), 0, null)) break;
+                cycles.add(steps);
+            }
         }
-
-        if (cycles.isEmpty()) return null;
-        LOG.info("[CC] buildCraftCycles: {} in {}ms", outputItem, (System.nanoTime() - startTime) / 1_000_000);
         return new AutoCrafter.CraftPlan(cycles, directCraft);
     }
 
-    private static boolean simulateCraft(
-            CraftedItem target, Map<Item, Integer> sim,
-            List<NetworkRecipeId> steps, int gridSize, Set<Item> inProgress,
-            Set<Item> uncraftable) {
-        if (target.gridSize() > gridSize) return false;
-        if (!inProgress.add(target.item())) return false;
-        if (uncraftable.contains(target.item())) {
-            inProgress.remove(target.item());
-            return false;
-        }
-
-        for (IngredientEdge edge : target.ingredients()) {
-            for (int i = 0; i < edge.count(); i++) {
-                // Pick best option: prefer available in sim, then craftable
-                IngredientOption chosen = null;
-                for (IngredientOption opt : edge.options()) {
-                    if (sim.getOrDefault(opt.item(), 0) >= 1) {
-                        chosen = opt;
-                        break;
-                    }
-                }
-
-                if (chosen != null) {
-                    sim.put(chosen.item(), sim.get(chosen.item()) - 1);
-                } else {
-                    // Try sub-crafting: collect all candidate recipes per option
-                    boolean subCrafted = false;
-                    for (IngredientOption opt : edge.options()) {
-                        if (uncraftable.contains(opt.item())) continue;
-
-                        List<CraftedItem> candidates = new ArrayList<>();
-                        if (opt.node() instanceof CraftedItem c) candidates.add(c);
-                        if (tree != null) {
-                            List<CraftedItem> alts = tree.getAllRecipes(opt.item());
-                            if (alts != null) {
-                                for (CraftedItem alt : alts) {
-                                    if (!candidates.contains(alt)) candidates.add(alt);
-                                }
-                            }
-                        }
-
-                        boolean optSucceeded = false;
-                        for (CraftedItem subNode : candidates) {
-                            Map<Item, Integer> simBackup = new HashMap<>(sim);
-                            int stepsSize = steps.size();
-
-                            if (simulateCraft(subNode, sim, steps, gridSize, inProgress, uncraftable)) {
-                                int nowHave = sim.getOrDefault(opt.item(), 0);
-                                if (nowHave >= 1) {
-                                    sim.put(opt.item(), nowHave - 1);
-                                    optSucceeded = true;
-                                    subCrafted = true;
-                                    break;
-                                }
-                            }
-
-                            // Rollback sim and steps on failure
-                            sim.clear();
-                            sim.putAll(simBackup);
-                            while (steps.size() > stepsSize) steps.removeLast();
-                        }
-                        if (!optSucceeded) uncraftable.add(opt.item());
-                        if (subCrafted) break;
-                    }
-                    if (!subCrafted) {
-                        inProgress.remove(target.item());
-                        return false;
-                    }
-                }
-            }
-        }
-
-        // All ingredients consumed, add output
-        steps.add(target.recipeId());
-        sim.merge(target.item(), target.outputCount(), Integer::sum);
-        inProgress.remove(target.item());
-        return true;
-    }
-
     public static ItemStack resolveResult(RecipeDisplay display) {
-        ItemStack out = RecipeTreeBuilder.resolveOutputSlot(display.result());
+        ItemStack out = resolveSlot(display.result());
         return out.isEmpty() ? ItemStack.EMPTY : out;
     }
 
@@ -417,89 +496,308 @@ public class RecipeResolver {
     }
 
     public static RecipeResultCollection buildIngredientCollection(RecipeDisplayEntry originalEntry) {
-        MinecraftClient client = MinecraftClient.getInstance();
-        if (client.player == null || client.world == null || tree == null) return null;
-
-        int gridSize = getGridSize();
-        tracker.snapshot(client.player.getInventory(), client.world.getTime());
-        Map<Item, Integer> inventory = tracker.getInventory();
-
+        prepareContext();
         RecipeDisplay display = originalEntry.display();
-        List<SlotDisplay> slots = RecipeTreeBuilder.getSlots(display);
+        List<SlotDisplay> slots = getSlots(display);
         if (slots == null || slots.isEmpty()) return null;
 
         IngredientGrid grid = new IngredientGrid();
         Arrays.fill(grid.items, ItemStack.EMPTY);
-        fillGrid(grid, display, slots, inventory);
-        computeGridCraftability(grid, inventory, gridSize);
+        fillGrid(grid, display, slots);
+        computeGridCraftability(grid);
 
         activeIngredientGrid = grid;
         return buildFakeCollection(grid, originalEntry);
     }
 
     public static void clearCache() {
-        tree = null;
-        building = false;
+        resolving = false;
         onResultsPublished = null;
         cachedResults = List.of();
+        recipesByOutput = Map.of();
+        recipeIndexDirty = true;
         craftCounts = Map.of();
-        craftCountsByItem = new HashMap<>();
         containerCraftable = Set.of();
+        containerAvailableItems = Set.of();
         collectionRanks = Map.of();
         autoCraftCollections = Set.of();
-        lastGridSize = -1;
-        lastGeneration = -1;
-        lastRecipeCount = -1;
+        cachedInventory = Map.of();
+        cachedContainerInventory = Map.of();
+        inventorySnapshotTick = -1;
+        inventoryGeneration = 0;
+        lastCacheKey = 0;
         activeIngredientGrid = null;
         lowerCaseNameCache.clear();
-        tracker.clear();
+        knownTags.clear();
+        itemToTags.clear();
+        inventoryTagIndex.clear();
+        containerTagIndex.clear();
+        tagMembersCache.clear();
+        tagFallbackItem.clear();
+        craftableTagIndex.clear();
+        lastInventoryKeySet = Set.of();
+        lastContainerKeySet = Set.of();
     }
 
-    // --- Helpers ---
+    // --- Resolution engine ---
 
-    private static CraftedItem findMatchingCraftedItem(Item outputItem, NetworkRecipeId recipeId) {
-        if (tree == null) return null;
-        List<CraftedItem> recipes = tree.getAllRecipes(outputItem);
-        if (recipes == null || recipes.isEmpty()) {
-            RecipeNode node = tree.getNode(outputItem);
-            return node instanceof CraftedItem c ? c : null;
+    private static boolean resolve(
+            RecipeDisplayEntry entry, Map<Item, Integer> available,
+            List<NetworkRecipeId> stepsOut, Set<Item> inProgress, int depth,
+            Item rootOutput) {
+        if (depth > MAX_DEPTH) return false;
+
+        List<SlotDisplay> slots = getSlots(entry.display());
+        if (slots == null || slots.isEmpty()) return false;
+
+        Item outputItem = getOutputItem(entry.display());
+        if (outputItem != null && !inProgress.add(outputItem)) return false;
+        if (rootOutput == null) rootOutput = outputItem;
+
+        Map<Item, Integer> snapshot = new HashMap<>(available);
+        int stepsStart = stepsOut != null ? stepsOut.size() : 0;
+
+        boolean success = true;
+        for (SlotDisplay slot : slots) {
+            if (slot instanceof SlotDisplay.EmptySlotDisplay) continue;
+
+            ItemStack resolved = resolveSlot(slot, available);
+            if (resolved.isEmpty()) { success = false; break; }
+            Item item = resolved.getItem();
+
+            int have = available.getOrDefault(item, 0);
+            if (have >= 1) {
+                available.put(item, have - 1);
+                continue;
+            }
+
+            if (!trySubCraft(item, available, stepsOut, inProgress, depth, rootOutput)
+                    && !(depth <= 1 && tryTagFallback(slot, item, available, stepsOut, inProgress, depth, rootOutput))) {
+                success = false;
+                break;
+            }
         }
-        for (CraftedItem recipe : recipes) {
-            if (recipe.recipeId().equals(recipeId)) return recipe;
+
+        if (!success) {
+            available.clear();
+            available.putAll(snapshot);
+            if (stepsOut != null) while (stepsOut.size() > stepsStart) stepsOut.removeLast();
+            if (outputItem != null) inProgress.remove(outputItem);
+            return false;
         }
-        RecipeNode node = tree.getNode(outputItem);
-        if (node instanceof CraftedItem c) return c;
-        return recipes.getFirst();
+
+        if (stepsOut != null) stepsOut.add(entry.id());
+        if (outputItem != null) inProgress.remove(outputItem);
+        return true;
     }
 
-    private static int simulateCraftableCount(Item outputItem, NetworkRecipeId recipeId,
-                                              Map<Item, Integer> inventory,
-                                              Map<Item, Integer> containerInv, int gridSize) {
-        if (tree == null) return 0;
-        CraftedItem recipe = findMatchingCraftedItem(outputItem, recipeId);
-        if (recipe == null || recipe.gridSize() > gridSize) return 0;
+    private static boolean tryTagFallback(
+            SlotDisplay slot, Item alreadyTried, Map<Item, Integer> working,
+            List<NetworkRecipeId> stepsOut, Set<Item> inProgress, int depth, Item rootOutput) {
+        // Unwrap remainder displays
+        if (slot instanceof SlotDisplay.WithRemainderSlotDisplay d)
+            return tryTagFallback(d.input(), alreadyTried, working, stepsOut, inProgress, depth, rootOutput);
+
+        if (slot instanceof SlotDisplay.TagSlotDisplay d) {
+            TagKey<Item> tag = d.tag();
+            // First: check working map for items already available that match this tag
+            for (Map.Entry<Item, Integer> e : working.entrySet()) {
+                if (e.getKey().equals(alreadyTried)) continue;
+                if (e.getValue() >= 1 && computeTagsForItem(e.getKey()).contains(tag)) {
+                    working.put(e.getKey(), e.getValue() - 1);
+                    return true;
+                }
+            }
+            // Second: try sub-crafting from pre-computed list
+            List<Item> craftable = craftableTagIndex.get(tag);
+            if (craftable != null) {
+                for (Item alt : craftable) {
+                    if (alt.equals(alreadyTried)) continue;
+                    if (trySubCraft(alt, working, stepsOut, inProgress, depth, rootOutput)) return true;
+                }
+            }
+            return false;
+        }
+
+        if (slot instanceof SlotDisplay.CompositeSlotDisplay d) {
+            for (SlotDisplay sub : d.contents()) {
+                ItemStack r = resolveSlot(sub, working);
+                if (r.isEmpty() || r.getItem().equals(alreadyTried)) continue;
+                int have = working.getOrDefault(r.getItem(), 0);
+                if (have >= 1) { working.put(r.getItem(), have - 1); return true; }
+                if (trySubCraft(r.getItem(), working, stepsOut, inProgress, depth, rootOutput)) return true;
+            }
+            return false;
+        }
+
+        return false;
+    }
+
+    private static boolean trySubCraft(
+            Item item, Map<Item, Integer> working, List<NetworkRecipeId> stepsOut,
+            Set<Item> inProgress, int depth, Item rootOutput) {
+        List<RecipeDisplayEntry> subs = recipesByOutput.get(item);
+        if (subs == null) return false;
+        for (int i = 0, len = subs.size(); i < len; i++) {
+            RecipeDisplayEntry sub = subs.get(i);
+            if (!fitsInGrid(sub.display(), currentGridSize)) continue;
+            int subOutput = getOutputCount(sub.display());
+            if (subOutput <= 0) continue;
+            if (rootOutput != null && recipeConsumesItem(sub, rootOutput)) continue;
+
+            Map<Item, Integer> temp = new HashMap<>(working);
+            List<NetworkRecipeId> tempSteps = stepsOut != null ? new ArrayList<>() : null;
+
+            if (resolve(sub, temp, tempSteps, inProgress, depth + 1, rootOutput)) {
+                working.clear();
+                working.putAll(temp);
+                working.merge(item, subOutput - 1, Integer::sum);
+                if (stepsOut != null) stepsOut.addAll(tempSteps);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // --- Repeat counting ---
+
+    private static int countRepeats(RecipeDisplayEntry target, Map<Item, Integer> inventory, int outputCount) {
+        int maxRepeats = Math.max(1, MAX_REPEATS / outputCount);
+        int mathCount = tryMathCount(target, inventory, maxRepeats);
+        if (mathCount >= 0) return mathCount;
 
         Map<Item, Integer> sim = new HashMap<>(inventory);
-        if (containerInv != null) containerInv.forEach((k, v) -> sim.merge(k, v, Integer::sum));
-
-        int total = 0;
-        for (int i = 0; i < 999; i++) {
-            int before = sim.getOrDefault(outputItem, 0);
-            if (!simulateCraft(recipe, sim, new ArrayList<>(), gridSize,
-                    new HashSet<>(), new HashSet<>())) break;
-            int gained = sim.getOrDefault(outputItem, 0) - before;
-            if (gained <= 0) break;
-            total += gained;
+        int count = 0;
+        while (count < maxRepeats) {
+            if (!resolve(target, sim, null, new HashSet<>(), 0, null)) break;
+            count++;
         }
-        return total;
+        return count;
     }
 
-    private static int getGridSize() {
-        return (MinecraftClient.getInstance().currentScreen instanceof CraftingScreen) ? 3 : 2;
+    private static int tryMathCount(RecipeDisplayEntry target, Map<Item, Integer> inventory, int maxRepeats) {
+        List<SlotDisplay> slots = getSlots(target.display());
+        if (slots == null) return -1;
+
+        Map<Item, Integer> needed = new HashMap<>();
+        for (SlotDisplay slot : slots) {
+            if (slot instanceof SlotDisplay.EmptySlotDisplay) continue;
+            ItemStack resolved = resolveSlot(slot, inventory);
+            if (resolved.isEmpty()) return -1;
+            Item item = resolved.getItem();
+            if (inventory.getOrDefault(item, 0) <= 0) return -1;
+            needed.merge(item, 1, Integer::sum);
+        }
+
+        if (needed.isEmpty()) return 0;
+        int maxCrafts = maxRepeats;
+        for (var e : needed.entrySet()) {
+            int crafts = inventory.getOrDefault(e.getKey(), 0) / e.getValue();
+            if (crafts < maxCrafts) maxCrafts = crafts;
+        }
+        // If the bottleneck ingredient can be sub-crafted, bail to simulation
+        for (var e : needed.entrySet()) {
+            if (inventory.getOrDefault(e.getKey(), 0) / e.getValue() == maxCrafts
+                    && recipesByOutput.containsKey(e.getKey())) {
+                return -1;
+            }
+        }
+        return maxCrafts;
     }
 
-    private static void fillGrid(IngredientGrid grid, RecipeDisplay display,
-                                 List<SlotDisplay> slots, Map<Item, Integer> inventory) {
+    // --- Recipe helpers ---
+
+    private static boolean recipeConsumesItem(RecipeDisplayEntry entry, Item target) {
+        List<SlotDisplay> slots = getSlots(entry.display());
+        if (slots == null) return false;
+        for (SlotDisplay slot : slots) {
+            ItemStack resolved = resolveSlot(slot, cachedInventory);
+            if (!resolved.isEmpty() && resolved.getItem().equals(target)) return true;
+        }
+        return false;
+    }
+
+    private static List<SlotDisplay> getSlots(RecipeDisplay display) {
+        if (display instanceof ShapedCraftingRecipeDisplay s) return s.ingredients();
+        if (display instanceof ShapelessCraftingRecipeDisplay s) return s.ingredients();
+        return null;
+    }
+
+    private static boolean fitsInGrid(RecipeDisplay display, int gridSize) {
+        if (display instanceof ShapedCraftingRecipeDisplay s) {
+            return s.width() <= gridSize && s.height() <= gridSize;
+        } else if (display instanceof ShapelessCraftingRecipeDisplay s) {
+            List<SlotDisplay> ingredients = s.ingredients();
+            int count = 0;
+            for (int i = 0, len = ingredients.size(); i < len; i++) {
+                if (!(ingredients.get(i) instanceof SlotDisplay.EmptySlotDisplay)) count++;
+            }
+            return count <= gridSize * gridSize;
+        }
+        return false;
+    }
+
+    private static Item getOutputItem(RecipeDisplay display) {
+        ItemStack out = resolveSlot(display.result());
+        return out.isEmpty() ? null : out.getItem();
+    }
+
+    private static int getOutputCount(RecipeDisplay display) {
+        ItemStack out = resolveSlot(display.result());
+        return out.isEmpty() ? 0 : out.getCount();
+    }
+
+    // --- Slot resolution ---
+
+    private static ItemStack resolveSlot(SlotDisplay display) {
+        return resolveSlot(display, cachedInventory);
+    }
+
+    private static ItemStack resolveSlot(SlotDisplay display, Map<Item, Integer> inventory) {
+        if (display instanceof SlotDisplay.EmptySlotDisplay) return ItemStack.EMPTY;
+        if (display instanceof SlotDisplay.ItemSlotDisplay d) return new ItemStack(d.item());
+        if (display instanceof SlotDisplay.StackSlotDisplay d) {
+            return new ItemStack(d.stack().getItem(), d.stack().getCount());
+        }
+        if (display instanceof SlotDisplay.TagSlotDisplay d) {
+            TagKey<Item> tag = d.tag();
+            // 1. Check inventory items matching this tag
+            Set<Item> matches = inventoryTagIndex.get(tag);
+            if (matches != null) {
+                for (Item item : matches) {
+                    if (inventory.getOrDefault(item, 0) > 0) return new ItemStack(item);
+                }
+            }
+            // 2. Check working map (resolve() decrements counts into working copies)
+            if (inventory != cachedInventory) {
+                for (Item item : inventory.keySet()) {
+                    if (inventory.get(item) > 0 && computeTagsForItem(item).contains(tag)) return new ItemStack(item);
+                }
+            }
+            // 3. Return a sub-craftable item so trySubCraft() can handle it
+            List<Item> craftable = craftableTagIndex.get(tag);
+            if (craftable != null) return new ItemStack(craftable.getFirst());
+            // 4. Fallback for display purposes
+            return getAnyTagMember(tag);
+        }
+        if (display instanceof SlotDisplay.WithRemainderSlotDisplay d) return resolveSlot(d.input(), inventory);
+        if (display instanceof SlotDisplay.CompositeSlotDisplay d) {
+            ItemStack fallback = ItemStack.EMPTY;
+            for (SlotDisplay sub : d.contents()) {
+                ItemStack r = resolveSlot(sub, inventory);
+                if (!r.isEmpty()) {
+                    if (inventory.getOrDefault(r.getItem(), 0) > 0) return r;
+                    if (fallback.isEmpty()) fallback = r;
+                }
+            }
+            return fallback;
+        }
+        return ItemStack.EMPTY;
+    }
+
+    // --- Ingredient grid building ---
+
+    private static void fillGrid(IngredientGrid grid, RecipeDisplay display, List<SlotDisplay> slots) {
         if (display instanceof ShapedCraftingRecipeDisplay shaped) {
             int w = shaped.width(), h = shaped.height();
             for (int row = 0; row < h; row++) for (int col = 0; col < w; col++) {
@@ -507,7 +805,7 @@ public class RecipeResolver {
                 if (srcIdx >= slots.size()) continue;
                 SlotDisplay slot = slots.get(srcIdx);
                 if (slot instanceof SlotDisplay.EmptySlotDisplay) continue;
-                ItemStack resolved = resolveIngredientSlot(slot, inventory);
+                ItemStack resolved = resolveGridSlot(slot);
                 if (!resolved.isEmpty()) {
                     int gridIdx = row * 3 + col;
                     grid.items[gridIdx] = resolved;
@@ -519,7 +817,7 @@ public class RecipeResolver {
             for (int i = 0, len = slots.size(); i < len && idx < 9; i++) {
                 SlotDisplay slot = slots.get(i);
                 if (slot instanceof SlotDisplay.EmptySlotDisplay) continue;
-                ItemStack resolved = resolveIngredientSlot(slot, inventory);
+                ItemStack resolved = resolveGridSlot(slot);
                 if (!resolved.isEmpty()) {
                     grid.items[idx] = resolved;
                     grid.slots[idx] = slot;
@@ -529,56 +827,52 @@ public class RecipeResolver {
         }
     }
 
-    private static ItemStack resolveIngredientSlot(SlotDisplay slot, Map<Item, Integer> inventory) {
-        MinecraftClient client = MinecraftClient.getInstance();
+    private static ItemStack resolveGridSlot(SlotDisplay slot) {
+        // First try: item already in inventory
+        ItemStack direct = resolveSlot(slot, cachedInventory);
+        if (!direct.isEmpty() && cachedInventory.getOrDefault(direct.getItem(), 0) > 0) return direct;
 
-        if (slot instanceof SlotDisplay.ItemSlotDisplay d) return new ItemStack(d.item().value());
-        if (slot instanceof SlotDisplay.StackSlotDisplay d)
-            return new ItemStack(d.stack().getItem(), d.stack().getCount());
+        // Second try: find an item we can sub-craft that satisfies this slot
+        ItemStack craftable = findCraftableForSlot(slot);
+        if (craftable != null) return craftable;
 
-        if (slot instanceof SlotDisplay.TagSlotDisplay d) {
-            if (client.world != null) {
-                var regOpt = client.world.getRegistryManager().getOptional(RegistryKeys.ITEM);
-                if (regOpt.isPresent()) {
-                    var entriesOpt = regOpt.get().getOptional(d.tag());
-                    if (entriesOpt.isPresent()) {
-                        ItemStack fallback = ItemStack.EMPTY;
-                        for (var entry : entriesOpt.get()) {
-                            Item item = entry.value();
-                            if (fallback.isEmpty()) fallback = new ItemStack(item);
-                            if (inventory.getOrDefault(item, 0) > 0) return new ItemStack(item);
-                            if (tree != null && tree.getNode(item) instanceof CraftedItem) {
-                                if (fallback.getItem() != item) fallback = new ItemStack(item);
-                            }
-                        }
-                        return fallback;
-                    }
-                }
-            }
-            return ItemStack.EMPTY;
-        }
-
-        if (slot instanceof SlotDisplay.CompositeSlotDisplay d) {
-            ItemStack fallback = ItemStack.EMPTY;
-            for (SlotDisplay sub : d.contents()) {
-                ItemStack r = resolveIngredientSlot(sub, inventory);
-                if (!r.isEmpty()) {
-                    if (inventory.getOrDefault(r.getItem(), 0) > 0) return r;
-                    if (fallback.isEmpty()) fallback = r;
-                }
-            }
-            return fallback;
-        }
-
-        if (slot instanceof SlotDisplay.WithRemainderSlotDisplay d) {
-            return resolveIngredientSlot(d.input(), inventory);
-        }
-
-        return ItemStack.EMPTY;
+        // Fallback: return whatever resolveSlot gives
+        return direct.isEmpty() ? resolveSlot(slot) : direct;
     }
 
-    private static void computeGridCraftability(IngredientGrid grid, Map<Item, Integer> inventory, int gridSize) {
-        Map<Item, Integer> remaining = new HashMap<>(inventory);
+    private static ItemStack findCraftableForSlot(SlotDisplay slot) {
+        if (slot instanceof SlotDisplay.TagSlotDisplay d) {
+            TagKey<Item> tag = d.tag();
+            Set<Item> invMatches = inventoryTagIndex.get(tag);
+            if (invMatches != null && !invMatches.isEmpty()) {
+                return new ItemStack(invMatches.iterator().next());
+            }
+            List<Item> craftable = craftableTagIndex.get(tag);
+            if (craftable != null) {
+                for (Item item : craftable) {
+                    if (canSubCraft(item, cachedInventory)) return new ItemStack(item);
+                }
+            }
+        } else if (slot instanceof SlotDisplay.CompositeSlotDisplay d) {
+            ItemStack fallback = ItemStack.EMPTY;
+            for (SlotDisplay sub : d.contents()) {
+                ItemStack r = resolveSlot(sub, cachedInventory);
+                if (r.isEmpty()) continue;
+                if (fallback.isEmpty()) fallback = r;
+                if (cachedInventory.getOrDefault(r.getItem(), 0) > 0) return r;
+                if (canSubCraft(r.getItem(), cachedInventory)) return r;
+            }
+            if (!fallback.isEmpty()) return fallback;
+        } else if (slot instanceof SlotDisplay.WithRemainderSlotDisplay d) {
+            return findCraftableForSlot(d.input());
+        }
+        return null;
+    }
+
+    private static void computeGridCraftability(IngredientGrid grid) {
+        Map<Item, Integer> remaining = new HashMap<>(getOrSnapshotInventory());
+        ensureIndex();
+        boolean hasContainer = !containerAvailableItems.isEmpty();
 
         for (int i = 0; i < 9; i++) {
             ItemStack stack = grid.items[i];
@@ -591,19 +885,51 @@ public class RecipeResolver {
             if (have >= 1) {
                 remaining.put(item, have - 1);
                 grid.craftable[i] = true;
-            } else if (tree != null) {
-                RecipeNode node = tree.getNode(item);
-                if (node instanceof CraftedItem) {
-                    int canCraft = CraftCalculator.maxCraftable(node, tree, remaining, null, gridSize);
-                    grid.craftable[i] = canCraft > 0;
+            } else if (hasContainer) {
+                Item found = findInSet(grid.slots[i], item, containerAvailableItems);
+                if (found != null) {
+                    grid.inContainer[i] = true;
+                    if (found != item) grid.items[i] = new ItemStack(found);
                 } else {
-                    Map<Item, Integer> containerInv = tracker.getContainerInventory();
-                    if (containerInv.getOrDefault(item, 0) > 0) {
-                        grid.inContainer[i] = true;
-                    }
+                    grid.craftable[i] = canSubCraft(item, remaining);
                 }
+            } else {
+                grid.craftable[i] = canSubCraft(item, remaining);
             }
         }
+    }
+
+    private static boolean canSubCraft(Item item, Map<Item, Integer> available) {
+        List<RecipeDisplayEntry> subs = recipesByOutput.get(item);
+        if (subs == null) return false;
+        for (RecipeDisplayEntry sub : subs) {
+            if (!fitsInGrid(sub.display(), currentGridSize)) continue;
+            Map<Item, Integer> temp = new HashMap<>(available);
+            if (resolve(sub, temp, null, new HashSet<>(), 0, null)) return true;
+        }
+        return false;
+    }
+
+    private static Item findInSet(SlotDisplay slot, Item resolved, Set<Item> items) {
+        if (items.contains(resolved)) return resolved;
+        if (slot instanceof SlotDisplay.TagSlotDisplay d) {
+            Set<Item> contMatches = containerTagIndex.get(d.tag());
+            if (contMatches != null) {
+                for (Item item : contMatches) if (items.contains(item)) return item;
+            }
+            List<Item> members = getOrComputeTagMembers(d.tag());
+            if (members != null) {
+                for (Item member : members) if (items.contains(member)) return member;
+            }
+        } else if (slot instanceof SlotDisplay.CompositeSlotDisplay comp) {
+            for (SlotDisplay sub : comp.contents()) {
+                Item item = findInSet(sub, resolved, items);
+                if (item != null) return item;
+            }
+        } else if (slot instanceof SlotDisplay.WithRemainderSlotDisplay rem) {
+            return findInSet(rem.input(), resolved, items);
+        }
+        return null;
     }
 
     private static RecipeResultCollection buildFakeCollection(IngredientGrid grid, RecipeDisplayEntry originalEntry) {
@@ -619,10 +945,7 @@ public class RecipeResolver {
         }
         RecipeResultCollection collection = new RecipeResultCollection(entries);
         RecipeResultCollectionAccessor acc = (RecipeResultCollectionAccessor) collection;
-        for (RecipeDisplayEntry e : entries) {
-            acc.getDisplayableRecipes().add(e.id());
-            acc.getCraftableRecipes().add(e.id());
-        }
+        for (RecipeDisplayEntry e : entries) { acc.getDisplayableRecipes().add(e.id()); acc.getCraftableRecipes().add(e.id()); }
         return collection;
     }
 }
