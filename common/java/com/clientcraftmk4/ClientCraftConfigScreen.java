@@ -25,13 +25,19 @@ public class ClientCraftConfigScreen extends Screen {
                     ClientCraftConfig.searchContainers = value;
                 }));
 
-        addDrawableChild(new DelaySlider(centerX, y + 26, 200, 20, ClientCraftConfig.delayTicks));
+        addDrawableChild(CyclingButtonWidget.onOffBuilder()
+                .initially(ClientCraftConfig.quickCountMode)
+                .build(centerX, y + 26, 200, 20, Text.literal("Quick Count Mode"), (button, value) -> {
+                    ClientCraftConfig.quickCountMode = value;
+                }));
+
+        addDrawableChild(new DelaySlider(centerX, y + 52, 200, 20, ClientCraftConfig.delayTicks));
 
         addDrawableChild(ButtonWidget.builder(Text.literal("Done"), button -> {
             ClientCraftConfig.save();
             RecipeResolver.clearCache();
             client.setScreen(parent);
-        }).dimensions(centerX, y + 62, 200, 20).build());
+        }).dimensions(centerX, y + 88, 200, 20).build());
     }
 
     private static class DelaySlider extends SliderWidget {
