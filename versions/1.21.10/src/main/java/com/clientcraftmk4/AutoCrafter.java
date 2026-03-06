@@ -9,10 +9,14 @@ import net.minecraft.recipe.RecipeDisplayEntry;
 import net.minecraft.screen.AbstractCraftingScreenHandler;
 import net.minecraft.screen.slot.SlotActionType;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.util.ArrayList;
 import java.util.List;
 
 public class AutoCrafter {
+    private static final Logger LOG = LoggerFactory.getLogger("ClientCraftMK4");
     public enum Mode { ONCE, STACK, ALL }
 
     /** Result from buildCraftCyclesForMode containing the step list and whether craftAll can be used. */
@@ -24,11 +28,21 @@ public class AutoCrafter {
     private static int tickCounter;
 
     public static void execute(RecipeDisplayEntry target, Mode mode) {
-        if (steps != null) return;
-        if (getHandler() == null) return;
+        if (steps != null) {
+            LOG.info("[CC] AutoCrafter.execute: already executing, skipping");
+            return;
+        }
+        if (getHandler() == null) {
+            LOG.info("[CC] AutoCrafter.execute: no handler (not in crafting screen)");
+            return;
+        }
 
+        LOG.info("[CC] AutoCrafter.execute: target={}, mode={}", target.id(), mode);
         CraftPlan plan = RecipeResolver.buildCraftCyclesForMode(target, mode);
-        if (plan == null || plan.cycles().isEmpty()) return;
+        if (plan == null || plan.cycles().isEmpty()) {
+            LOG.info("[CC] AutoCrafter.execute: plan is null or empty");
+            return;
+        }
 
         // Flatten all cycles into a single step list
         List<NetworkRecipeId> flat = new ArrayList<>();
