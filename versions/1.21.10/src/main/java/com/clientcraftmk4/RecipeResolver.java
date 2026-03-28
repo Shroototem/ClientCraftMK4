@@ -1030,35 +1030,6 @@ public class RecipeResolver {
         return true;
     }
 
-    /** Quick O(slots) check: can this recipe possibly be crafted? */
-    private static boolean canCraftAtAll(RecipeDisplayEntry entry, Map<Item, Integer> inventory) {
-        List<SlotDisplay> slots = getSlots(entry.display());
-        if (slots == null) return false;
-        for (SlotDisplay slot : slots) {
-            if (slot instanceof SlotDisplay.EmptySlotDisplay) continue;
-            ItemStack resolved = resolveSlot(slot, inventory);
-            if (resolved.isEmpty()) return false;
-            Item item = resolved.getItem();
-            if (inventory.getOrDefault(item, 0) > 0) continue;
-            // Check if this item can actually be sub-crafted from what we have
-            if (canSubCraftMore(item, inventory)) continue;
-            TagKey<Item> tag = getSlotTag(slot);
-            if (tag != null) {
-                if (sumTagInventory(tag, inventory) > 0) continue;
-                List<Item> craftable = craftableTagIndex.get(tag);
-                if (craftable != null) {
-                    boolean found = false;
-                    for (Item ci : craftable) {
-                        if (inventory.getOrDefault(ci, 0) > 0 || canSubCraftMore(ci, inventory)) { found = true; break; }
-                    }
-                    if (found) continue;
-                }
-            }
-            return false;
-        }
-        return true;
-    }
-
     private static List<SlotDisplay> getSlots(RecipeDisplay display) {
         if (display instanceof ShapedCraftingRecipeDisplay s) return s.ingredients();
         if (display instanceof ShapelessCraftingRecipeDisplay s) return s.ingredients();
