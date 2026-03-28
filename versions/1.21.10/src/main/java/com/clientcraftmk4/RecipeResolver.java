@@ -344,6 +344,8 @@ public class RecipeResolver {
 
         RESOLVER_EXECUTOR.submit(() -> {
             try {
+                long t0 = System.nanoTime();
+
                 List<RecipeResultCollection> result = new ArrayList<>();
                 Map<NetworkRecipeId, Integer> counts = new HashMap<>();
                 Set<NetworkRecipeId> containerSet = new HashSet<>();
@@ -351,6 +353,19 @@ public class RecipeResolver {
 
                 Map<Item, Integer> combined = checkContainers ? mergeMaps(invSnapshot, contSnapshot) : null;
                 Set<Item> containerItemSet = checkContainers ? new HashSet<>(contSnapshot.keySet()) : Set.of();
+                Set<Item> sharedInProgress = new HashSet<>();
+                Map<Item, Integer> tempInv = new HashMap<>();
+
+                int totalRecipes = 0, mathPathCount = 0, simPathCount = 0;
+                int preCheckSkipped = 0, containerChecked = 0;
+                long mathTimeNs = 0, simTimeNs = 0, containerTimeNs = 0, preCheckTimeNs = 0;
+
+                // Pre-compute the full set of items reachable from inventory via crafting chains.
+                // This is a fixed-point closure: start with inventory items, then repeatedly add
+                // items whose recipes are fully satisfiable from the set, until nothing new is added.
+                long tReachable = System.nanoTime();
+                Set<Item> reachableItems = computeReachableItems(invSnapshot, snapGridSize);
+                long reachableMs = (System.nanoTime() - tReachable) / 1_000_000;
 
                 for (RecipeResultCollection coll : allCrafting) {
                     List<RecipeDisplayEntry> allEntries = new ArrayList<>();
@@ -364,27 +379,55 @@ public class RecipeResolver {
                         Item out = outputStack.isEmpty() ? null : outputStack.getItem();
                         if (out != null && recipeConsumesItem(entry, out)) continue;
                         allEntries.add(entry);
+                        totalRecipes++;
 
                         int outputCount = Math.max(1, outputStack.getCount());
-                        int repeats;
-                        if (ClientCraftConfig.quickCountMode) {
-                            Map<Item, Integer> temp = new HashMap<>(invSnapshot);
-                            repeats = resolve(entry, temp, null, new HashSet<>(), 0, null) ? 1 : 0;
+                        int repeats = 0;
+
+                        long tPre = System.nanoTime();
+                        boolean canCraft = allSlotsReachable(entry, reachableItems);
+                        preCheckTimeNs += System.nanoTime() - tPre;
+
+                        if (canCraft) {
+                            if (ClientCraftConfig.quickCountMode) {
+                                tempInv.clear(); tempInv.putAll(invSnapshot);
+                                sharedInProgress.clear();
+                                repeats = resolve(entry, tempInv, null, sharedInProgress, 0, null) ? 1 : 0;
+                            } else {
+                                int maxRepeats = Math.max(1, MAX_REPEATS / outputCount);
+                                long tMath = System.nanoTime();
+                                int mathResult = tryMathCount(entry, invSnapshot, maxRepeats);
+                                mathTimeNs += System.nanoTime() - tMath;
+
+                                if (mathResult >= 0) {
+                                    repeats = mathResult;
+                                    mathPathCount++;
+                                } else {
+                                    long tSim = System.nanoTime();
+                                    repeats = countRepeats(entry, invSnapshot, outputCount);
+                                    simTimeNs += System.nanoTime() - tSim;
+                                    simPathCount++;
+                                }
+                            }
                         } else {
-                            repeats = countRepeats(entry, invSnapshot, outputCount);
+                            preCheckSkipped++;
                         }
                         if (repeats > 0) {
                             craftable.add(entry);
                             hasDirect = true;
-                            counts.put(entry.id(), ClientCraftConfig.quickCountMode ? outputCount : Math.min(repeats * outputCount, MAX_REPEATS));
+                            counts.put(entry.id(), ClientCraftConfig.quickCountMode ? outputCount : (int) Math.min((long) repeats * outputCount, MAX_REPEATS));
                         } else if (combined != null) {
-                            Map<Item, Integer> temp = new HashMap<>(combined);
-                            if (resolve(entry, temp, null, new HashSet<>(), 0, null)) {
+                            containerChecked++;
+                            long tCont = System.nanoTime();
+                            tempInv.clear(); tempInv.putAll(combined);
+                            sharedInProgress.clear();
+                            if (resolve(entry, tempInv, null, sharedInProgress, 0, null)) {
                                 containerSet.add(entry.id());
                                 craftable.add(entry);
                                 hasContainer = true;
                                 if (out != null) containerItemSet.add(out);
                             }
+                            containerTimeNs += System.nanoTime() - tCont;
                         }
                     }
 
@@ -397,6 +440,15 @@ public class RecipeResolver {
                         result.add(nc);
                     }
                 }
+
+                long totalMs = (System.nanoTime() - t0) / 1_000_000;
+                LOG.info("[CC] Resolve: {}ms | {} recipes | reachable: {}ms ({} items) | skip:{} math:{} sim:{} cont:{}",
+                        totalMs, totalRecipes,
+                        reachableMs, reachableItems.size(),
+                        preCheckSkipped, mathPathCount, simPathCount, containerChecked);
+                LOG.info("[CC] Timing: preCheck={}ms math={}ms sim={}ms container={}ms",
+                        preCheckTimeNs / 1_000_000, mathTimeNs / 1_000_000,
+                        simTimeNs / 1_000_000, containerTimeNs / 1_000_000);
 
                 Set<Item> finalContainerItemSet = containerItemSet;
                 MinecraftClient.getInstance().execute(() -> {
@@ -436,7 +488,7 @@ public class RecipeResolver {
         boolean directCraft = mode == AutoCrafter.Mode.ALL && firstSteps.size() == 1;
 
         ItemStack output = resolveResult(target.display());
-        int outputCount = output.getCount();
+        int outputCount = Math.max(1, output.getCount());
 
         int maxRepeats;
         if (directCraft) {
@@ -554,7 +606,12 @@ public class RecipeResolver {
         if (outputItem != null && !inProgress.add(outputItem)) return false;
         if (rootOutput == null) rootOutput = outputItem;
 
-        Map<Item, Integer> snapshot = new HashMap<>(available);
+        // Defer full snapshot until sub-crafting is needed. Track direct
+        // consumptions cheaply so we can roll back without a HashMap copy
+        // when only direct items are used (the common case in simulation).
+        Map<Item, Integer> snapshot = null;
+        Item[] consumed = null;
+        int consumedCount = 0;
         int stepsStart = stepsOut != null ? stepsOut.size() : 0;
 
         boolean success = true;
@@ -568,7 +625,15 @@ public class RecipeResolver {
             int have = available.getOrDefault(item, 0);
             if (have >= 1) {
                 available.put(item, have - 1);
+                if (consumed == null) consumed = new Item[slots.size()];
+                consumed[consumedCount++] = item;
                 continue;
+            }
+
+            // Sub-crafting needed: take full snapshot, restoring already-consumed items
+            if (snapshot == null) {
+                snapshot = new HashMap<>(available);
+                for (int i = 0; i < consumedCount; i++) snapshot.merge(consumed[i], 1, Integer::sum);
             }
 
             if (!trySubCraft(item, available, stepsOut, inProgress, depth, rootOutput)
@@ -579,8 +644,12 @@ public class RecipeResolver {
         }
 
         if (!success) {
-            available.clear();
-            available.putAll(snapshot);
+            if (snapshot != null) {
+                available.clear();
+                available.putAll(snapshot);
+            } else {
+                for (int i = 0; i < consumedCount; i++) available.merge(consumed[i], 1, Integer::sum);
+            }
             if (stepsOut != null) while (stepsOut.size() > stepsStart) stepsOut.removeLast();
             if (outputItem != null) inProgress.remove(outputItem);
             return false;
@@ -645,14 +714,10 @@ public class RecipeResolver {
             if (subOutput <= 0) continue;
             if (rootOutput != null && recipeConsumesItem(sub, rootOutput)) continue;
 
-            Map<Item, Integer> temp = new HashMap<>(working);
-            List<NetworkRecipeId> tempSteps = stepsOut != null ? new ArrayList<>() : null;
-
-            if (resolve(sub, temp, tempSteps, inProgress, depth + 1, rootOutput)) {
-                working.clear();
-                working.putAll(temp);
+            // resolve() snapshots and rolls back working/stepsOut on failure,
+            // so we can pass them directly instead of copying.
+            if (resolve(sub, working, stepsOut, inProgress, depth + 1, rootOutput)) {
                 working.merge(item, subOutput - 1, Integer::sum);
-                if (stepsOut != null) stepsOut.addAll(tempSteps);
                 return true;
             }
         }
@@ -667,39 +732,178 @@ public class RecipeResolver {
         if (mathCount >= 0) return mathCount;
 
         Map<Item, Integer> sim = new HashMap<>(inventory);
+        Set<Item> inProgress = new HashSet<>();
         int count = 0;
         while (count < maxRepeats) {
-            if (!resolve(target, sim, null, new HashSet<>(), 0, null)) break;
+            // Batch direct-only iterations (items already in sim, no sub-crafting)
+            int direct = skipDirectCrafts(target, sim, maxRepeats - count);
+            if (direct > 0) {
+                count += direct;
+                continue;
+            }
+
+            // Resolve once with sub-crafting, then extrapolate the cost
+            Map<Item, Integer> before = new HashMap<>(sim);
+            inProgress.clear();
+            if (!resolve(target, sim, null, inProgress, 0, null)) break;
             count++;
+
+            // Compute full delta: both consumed items (negative) and surplus produced (positive).
+            // Extrapolate by applying this delta repeatedly until any item would go negative.
+            Map<Item, Integer> delta = new HashMap<>();
+            for (var e : before.entrySet()) {
+                int d = sim.getOrDefault(e.getKey(), 0) - e.getValue();
+                if (d != 0) delta.put(e.getKey(), d);
+            }
+            for (var e : sim.entrySet()) {
+                if (!before.containsKey(e.getKey()) && e.getValue() != 0) {
+                    delta.put(e.getKey(), e.getValue());
+                }
+            }
+
+            int maxMore = maxRepeats - count;
+            for (var e : delta.entrySet()) {
+                if (e.getValue() < 0) {
+                    int remaining = sim.getOrDefault(e.getKey(), 0);
+                    maxMore = Math.min(maxMore, remaining / (-e.getValue()));
+                }
+            }
+            if (maxMore > 0) {
+                for (var e : delta.entrySet()) {
+                    sim.merge(e.getKey(), maxMore * e.getValue(), Integer::sum);
+                }
+                count += maxMore;
+            }
         }
         return count;
+    }
+
+    /**
+     * Computes how many crafts can be done with items currently in sim (no sub-crafting),
+     * deducts the consumed items, and returns the count.
+     */
+    private static int skipDirectCrafts(RecipeDisplayEntry target, Map<Item, Integer> sim, int maxRepeats) {
+        List<SlotDisplay> slots = getSlots(target.display());
+        if (slots == null || maxRepeats <= 0) return 0;
+
+        Map<Object, Integer> needed = new HashMap<>();
+        Map<Object, Integer> avail = new HashMap<>();
+
+        for (SlotDisplay slot : slots) {
+            if (slot instanceof SlotDisplay.EmptySlotDisplay) continue;
+            TagKey<Item> tag = getSlotTag(slot);
+            if (tag != null) {
+                needed.merge(tag, 1, Integer::sum);
+                if (!avail.containsKey(tag)) avail.put(tag, sumTagInventory(tag, sim));
+            } else if (slot instanceof SlotDisplay.CompositeSlotDisplay) {
+                return 0;
+            } else {
+                ItemStack resolved = resolveSlot(slot, sim);
+                if (resolved.isEmpty()) return 0;
+                Item item = resolved.getItem();
+                if (sim.getOrDefault(item, 0) <= 0) return 0;
+                needed.merge(item, 1, Integer::sum);
+                avail.putIfAbsent(item, sim.getOrDefault(item, 0));
+            }
+        }
+
+        int maxCrafts = maxRepeats;
+        for (var e : needed.entrySet()) {
+            int crafts = avail.getOrDefault(e.getKey(), 0) / e.getValue();
+            if (crafts < maxCrafts) maxCrafts = crafts;
+        }
+        if (maxCrafts <= 0) return 0;
+
+        // Deduct consumed items from sim
+        for (var e : needed.entrySet()) {
+            int toConsume = maxCrafts * e.getValue();
+            if (e.getKey() instanceof Item item) {
+                sim.merge(item, -toConsume, Integer::sum);
+            } else if (e.getKey() instanceof TagKey<?>) {
+                @SuppressWarnings("unchecked")
+                TagKey<Item> tagKey = (TagKey<Item>) e.getKey();
+                Set<Item> members = inventoryTagIndex.get(tagKey);
+                if (members != null) {
+                    for (Item m : members) {
+                        int have = sim.getOrDefault(m, 0);
+                        if (have <= 0) continue;
+                        int take = Math.min(have, toConsume);
+                        sim.merge(m, -take, Integer::sum);
+                        toConsume -= take;
+                        if (toConsume <= 0) break;
+                    }
+                }
+            }
+        }
+        return maxCrafts;
     }
 
     private static int tryMathCount(RecipeDisplayEntry target, Map<Item, Integer> inventory, int maxRepeats) {
         List<SlotDisplay> slots = getSlots(target.display());
         if (slots == null) return -1;
 
-        Map<Item, Integer> needed = new HashMap<>();
+        // Track needed counts keyed by TagKey (for tag slots) or Item (for specific slots)
+        Map<Object, Integer> needed = new HashMap<>();
+        Map<Object, Integer> available = new HashMap<>();
+        Set<TagKey<Item>> usedTags = null;
+
         for (SlotDisplay slot : slots) {
             if (slot instanceof SlotDisplay.EmptySlotDisplay) continue;
-            ItemStack resolved = resolveSlot(slot, inventory);
-            if (resolved.isEmpty()) return -1;
-            Item item = resolved.getItem();
-            if (inventory.getOrDefault(item, 0) <= 0) return -1;
-            needed.merge(item, 1, Integer::sum);
+
+            TagKey<Item> tag = getSlotTag(slot);
+            if (tag != null) {
+                needed.merge(tag, 1, Integer::sum);
+                if (!available.containsKey(tag)) {
+                    available.put(tag, sumTagInventory(tag, inventory));
+                }
+                if (usedTags == null) usedTags = new HashSet<>();
+                usedTags.add(tag);
+            } else if (slot instanceof SlotDisplay.CompositeSlotDisplay) {
+                return -1;
+            } else {
+                ItemStack resolved = resolveSlot(slot, inventory);
+                if (resolved.isEmpty()) return -1;
+                Item item = resolved.getItem();
+                if (inventory.getOrDefault(item, 0) <= 0) return -1;
+                needed.merge(item, 1, Integer::sum);
+                available.putIfAbsent(item, inventory.getOrDefault(item, 0));
+            }
         }
 
         if (needed.isEmpty()) return 0;
+
+        // If a specific item slot overlaps with a used tag, the math path
+        // can't correctly partition shared resources — bail to simulation.
+        if (usedTags != null) {
+            for (var e : needed.entrySet()) {
+                if (e.getKey() instanceof Item item) {
+                    for (TagKey<Item> tag : usedTags) {
+                        Set<Item> tagItems = inventoryTagIndex.get(tag);
+                        if (tagItems != null && tagItems.contains(item)) return -1;
+                    }
+                }
+            }
+        }
+
         int maxCrafts = maxRepeats;
         for (var e : needed.entrySet()) {
-            int crafts = inventory.getOrDefault(e.getKey(), 0) / e.getValue();
+            int avail = available.getOrDefault(e.getKey(), 0);
+            int crafts = avail / e.getValue();
             if (crafts < maxCrafts) maxCrafts = crafts;
         }
-        // If the bottleneck ingredient can be sub-crafted, bail to simulation
+
+        // Only bail if the bottleneck can actually be sub-crafted with current inventory
         for (var e : needed.entrySet()) {
-            if (inventory.getOrDefault(e.getKey(), 0) / e.getValue() == maxCrafts
-                    && recipesByOutput.containsKey(e.getKey())) {
-                return -1;
+            int avail = available.getOrDefault(e.getKey(), 0);
+            if (avail / e.getValue() != maxCrafts) continue;
+            if (e.getKey() instanceof Item item && canSubCraftMore(item, inventory)) return -1;
+            if (e.getKey() instanceof TagKey<?> tag) {
+                List<Item> craftable = craftableTagIndex.get(tag);
+                if (craftable != null) {
+                    boolean anyCanCraft = false;
+                    for (Item ci : craftable) { if (canSubCraftMore(ci, inventory)) { anyCanCraft = true; break; } }
+                    if (anyCanCraft) return -1;
+                }
             }
         }
         return maxCrafts;
@@ -711,10 +915,148 @@ public class RecipeResolver {
         List<SlotDisplay> slots = getSlots(entry.display());
         if (slots == null) return false;
         for (SlotDisplay slot : slots) {
-            ItemStack resolved = resolveSlot(slot, cachedInventory);
-            if (!resolved.isEmpty() && resolved.getItem().equals(target)) return true;
+            if (slotRequiresItem(slot, target)) return true;
         }
         return false;
+    }
+
+    /** Returns true only if every option for this slot resolves to the target item. */
+    private static boolean slotRequiresItem(SlotDisplay slot, Item target) {
+        if (slot instanceof SlotDisplay.EmptySlotDisplay) return false;
+        if (slot instanceof SlotDisplay.ItemSlotDisplay d) return d.item().value().equals(target);
+        if (slot instanceof SlotDisplay.StackSlotDisplay d) return d.stack().getItem().equals(target);
+        // Tags and composites have alternatives, so they don't strictly require a specific item.
+        // The inProgress set in resolve() already prevents true circular dependencies.
+        if (slot instanceof SlotDisplay.TagSlotDisplay) return false;
+        if (slot instanceof SlotDisplay.CompositeSlotDisplay d) {
+            for (SlotDisplay sub : d.contents()) {
+                if (!slotRequiresItem(sub, target)) return false;
+            }
+            return !d.contents().isEmpty();
+        }
+        if (slot instanceof SlotDisplay.WithRemainderSlotDisplay d) return slotRequiresItem(d.input(), target);
+        return false;
+    }
+
+    /**
+     * Fixed-point closure: starting from items in inventory, repeatedly add items
+     * whose recipes can be fully satisfied from the set, until no new items appear.
+     * Returns the complete set of items reachable via crafting chains.
+     */
+    private static Set<Item> computeReachableItems(Map<Item, Integer> inventory, int gridSize) {
+        Set<Item> reachable = new HashSet<>(inventory.keySet());
+        // Also include items reachable via tag membership (if oak_planks is reachable, birch_planks
+        // isn't automatically, but any tag containing oak_planks is "satisfiable")
+        boolean changed = true;
+        while (changed) {
+            changed = false;
+            for (var entry : recipesByOutput.entrySet()) {
+                Item output = entry.getKey();
+                if (reachable.contains(output)) continue;
+                for (RecipeDisplayEntry recipe : entry.getValue()) {
+                    if (!fitsInGrid(recipe.display(), gridSize)) continue;
+                    if (allSlotsReachable(recipe, reachable)) {
+                        reachable.add(output);
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+        }
+        return reachable;
+    }
+
+    /** Returns true if every non-empty slot has at least one option in the reachable set. */
+    private static boolean allSlotsReachable(RecipeDisplayEntry entry, Set<Item> reachable) {
+        List<SlotDisplay> slots = getSlots(entry.display());
+        if (slots == null) return false;
+        for (SlotDisplay slot : slots) {
+            if (slot instanceof SlotDisplay.EmptySlotDisplay) continue;
+            if (!slotReachable(slot, reachable)) return false;
+        }
+        return true;
+    }
+
+    private static boolean slotReachable(SlotDisplay slot, Set<Item> reachable) {
+        if (slot instanceof SlotDisplay.ItemSlotDisplay d)
+            return reachable.contains(d.item().value());
+        if (slot instanceof SlotDisplay.StackSlotDisplay d)
+            return reachable.contains(d.stack().getItem());
+        if (slot instanceof SlotDisplay.TagSlotDisplay d) {
+            // Tag is satisfiable if ANY member is reachable
+            List<Item> members = getOrComputeTagMembers(d.tag());
+            if (members != null) {
+                for (Item m : members) {
+                    if (reachable.contains(m)) return true;
+                }
+            }
+            return false;
+        }
+        if (slot instanceof SlotDisplay.CompositeSlotDisplay d) {
+            for (SlotDisplay sub : d.contents()) {
+                if (slotReachable(sub, reachable)) return true;
+            }
+            return false;
+        }
+        if (slot instanceof SlotDisplay.WithRemainderSlotDisplay d)
+            return slotReachable(d.input(), reachable);
+        return false;
+    }
+
+    /** Can the player sub-craft more of this item using only items directly in inventory? */
+    private static boolean canSubCraftMore(Item item, Map<Item, Integer> inventory) {
+        List<RecipeDisplayEntry> subs = recipesByOutput.get(item);
+        if (subs == null) return false;
+        for (RecipeDisplayEntry sub : subs) {
+            if (hasDirectIngredients(sub, inventory)) return true;
+        }
+        return false;
+    }
+
+    /** Returns true if every ingredient of this recipe is directly in inventory (no sub-crafting). */
+    private static boolean hasDirectIngredients(RecipeDisplayEntry entry, Map<Item, Integer> inventory) {
+        List<SlotDisplay> slots = getSlots(entry.display());
+        if (slots == null) return false;
+        for (SlotDisplay slot : slots) {
+            if (slot instanceof SlotDisplay.EmptySlotDisplay) continue;
+            ItemStack resolved = resolveSlot(slot, inventory);
+            if (resolved.isEmpty()) return false;
+            if (inventory.getOrDefault(resolved.getItem(), 0) > 0) continue;
+            // Check tag alternatives directly in inventory
+            TagKey<Item> tag = getSlotTag(slot);
+            if (tag != null && sumTagInventory(tag, inventory) > 0) continue;
+            return false;
+        }
+        return true;
+    }
+
+    /** Quick O(slots) check: can this recipe possibly be crafted? */
+    private static boolean canCraftAtAll(RecipeDisplayEntry entry, Map<Item, Integer> inventory) {
+        List<SlotDisplay> slots = getSlots(entry.display());
+        if (slots == null) return false;
+        for (SlotDisplay slot : slots) {
+            if (slot instanceof SlotDisplay.EmptySlotDisplay) continue;
+            ItemStack resolved = resolveSlot(slot, inventory);
+            if (resolved.isEmpty()) return false;
+            Item item = resolved.getItem();
+            if (inventory.getOrDefault(item, 0) > 0) continue;
+            // Check if this item can actually be sub-crafted from what we have
+            if (canSubCraftMore(item, inventory)) continue;
+            TagKey<Item> tag = getSlotTag(slot);
+            if (tag != null) {
+                if (sumTagInventory(tag, inventory) > 0) continue;
+                List<Item> craftable = craftableTagIndex.get(tag);
+                if (craftable != null) {
+                    boolean found = false;
+                    for (Item ci : craftable) {
+                        if (inventory.getOrDefault(ci, 0) > 0 || canSubCraftMore(ci, inventory)) { found = true; break; }
+                    }
+                    if (found) continue;
+                }
+            }
+            return false;
+        }
+        return true;
     }
 
     private static List<SlotDisplay> getSlots(RecipeDisplay display) {
@@ -735,6 +1077,23 @@ public class RecipeResolver {
             return count <= gridSize * gridSize;
         }
         return false;
+    }
+
+    private static TagKey<Item> getSlotTag(SlotDisplay slot) {
+        if (slot instanceof SlotDisplay.TagSlotDisplay d) return d.tag();
+        if (slot instanceof SlotDisplay.WithRemainderSlotDisplay d) return getSlotTag(d.input());
+        return null;
+    }
+
+    private static int sumTagInventory(TagKey<Item> tag, Map<Item, Integer> inventory) {
+        int total = 0;
+        Set<Item> matches = inventoryTagIndex.get(tag);
+        if (matches != null) {
+            for (Item item : matches) {
+                total += inventory.getOrDefault(item, 0);
+            }
+        }
+        return total;
     }
 
     private static Item getOutputItem(RecipeDisplay display) {
