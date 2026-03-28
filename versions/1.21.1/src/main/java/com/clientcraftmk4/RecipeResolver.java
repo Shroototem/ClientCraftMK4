@@ -310,15 +310,6 @@ public class RecipeResolver {
         return false;
     }
 
-    private static ItemStack getAnyTagMember(TagKey<Item> tag) {
-        Item cached = tagFallbackItem.get(tag);
-        if (cached != null) return new ItemStack(cached);
-        List<Item> members = getOrComputeTagMembers(tag);
-        if (members == null || members.isEmpty()) return ItemStack.EMPTY;
-        tagFallbackItem.put(tag, members.getFirst());
-        return new ItemStack(members.getFirst());
-    }
-
     // --- Public API ---
 
     public static List<RecipeResultCollection> resolveForTab(ClientRecipeBook recipeBook) {
