@@ -1,0 +1,19 @@
+{
+    "required": true,
+    "package": "com.clientcraftmk4.mixin",
+    "compatibilityLevel": "JAVA_25",
+    "client": [
+        "AlternativeButtonWidgetMixin",
+        "AnimatedResultButtonMixin",
+        "CraftingRecipeBookWidgetMixin",
+        "ClientRecipeBookMixin",
+        "RecipeBookResultsMixin",
+        "RecipeBookWidgetAccessor",
+        "RecipeBookWidgetMixin",
+        "RecipeResultCollectionAccessor",
+        "RecipeResultCollectionMixin"
+    ],
+    "injectors": {
+        "defaultRequire": 1
+    }
+}
