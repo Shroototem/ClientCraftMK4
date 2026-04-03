@@ -51,6 +51,7 @@ public class RecipeResolver {
 
     private static Map<Item, List<RecipeEntry<?>>> recipesByOutput = Map.of();
     private static boolean recipeIndexDirty = true;
+    private static int lastRecipeCount = 0;
     private static int currentGridSize = 3;
     private static Map<Identifier, Integer> craftCounts = Map.of();
     private static Set<Identifier> containerCraftable = Set.of();
@@ -108,53 +109,53 @@ public class RecipeResolver {
     private static Map<Item, Integer> getOrSnapshotInventory() {
         MinecraftClient client = MinecraftClient.getInstance();
         if (client.world == null || client.player == null) return Map.of();
-        long tick = client.world.getTime();
-        if (tick != inventorySnapshotTick) {
-            Map<Item, Integer> snapshot = new HashMap<>();
-            Map<Item, Integer> containerSnapshot = new HashMap<>();
-            var inv = client.player.getInventory();
-            for (int i = 0; i < inv.size(); i++) {
-                ItemStack stack = inv.getStack(i);
-                if (stack.isEmpty()) continue;
+        Map<Item, Integer> snapshot = new HashMap<>();
+        Map<Item, Integer> containerSnapshot = new HashMap<>();
+        var inv = client.player.getInventory();
+        for (int i = 0; i < inv.size(); i++) {
+            ItemStack stack = inv.getStack(i);
+            if (stack.isEmpty()) continue;
 
-                if (ClientCraftConfig.searchContainers) {
-                    ContainerComponent container = stack.get(DataComponentTypes.CONTAINER);
-                    if (container != null) {
-                        for (ItemStack contained : container.iterateNonEmpty()) {
-                            containerSnapshot.merge(contained.getItem(), contained.getCount(), Integer::sum);
-                        }
-                    }
-                    BundleContentsComponent bundle = stack.get(DataComponentTypes.BUNDLE_CONTENTS);
-                    if (bundle != null) {
-                        for (ItemStack contained : bundle.iterate()) {
-                            containerSnapshot.merge(contained.getItem(), contained.getCount(), Integer::sum);
-                        }
+            if (ClientCraftConfig.searchContainers) {
+                ContainerComponent container = stack.get(DataComponentTypes.CONTAINER);
+                if (container != null) {
+                    for (ItemStack contained : container.iterateNonEmpty()) {
+                        containerSnapshot.merge(contained.getItem(), contained.getCount(), Integer::sum);
                     }
                 }
+                BundleContentsComponent bundle = stack.get(DataComponentTypes.BUNDLE_CONTENTS);
+                if (bundle != null) {
+                    for (ItemStack contained : bundle.iterate()) {
+                        containerSnapshot.merge(contained.getItem(), contained.getCount(), Integer::sum);
+                    }
+                }
+            }
 
-                if (stack.contains(DataComponentTypes.CUSTOM_NAME)) continue;
-                snapshot.merge(stack.getItem(), stack.getCount(), Integer::sum);
-            }
-            inventorySnapshotTick = tick;
-            if (!resolving && (!snapshot.equals(cachedInventory) || !containerSnapshot.equals(cachedContainerInventory))) {
-                cachedInventory = snapshot;
-                cachedContainerInventory = containerSnapshot;
-                rebuildInventoryTagIndex();
-                inventoryGeneration++;
-            }
+            if (stack.contains(DataComponentTypes.CUSTOM_NAME)) continue;
+            snapshot.merge(stack.getItem(), stack.getCount(), Integer::sum);
+        }
+        if (!snapshot.equals(cachedInventory) || !containerSnapshot.equals(cachedContainerInventory)) {
+            cachedInventory = snapshot;
+            cachedContainerInventory = containerSnapshot;
+            rebuildInventoryTagIndex();
+            inventoryGeneration++;
         }
         return cachedInventory;
     }
 
     private static void ensureIndex() {
-        if (!recipeIndexDirty && !recipesByOutput.isEmpty()) return;
         MinecraftClient client = MinecraftClient.getInstance();
         if (client.player == null) return;
+        List<RecipeResultCollection> allCrafting = client.player.getRecipeBook().getResultsForGroup(RecipeBookGroup.CRAFTING_SEARCH);
+        int currentCount = 0;
+        for (RecipeResultCollection c : allCrafting) currentCount += c.getAllRecipes().size();
+        if (!recipeIndexDirty && !recipesByOutput.isEmpty() && currentCount == lastRecipeCount) return;
+        lastRecipeCount = currentCount;
         DynamicRegistryManager registryManager = getRegistryManager();
         if (registryManager == null) return;
         Map<Item, List<RecipeEntry<?>>> index = new HashMap<>();
         knownTags.clear();
-        for (RecipeResultCollection coll : client.player.getRecipeBook().getResultsForGroup(RecipeBookGroup.CRAFTING_SEARCH)) {
+        for (RecipeResultCollection coll : allCrafting) {
             for (RecipeEntry<?> entry : coll.getAllRecipes()) {
                 Item out = getOutputItem(entry, registryManager);
                 if (out != null) index.computeIfAbsent(out, k -> new ArrayList<>()).add(entry);
@@ -165,7 +166,7 @@ public class RecipeResolver {
             }
         }
         recipesByOutput = index;
-        recipeIndexDirty = false;
+        if (!resolving) recipeIndexDirty = false;
         for (Item item : index.keySet()) computeTagsForItem(item);
     }
 
@@ -355,6 +356,7 @@ public class RecipeResolver {
         }
 
         resolving = true;
+        int startRecipeCount = lastRecipeCount;
 
         RESOLVER_EXECUTOR.submit(() -> {
             try {
@@ -426,6 +428,12 @@ public class RecipeResolver {
 
                 Set<Item> finalContainerItemSet = containerItemSet;
                 MinecraftClient.getInstance().execute(() -> {
+                    if (recipeIndexDirty || lastRecipeCount != startRecipeCount) {
+                        resolving = false;
+                        Runnable retry = onResultsPublished;
+                        if (retry != null) retry.run();
+                        return;
+                    }
                     craftCounts = counts;
                     containerCraftable = containerSet;
                     collectionRanks = ranks;
@@ -468,26 +476,42 @@ public class RecipeResolver {
         ItemStack output = resolveResult(target);
         int outputCount = Math.max(1, output.getCount());
 
-        int maxRepeats;
-        if (directCraft) {
-            int craftsPerClick = output.getMaxCount() / outputCount;
-            int total = countRepeats(target, new HashMap<>(cachedInventory), registryManager, outputCount);
-            maxRepeats = Math.max(1, (total + craftsPerClick - 1) / craftsPerClick);
-        } else {
-            maxRepeats = switch (mode) {
-                case ONCE -> 1;
-                case STACK -> (output.getMaxCount() + outputCount - 1) / outputCount;
-                case ALL -> MAX_REPEATS;
-            };
-        }
+        int maxRepeats = switch (mode) {
+            case ONCE -> 1;
+            case STACK -> (output.getMaxCount() + outputCount - 1) / outputCount;
+            case ALL -> MAX_REPEATS;
+        };
         if (maxRepeats <= 0) return null;
 
         List<List<RecipeEntry<?>>> cycles = new ArrayList<>();
         cycles.add(firstSteps);
 
         if (directCraft) {
-            for (int r = 1; r < maxRepeats; r++) {
+            // Count how many crafts can be done with direct items only
+            Map<Item, Integer> directSim = new HashMap<>(cachedInventory);
+            int directCount = 0;
+            while (directCount < maxRepeats) {
+                List<RecipeEntry<?>> testSteps = new ArrayList<>();
+                if (!resolve(target, directSim, testSteps, new HashSet<>(), 0, null, registryManager)) break;
+                if (testSteps.size() != 1) break;
+                directCount++;
+            }
+
+            int craftsPerClick = output.getMaxCount() / outputCount;
+            int directClicks = Math.max(1, (directCount + craftsPerClick - 1) / craftsPerClick);
+
+            for (int r = 1; r < directClicks; r++) {
                 cycles.add(List.of(firstSteps.getFirst()));
+            }
+
+            // Deduct direct items from available, then continue with sub-crafting
+            for (int r = 1; r < directCount; r++) {
+                resolve(target, available, null, new HashSet<>(), 0, null, registryManager);
+            }
+            for (int r = directCount; r < maxRepeats; r++) {
+                List<RecipeEntry<?>> steps = new ArrayList<>();
+                if (!resolve(target, available, steps, new HashSet<>(), 0, null, registryManager)) break;
+                cycles.add(steps);
             }
         } else {
             for (int r = 1; r < maxRepeats; r++) {
@@ -496,7 +520,9 @@ public class RecipeResolver {
                 cycles.add(steps);
             }
         }
-        return new AutoCrafter.CraftPlan(cycles, directCraft);
+
+        boolean allDirect = directCraft && cycles.stream().allMatch(c -> c.size() == 1);
+        return new AutoCrafter.CraftPlan(cycles, allDirect);
     }
 
     public static ItemStack resolveResult(RecipeEntry<?> entry) {
@@ -542,6 +568,13 @@ public class RecipeResolver {
 
         activeIngredientGrid = grid;
         return buildFakeCollection(grid, originalEntry, registryManager);
+    }
+
+    public static void markRecipesDirty() {
+        recipeIndexDirty = true;
+        cachedResults = List.of();
+        lastCacheKey = 0;
+        lastRecipeCount = 0;
     }
 
     public static void clearCache() {

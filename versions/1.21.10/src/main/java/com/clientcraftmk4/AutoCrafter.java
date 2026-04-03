@@ -9,10 +9,15 @@ import net.minecraft.recipe.RecipeDisplayEntry;
 import net.minecraft.screen.AbstractCraftingScreenHandler;
 import net.minecraft.screen.slot.SlotActionType;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.util.ArrayList;
 import java.util.List;
 
 public class AutoCrafter {
+    private static final Logger LOG = LoggerFactory.getLogger("ClientCraftMK4");
+
     public enum Mode { ONCE, STACK, ALL }
 
     /** Result from buildCraftCyclesForMode containing the step list and whether craftAll can be used. */
@@ -22,6 +27,8 @@ public class AutoCrafter {
     private static boolean craftAll;
     private static int stepIndex;
     private static int tickCounter;
+    private static long startTimeNs;
+    private static int totalSteps;
 
     public static void execute(RecipeDisplayEntry target, Mode mode) {
         if (steps != null) return;
@@ -38,6 +45,8 @@ public class AutoCrafter {
         craftAll = plan.directCraft();
         stepIndex = 0;
         tickCounter = 0;
+        totalSteps = flat.size();
+        startTimeNs = System.nanoTime();
     }
 
     public static void registerTickHandler() {
@@ -52,6 +61,7 @@ public class AutoCrafter {
                 for (NetworkRecipeId step : steps) {
                     executeStep(client, handler, step);
                 }
+                logCompletion();
                 steps = null;
             } else {
                 if (tickCounter++ >= delay) {
@@ -59,10 +69,18 @@ public class AutoCrafter {
                     if (stepIndex < steps.size()) {
                         executeStep(client, handler, steps.get(stepIndex++));
                     }
-                    if (stepIndex >= steps.size()) steps = null;
+                    if (stepIndex >= steps.size()) {
+                        logCompletion();
+                        steps = null;
+                    }
                 }
             }
         });
+    }
+
+    private static void logCompletion() {
+        long elapsedMs = (System.nanoTime() - startTimeNs) / 1_000_000;
+        LOG.info("[CC] Auto-craft completed: {} step(s) in {}ms", totalSteps, elapsedMs);
     }
 
     private static void executeStep(MinecraftClient client, AbstractCraftingScreenHandler handler, NetworkRecipeId step) {

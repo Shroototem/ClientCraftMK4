@@ -8,6 +8,7 @@ import net.minecraft.client.recipebook.RecipeBookGroup;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 import java.util.List;
@@ -20,5 +21,10 @@ public class ClientRecipeBookMixin {
         if (category == ClientCraftTab.INSTANCE) {
             cir.setReturnValue(RecipeResolver.resolveForTab((ClientRecipeBook) (Object) this));
         }
+    }
+
+    @Inject(method = "refresh", at = @At("TAIL"))
+    private void clientcraft$onRecipesRefreshed(CallbackInfo ci) {
+        RecipeResolver.markRecipesDirty();
     }
 }
