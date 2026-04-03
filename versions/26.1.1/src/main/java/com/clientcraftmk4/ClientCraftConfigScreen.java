@@ -31,11 +31,16 @@ public class ClientCraftConfigScreen extends Screen {
 
         addRenderableWidget(new DelaySlider(centerX, y + 52, 200, 20, ClientCraftConfig.delayTicks));
 
+        addRenderableWidget(CycleButton.onOffBuilder(ClientCraftConfig.debugLogging)
+                .create(centerX, y + 78, 200, 20, Component.literal("Debug Logging"), (button, value) -> {
+                    ClientCraftConfig.debugLogging = value;
+                }));
+
         addRenderableWidget(Button.builder(Component.literal("Done"), button -> {
             ClientCraftConfig.save();
             RecipeResolver.clearCache();
             minecraft.setScreen(parent);
-        }).bounds(centerX, y + 88, 200, 20).build());
+        }).bounds(centerX, y + 114, 200, 20).build());
     }
 
     private static class DelaySlider extends AbstractSliderButton {
