@@ -33,11 +33,17 @@ public class ClientCraftConfigScreen extends Screen {
 
         addDrawableChild(new DelaySlider(centerX, y + 52, 200, 20, ClientCraftConfig.delayTicks));
 
+        addDrawableChild(CyclingButtonWidget.onOffBuilder()
+                .initially(ClientCraftConfig.debugLogging)
+                .build(centerX, y + 78, 200, 20, Text.literal("Debug Logging"), (button, value) -> {
+                    ClientCraftConfig.debugLogging = value;
+                }));
+
         addDrawableChild(ButtonWidget.builder(Text.literal("Done"), button -> {
             ClientCraftConfig.save();
             RecipeResolver.clearCache();
             client.setScreen(parent);
-        }).dimensions(centerX, y + 88, 200, 20).build());
+        }).dimensions(centerX, y + 114, 200, 20).build());
     }
 
     private static class DelaySlider extends SliderWidget {
