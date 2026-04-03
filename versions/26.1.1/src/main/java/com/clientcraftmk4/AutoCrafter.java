@@ -1,12 +1,13 @@
 package com.clientcraftmk4;
 
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
-import net.minecraft.client.gui.screen.ingame.CraftingScreen;
-import net.minecraft.client.gui.screen.ingame.InventoryScreen;
-import net.minecraft.client.MinecraftClient;
-import net.minecraft.recipe.RecipeEntry;
-import net.minecraft.screen.AbstractRecipeScreenHandler;
-import net.minecraft.screen.slot.SlotActionType;
+import net.minecraft.client.gui.screens.inventory.CraftingScreen;
+import net.minecraft.client.gui.screens.inventory.InventoryScreen;
+import net.minecraft.client.Minecraft;
+import net.minecraft.world.item.crafting.display.RecipeDisplayId;
+import net.minecraft.world.item.crafting.display.RecipeDisplayEntry;
+import net.minecraft.world.inventory.AbstractCraftingMenu;
+import net.minecraft.world.inventory.ContainerInput;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -20,24 +21,25 @@ public class AutoCrafter {
     public enum Mode { ONCE, STACK, ALL }
 
     /** Result from buildCraftCyclesForMode containing the step list and whether craftAll can be used. */
-    public record CraftPlan(List<List<RecipeEntry<?>>> cycles, boolean directCraft) {}
+    public record CraftPlan(List<List<RecipeDisplayId>> cycles, boolean directCraft) {}
 
-    private static List<RecipeEntry<?>> steps;
+    private static List<RecipeDisplayId> steps;
     private static boolean craftAll;
     private static int stepIndex;
     private static int tickCounter;
     private static long startTimeNs;
     private static int totalSteps;
 
-    public static void execute(RecipeEntry<?> target, Mode mode) {
+    public static void execute(RecipeDisplayEntry target, Mode mode) {
         if (steps != null) return;
         if (getHandler() == null) return;
 
         CraftPlan plan = RecipeResolver.buildCraftCyclesForMode(target, mode);
         if (plan == null || plan.cycles().isEmpty()) return;
 
-        List<RecipeEntry<?>> flat = new ArrayList<>();
-        for (List<RecipeEntry<?>> cycle : plan.cycles()) flat.addAll(cycle);
+        // Flatten all cycles into a single step list
+        List<RecipeDisplayId> flat = new ArrayList<>();
+        for (List<RecipeDisplayId> cycle : plan.cycles()) flat.addAll(cycle);
 
         steps = flat;
         craftAll = plan.directCraft();
@@ -51,16 +53,12 @@ public class AutoCrafter {
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             if (steps == null) return;
 
-            AbstractRecipeScreenHandler handler = getHandler();
-            if (handler == null || client.interactionManager == null) { steps = null; return; }
-
-            // If the output slot still has items, the previous craft couldn't be
-            // moved to inventory (full) — stop crafting.
-            if (!handler.getSlot(0).getStack().isEmpty()) { steps = null; return; }
+            AbstractCraftingMenu handler = getHandler();
+            if (handler == null || client.gameMode == null) { steps = null; return; }
 
             int delay = ClientCraftConfig.delayTicks;
             if (delay <= 0) {
-                for (RecipeEntry<?> step : steps) {
+                for (RecipeDisplayId step : steps) {
                     executeStep(client, handler, step);
                 }
                 logCompletion();
@@ -85,15 +83,15 @@ public class AutoCrafter {
         LOG.info("[CC] Auto-craft completed: {} step(s) in {}ms", totalSteps, elapsedMs);
     }
 
-    private static void executeStep(MinecraftClient client, AbstractRecipeScreenHandler handler, RecipeEntry<?> step) {
-        client.interactionManager.clickRecipe(handler.syncId, step, craftAll);
-        client.interactionManager.clickSlot(handler.syncId, 0, 0, SlotActionType.QUICK_MOVE, client.player);
+    private static void executeStep(Minecraft client, AbstractCraftingMenu handler, RecipeDisplayId step) {
+        client.gameMode.handlePlaceRecipe(handler.containerId, step, craftAll);
+        client.gameMode.handleContainerInput(handler.containerId, 0, 0, ContainerInput.QUICK_MOVE, client.player);
     }
 
-    private static AbstractRecipeScreenHandler getHandler() {
-        MinecraftClient client = MinecraftClient.getInstance();
-        if (client.currentScreen instanceof CraftingScreen s) return s.getScreenHandler();
-        if (client.currentScreen instanceof InventoryScreen s) return s.getScreenHandler();
+    private static AbstractCraftingMenu getHandler() {
+        Minecraft client = Minecraft.getInstance();
+        if (client.screen instanceof CraftingScreen s) return s.getMenu();
+        if (client.screen instanceof InventoryScreen s) return s.getMenu();
         return null;
     }
 }
