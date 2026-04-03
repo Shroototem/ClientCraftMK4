@@ -81,6 +81,7 @@ public class AutoCrafter {
     private static void logCompletion() {
         long elapsedMs = (System.nanoTime() - startTimeNs) / 1_000_000;
         LOG.info("[CC] Auto-craft completed: {} step(s) in {}ms", totalSteps, elapsedMs);
+        RecipeResolver.onAutoCraftComplete();
     }
 
     private static void executeStep(Minecraft client, AbstractCraftingMenu handler, RecipeDisplayId step) {
