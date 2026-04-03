@@ -29,6 +29,11 @@ public class AutoCrafter {
     private static long startTimeNs;
     private static int totalSteps;
 
+    // Stability polling: after craft completes, wait for inventory to stop changing
+    private static boolean pendingBatchClear = false;
+    private static long lastSeenGen = -1;
+    private static int stableFrames = 0;
+
     public static void execute(RecipeEntry<?> target, Mode mode) {
         if (steps != null) return;
         if (getHandler() == null) return;
@@ -45,23 +50,52 @@ public class AutoCrafter {
         tickCounter = 0;
         totalSteps = flat.size();
         startTimeNs = System.nanoTime();
+        if (flat.size() > 10) RecipeResolver.batchMode = true;
     }
 
     public static void registerTickHandler() {
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
+            // Poll for inventory stability after craft completes
+            if (pendingBatchClear) {
+                RecipeResolver.pollInventory(); // ensure inventoryGeneration is up to date
+                long gen = RecipeResolver.getInventoryGeneration();
+                if (gen == lastSeenGen) {
+                    if (++stableFrames >= 2) {
+                        RecipeResolver.batchMode = false;
+                        pendingBatchClear = false;
+                        // Trigger a resolve now that inventory has stabilized
+                        RecipeResolver.triggerRefresh();
+                    }
+                } else {
+                    lastSeenGen = gen;
+                    stableFrames = 0;
+                }
+            }
+
             if (steps == null) return;
 
             AbstractRecipeScreenHandler handler = getHandler();
-            if (handler == null || client.interactionManager == null) { steps = null; return; }
+            if (handler == null || client.interactionManager == null) {
+                steps = null;
+                RecipeResolver.batchMode = false;
+                pendingBatchClear = false;
+                return;
+            }
 
             // If the output slot still has items, the previous craft couldn't be
-            // moved to inventory (full) — stop crafting.
+            // moved to inventory (full) -- stop crafting.
             if (!handler.getSlot(0).getStack().isEmpty()) { steps = null; return; }
 
             int delay = ClientCraftConfig.delayTicks;
             if (delay <= 0) {
+                long tExec = ClientCraftConfig.debugLogging ? System.nanoTime() : 0;
                 for (RecipeEntry<?> step : steps) {
                     executeStep(client, handler, step);
+                }
+                if (ClientCraftConfig.debugLogging) {
+                    long execNs = System.nanoTime() - tExec;
+                    LOG.info("[CC] Execute steps: {}ms for {} steps ({}us/step)",
+                            execNs / 1_000_000, steps.size(), steps.size() > 0 ? execNs / 1_000 / steps.size() : 0);
                 }
                 logCompletion();
                 steps = null;
@@ -82,7 +116,11 @@ public class AutoCrafter {
 
     private static void logCompletion() {
         long elapsedMs = (System.nanoTime() - startTimeNs) / 1_000_000;
-        LOG.info("[CC] Auto-craft completed: {} step(s) in {}ms", totalSteps, elapsedMs);
+        if (ClientCraftConfig.debugLogging)
+            LOG.info("[CC] Auto-craft completed: {} step(s) in {}ms", totalSteps, elapsedMs);
+        pendingBatchClear = true;
+        lastSeenGen = RecipeResolver.getInventoryGeneration();
+        stableFrames = 0;
     }
 
     private static void executeStep(MinecraftClient client, AbstractRecipeScreenHandler handler, RecipeEntry<?> step) {
