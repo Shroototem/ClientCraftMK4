@@ -43,14 +43,16 @@ public class RecipeResolver {
     private static volatile boolean resolving = false;
     private static volatile Runnable onResultsPublished = null;
 
-    // Batch logging: suppress individual resolve logs after auto-craft
-    private static volatile long suppressResolveLogUntil = 0;
-    private static int batchedResolves = 0;
-    private static long batchedSimNs = 0;
-    private static long batchedTotalNs = 0;
+    // Batch mode: during mass/stack craft, skip all intermediate resolves.
+    // AutoCrafter sets true on start, clears when inventory stabilizes.
+    static volatile boolean batchMode = false;
 
-    static void onAutoCraftComplete() {
-        suppressResolveLogUntil = System.nanoTime() + 500_000_000L;
+    static long getInventoryGeneration() { return inventoryGeneration; }
+    static void pollInventory() { getOrSnapshotInventory(); }
+    static void triggerRefresh() {
+        inventoryGeneration++;
+        Runnable callback = onResultsPublished;
+        if (callback != null) callback.run();
     }
 
     public static void setOnResultsPublished(Runnable callback) { onResultsPublished = callback; }
@@ -322,6 +324,7 @@ public class RecipeResolver {
 
         long cacheKey = inventoryGeneration * 7L + gridSize;
         if (cacheKey == lastCacheKey && !cachedResults.isEmpty()) return cachedResults;
+        if (batchMode) return cachedResults;
         if (resolving) return cachedResults;
         if (recipesByOutput.isEmpty()) return List.of();
 
@@ -508,20 +511,8 @@ public class RecipeResolver {
                     result.add(nc);
                 }
 
-                long totalNs = System.nanoTime() - t0;
-                long totalMs = totalNs / 1_000_000;
-                if (System.nanoTime() < suppressResolveLogUntil) {
-                    batchedResolves++;
-                    batchedSimNs += simTimeNs;
-                    batchedTotalNs += totalNs;
-                } else {
-                    if (batchedResolves > 0) {
-                        LOG.info("[CC] Batch resolve: {} passes | total={}ms sim={}ms",
-                                batchedResolves, batchedTotalNs / 1_000_000, batchedSimNs / 1_000_000);
-                        batchedResolves = 0;
-                        batchedSimNs = 0;
-                        batchedTotalNs = 0;
-                    }
+                if (ClientCraftConfig.debugLogging) {
+                    long totalMs = (System.nanoTime() - t0) / 1_000_000;
                     LOG.info("[CC] Resolve: {}ms | {} recipes | reachable: {}ms ({} items) | skip:{} math:{} sim:{} cont:{}",
                             totalMs, totalRecipes,
                             reachableMs, reachableItems.size(),
@@ -561,12 +552,15 @@ public class RecipeResolver {
     }
 
     public static AutoCrafter.CraftPlan buildCraftCyclesForMode(RecipeDisplayEntry target, AutoCrafter.Mode mode) {
+        long t0 = System.nanoTime();
         if (Minecraft.getInstance().player == null) return null;
         prepareContext();
+        long tPrep = System.nanoTime();
 
         Map<Item, Integer> available = new HashMap<>(cachedInventory);
         List<RecipeDisplayId> firstSteps = new ArrayList<>();
         if (!resolve(target, available, firstSteps, new HashSet<>(), 0, null)) return null;
+        long tFirst = System.nanoTime();
 
         // A "direct" recipe has exactly 1 step (no sub-crafting required).
         // For ALL mode with direct recipes, use craftAll to fill the grid with
@@ -611,9 +605,18 @@ public class RecipeResolver {
                 cycles.add(steps);
             }
         }
+        long tCycles = System.nanoTime();
 
         // Direct craft flag only applies if ALL cycles are single-step direct
         boolean allDirect = directCraft && cycles.stream().allMatch(c -> c.size() == 1);
+
+        if (ClientCraftConfig.debugLogging) {
+            int totalSteps = cycles.stream().mapToInt(List::size).sum();
+            LOG.info("[CC] BuildCraft({}): prep={}ms first={}ms cycles={}ms | {} cycles, {} steps, direct={}",
+                    mode,
+                    (tPrep - t0) / 1_000_000, (tFirst - tPrep) / 1_000_000, (tCycles - tFirst) / 1_000_000,
+                    cycles.size(), totalSteps, allDirect);
+        }
         return new AutoCrafter.CraftPlan(cycles, allDirect);
     }
 
