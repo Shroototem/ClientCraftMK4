@@ -17,6 +17,7 @@ public class ClientCraftConfig {
     public static int delayTicks = 0;
     public static boolean searchContainers = false;
     public static boolean quickCountMode = false;
+    public static boolean debugLogging = false;
 
     public static void load() {
         if (Files.exists(CONFIG_PATH)) {
@@ -26,6 +27,7 @@ public class ClientCraftConfig {
                     delayTicks = Math.clamp(data.delayTicks, 0, 20);
                     searchContainers = data.searchContainers;
                     quickCountMode = data.quickCountMode;
+                    debugLogging = data.debugLogging;
                 }
             } catch (IOException ignored) {}
         }
@@ -36,6 +38,7 @@ public class ClientCraftConfig {
         data.delayTicks = delayTicks;
         data.searchContainers = searchContainers;
         data.quickCountMode = quickCountMode;
+        data.debugLogging = debugLogging;
         try (Writer writer = Files.newBufferedWriter(CONFIG_PATH)) {
             GSON.toJson(data, writer);
         } catch (IOException ignored) {}
@@ -45,5 +48,6 @@ public class ClientCraftConfig {
         int delayTicks = 0;
         boolean searchContainers = false;
         boolean quickCountMode = false;
+        boolean debugLogging = false;
     }
 }
