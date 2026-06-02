@@ -13,8 +13,29 @@ import net.minecraft.world.item.crafting.display.ShapelessCraftingRecipeDisplay;
 import net.minecraft.world.item.crafting.display.SlotDisplay;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class RecipeTreeBuilder {
+
+    private static final Map<TagKey<Item>, List<Item>> tagMemberCache = new ConcurrentHashMap<>();
+
+    private static List<Item> getTagMembers(TagKey<Item> tag, Minecraft client) {
+        List<Item> cached = tagMemberCache.get(tag);
+        if (cached != null) return cached;
+        var reg = client.level.registryAccess().lookupOrThrow(Registries.ITEM);
+        var entriesOpt = reg.get(tag);
+        if (entriesOpt.isEmpty()) {
+            List<Item> empty = List.of();
+            tagMemberCache.put(tag, empty);
+            return empty;
+        }
+        List<Item> items = new ArrayList<>();
+        for (var entry : entriesOpt.get()) items.add(entry.value());
+        tagMemberCache.put(tag, items);
+        return items;
+    }
+
+    public static void clearTagCache() { tagMemberCache.clear(); }
 
     public static RecipeTree build(List<RecipeCollection> allCrafting) {
         Minecraft client = Minecraft.getInstance();
@@ -237,14 +258,14 @@ public class RecipeTreeBuilder {
         int gridSize = getGridSize(display);
 
         // Consolidate ingredients, filtering output item from tag options
-        Map<String, ConsolidatedIngredient> consolidated = new LinkedHashMap<>();
+        Map<List<Item>, ConsolidatedIngredient> consolidated = new LinkedHashMap<>();
         for (SlotDisplay slot : slots) {
             if (slot instanceof SlotDisplay.Empty) continue;
 
             List<IngredientOption> options = buildOptions(slot, resolved, client, outputItem);
             if (options.isEmpty()) return null; // Truly self-consuming: no non-self option exists
 
-            String key = optionsKey(options);
+            List<Item> key = optionsKey(options);
             ConsolidatedIngredient existing = consolidated.get(key);
             if (existing != null) {
                 existing.count++;
@@ -285,15 +306,10 @@ public class RecipeTreeBuilder {
             }
         } else if (slot instanceof SlotDisplay.TagSlotDisplay d) {
             TagKey<Item> tag = d.tag();
-            var reg = client.level.registryAccess().lookupOrThrow(Registries.ITEM);
-            var entriesOpt = reg.get(tag);
-            if (entriesOpt.isPresent()) {
-                for (var entry : entriesOpt.get()) {
-                    Item item = entry.value();
-                    if (item.equals(excludeItem)) continue; // Filter out the output item
-                    RecipeNode node = resolved.getOrDefault(item, new BaseResource(item));
-                    options.add(new IngredientOption(item, node));
-                }
+            for (Item item : getTagMembers(tag, client)) {
+                if (item.equals(excludeItem)) continue;
+                RecipeNode node = resolved.getOrDefault(item, new BaseResource(item));
+                options.add(new IngredientOption(item, node));
             }
         } else if (slot instanceof SlotDisplay.Composite d) {
             for (SlotDisplay sub : d.contents()) {
@@ -310,7 +326,7 @@ public class RecipeTreeBuilder {
         List<SlotDisplay> slots = getSlots(display);
         if (slots == null) return null;
 
-        Map<String, Set<Item>> consolidated = new LinkedHashMap<>();
+        Map<List<Item>, Set<Item>> consolidated = new LinkedHashMap<>();
         for (SlotDisplay slot : slots) {
             if (slot instanceof SlotDisplay.Empty) continue;
 
@@ -319,11 +335,7 @@ public class RecipeTreeBuilder {
             options.remove(outputItem);
             if (options.isEmpty()) return null; // Truly self-consuming
 
-            List<String> sortedNames = new ArrayList<>();
-            for (Item item : options) sortedNames.add(item.toString());
-            Collections.sort(sortedNames);
-            String key = String.join(",", sortedNames);
-
+            List<Item> key = itemSetKey(options);
             consolidated.merge(key, options, (a, b) -> a); // Keep first (same options)
         }
 
@@ -346,14 +358,20 @@ public class RecipeTreeBuilder {
         return false;
     }
 
-    private static String optionsKey(List<IngredientOption> options) {
-        if (options.size() == 1) return options.getFirst().item().toString();
-        List<String> keys = new ArrayList<>();
-        for (IngredientOption opt : options) {
-            keys.add(opt.item().toString());
-        }
-        Collections.sort(keys);
-        return String.join(",", keys);
+    private static List<Item> optionsKey(List<IngredientOption> options) {
+        if (options.size() == 1) return List.of(options.getFirst().item());
+        List<Item> items = new ArrayList<>(options.size());
+        for (IngredientOption opt : options) items.add(opt.item());
+        items.sort(Comparator.comparingInt(System::identityHashCode));
+        return items;
+    }
+
+    /** Returns a sorted list of items for use as a deduplication key. */
+    private static List<Item> itemSetKey(Set<Item> items) {
+        if (items.size() == 1) return List.of(items.iterator().next());
+        List<Item> sorted = new ArrayList<>(items);
+        sorted.sort(Comparator.comparingInt(System::identityHashCode));
+        return sorted;
     }
 
     public static void collectItems(SlotDisplay slot, Set<Item> items, Minecraft client) {
@@ -362,11 +380,7 @@ public class RecipeTreeBuilder {
         } else if (slot instanceof SlotDisplay.ItemStackSlotDisplay d) {
             items.add(d.stack().item().value());
         } else if (slot instanceof SlotDisplay.TagSlotDisplay d) {
-            var reg = client.level.registryAccess().lookupOrThrow(Registries.ITEM);
-            var entriesOpt = reg.get(d.tag());
-            if (entriesOpt.isPresent()) {
-                for (var entry : entriesOpt.get()) items.add(entry.value());
-            }
+            items.addAll(getTagMembers(d.tag(), client));
         } else if (slot instanceof SlotDisplay.Composite d) {
             for (SlotDisplay sub : d.contents()) collectItems(sub, items, client);
         } else if (slot instanceof SlotDisplay.WithRemainder d) {
