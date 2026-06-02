@@ -1,8 +1,0 @@
-// Override common source set — Mojang-named MC has different package paths
-sourceSets {
-    main {
-        java {
-            srcDirs = [file("src/main/java")]
-        }
-    }
-}
