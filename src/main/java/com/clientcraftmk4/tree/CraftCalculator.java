@@ -59,8 +59,27 @@ public class CraftCalculator {
             List<CraftedItem> recipes = tree.getAllRecipes(item);
             if (recipes.isEmpty()) continue;
             long alreadyHave = combined.getOrDefault(item, 0);
+
+            if (recipes.size() > 1) {
+                MemoEntry itemMemo = memo.get(item);
+                if (itemMemo != null) {
+                    long maxNewItems = Math.max(0, itemMemo.count - alreadyHave);
+                    if (maxNewItems > 0) {
+                        long base = maxNewItems / recipes.size();
+                        int rem = (int) (maxNewItems % recipes.size());
+                        for (int i = 0; i < recipes.size(); i++) {
+                            long share = base + (i < rem ? 1 : 0);
+                            results.put(recipes.get(i).recipeId(),
+                                    (int) Math.min(share, maxOutput));
+                        }
+                        continue;
+                    }
+                }
+            }
+
             for (CraftedItem crafted : recipes) {
-                long total = computeForRecipe(crafted, tree, inventory, combined, gridSize, memo);
+                Set<Item> baseOnlyItems = computeCycleIngredients(crafted, tree);
+                long total = computeForRecipe(crafted, tree, inventory, combined, gridSize, memo, baseOnlyItems);
                 long newItems = total - alreadyHave;
                 if (newItems > 0) {
                     results.put(crafted.recipeId(), (int) Math.min(newItems, maxOutput));
@@ -96,7 +115,7 @@ public class CraftCalculator {
             List<CraftedItem> alternatives = tree.getAllRecipes(base.item());
             if (alternatives != null && !alternatives.isEmpty()) {
                 for (CraftedItem alt : alternatives) {
-                    long altResult = computeForRecipe(alt, tree, inventory, combined, gridSize, memo);
+                    long altResult = computeForRecipeBaseOnly(alt, combined, gridSize);
                     if (altResult > result) {
                         result = altResult;
                         containerOnly = false;
@@ -133,8 +152,15 @@ public class CraftCalculator {
     }
 
     private static long computeForRecipe(CraftedItem crafted, RecipeTree tree,
-                                         Map<Item, Integer> inventory, Map<Item, Integer> combined,
-                                         int gridSize, Map<Item, MemoEntry> memo) {
+                                          Map<Item, Integer> inventory, Map<Item, Integer> combined,
+                                          int gridSize, Map<Item, MemoEntry> memo) {
+        return computeForRecipe(crafted, tree, inventory, combined, gridSize, memo, null);
+    }
+
+    private static long computeForRecipe(CraftedItem crafted, RecipeTree tree,
+                                          Map<Item, Integer> inventory, Map<Item, Integer> combined,
+                                          int gridSize, Map<Item, MemoEntry> memo,
+                                          Set<Item> baseOnlyItems) {
         if (crafted.gridSize() > gridSize) {
             return combined.getOrDefault(crafted.item(), 0);
         }
@@ -145,6 +171,10 @@ public class CraftCalculator {
             long availableForEdge = 0;
 
             for (IngredientOption option : edge.options()) {
+                if (baseOnlyItems != null && baseOnlyItems.contains(option.item())) {
+                    availableForEdge += combined.getOrDefault(option.item(), 0);
+                    continue;
+                }
                 MemoEntry optMemo = memo.get(option.item());
                 long optAvail;
                 if (optMemo != null) {
@@ -168,6 +198,54 @@ public class CraftCalculator {
 
         long alreadyHave = combined.getOrDefault(crafted.item(), 0);
         return maxOps * crafted.outputCount() + alreadyHave;
+    }
+
+    private static long computeForRecipeBaseOnly(CraftedItem crafted,
+                                                  Map<Item, Integer> combined,
+                                                  int gridSize) {
+        if (crafted.gridSize() > gridSize) {
+            return combined.getOrDefault(crafted.item(), 0);
+        }
+
+        long maxOps = Long.MAX_VALUE;
+
+        for (IngredientEdge edge : crafted.ingredients()) {
+            long availableForEdge = 0;
+            for (IngredientOption option : edge.options()) {
+                availableForEdge += combined.getOrDefault(option.item(), 0);
+            }
+            long opsFromEdge = availableForEdge / edge.count();
+            maxOps = Math.min(maxOps, opsFromEdge);
+        }
+
+        if (maxOps == Long.MAX_VALUE) maxOps = 0;
+
+        long alreadyHave = combined.getOrDefault(crafted.item(), 0);
+        return maxOps * crafted.outputCount() + alreadyHave;
+    }
+
+    private static Set<Item> computeCycleIngredients(CraftedItem crafted, RecipeTree tree) {
+        Set<Item> cycles = new HashSet<>();
+        for (IngredientEdge edge : crafted.ingredients()) {
+            for (IngredientOption option : edge.options()) {
+                if (hasReverseConversion(option.item(), crafted.item(), tree)) {
+                    cycles.add(option.item());
+                }
+            }
+        }
+        return cycles;
+    }
+
+    private static boolean hasReverseConversion(Item ingredient, Item output, RecipeTree tree) {
+        List<CraftedItem> altRecipes = tree.getAllRecipes(ingredient);
+        for (CraftedItem alt : altRecipes) {
+            for (IngredientEdge edge : alt.ingredients()) {
+                for (IngredientOption option : edge.options()) {
+                    if (option.item() == output) return true;
+                }
+            }
+        }
+        return false;
     }
 
     private static boolean isRecipeContainerOnly(CraftedItem crafted, Map<Item, MemoEntry> memo) {
