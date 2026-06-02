@@ -1,17 +1,20 @@
 package com.clientcraftmk4.tree;
 
 import net.minecraft.world.item.Item;
+import net.minecraft.world.item.crafting.display.RecipeDisplayId;
 
 import java.util.*;
 
 public class CraftCalculator {
+
+    private record MemoEntry(long count, boolean containerOnly) {}
 
     public static Map<Item, Integer> calculateAllCounts(
             RecipeTree tree, Map<Item, Integer> inventory,
             Map<Item, Integer> containerInventory, int gridSize) {
 
         Map<Item, Integer> combined = combinedInventory(inventory, containerInventory);
-        Map<Item, long[]> memo = new HashMap<>();
+        Map<Item, MemoEntry> memo = new HashMap<>();
         Map<Item, Integer> results = new HashMap<>();
 
         for (Item item : tree.getTopologicalOrder()) {
@@ -20,30 +23,68 @@ public class CraftCalculator {
             computeMemo(node, tree, inventory, combined, gridSize, memo);
         }
 
-        for (Map.Entry<Item, long[]> e : memo.entrySet()) {
-            if (e.getValue()[0] > 0) {
-                results.put(e.getKey(), clampInt(e.getValue()[0]));
+        for (Map.Entry<Item, MemoEntry> e : memo.entrySet()) {
+            if (e.getValue().count > 0) {
+                results.put(e.getKey(), clampInt(e.getValue().count));
             }
         }
 
         return results;
     }
 
+    /**
+     * Computes per-recipe craftable counts for all recipes in the tree.
+     * Uses the memoized topological approach: builds a memo of per-item max counts,
+     * then derives per-recipe counts from it. Sub-item lookups are cached so each
+     * per-recipe call is O(ingredient edges).
+     */
+    public static Map<RecipeDisplayId, Integer> calculatePerRecipeCounts(
+            RecipeTree tree,
+            Map<Item, Integer> inventory,
+            Map<Item, Integer> containerInventory,
+            int gridSize,
+            int maxOutput) {
+        Map<Item, Integer> combined = combinedInventory(inventory, containerInventory);
+        Map<Item, MemoEntry> memo = new HashMap<>();
+
+        for (Item item : tree.getTopologicalOrder()) {
+            RecipeNode node = tree.getNode(item);
+            if (node != null) {
+                computeMemo(node, tree, inventory, combined, gridSize, memo);
+            }
+        }
+
+        Map<RecipeDisplayId, Integer> results = new HashMap<>();
+        for (Item item : tree.getTopologicalOrder()) {
+            List<CraftedItem> recipes = tree.getAllRecipes(item);
+            if (recipes.isEmpty()) continue;
+            long alreadyHave = combined.getOrDefault(item, 0);
+            for (CraftedItem crafted : recipes) {
+                long total = computeForRecipe(crafted, tree, inventory, combined, gridSize, memo);
+                long newItems = total - alreadyHave;
+                if (newItems > 0) {
+                    results.put(crafted.recipeId(), (int) Math.min(newItems, maxOutput));
+                }
+            }
+        }
+        return results;
+    }
+
     public static int maxCraftable(RecipeNode node, RecipeTree tree, Map<Item, Integer> inventory,
                                    Map<Item, Integer> containerInventory, int gridSize) {
         Map<Item, Integer> combined = combinedInventory(inventory, containerInventory);
-        Map<Item, long[]> memo = new HashMap<>();
+        Map<Item, MemoEntry> memo = new HashMap<>();
         return clampInt(computeMemo(node, tree, inventory, combined, gridSize, memo));
     }
 
     private static long computeMemo(RecipeNode node, RecipeTree tree, Map<Item, Integer> inventory,
                                     Map<Item, Integer> combined, int gridSize,
-                                    Map<Item, long[]> memo) {
-        long[] cached = memo.get(node.item());
-        if (cached != null) return cached[0];
+                                    Map<Item, MemoEntry> memo) {
+        MemoEntry cached = memo.get(node.item());
+        if (cached != null) return cached.count;
 
         long baseValue = combined.getOrDefault(node.item(), 0);
-        memo.put(node.item(), new long[]{baseValue, 0});
+        memo.put(node.item(), new MemoEntry(baseValue, false));
 
         long result;
         boolean containerOnly = false;
@@ -87,13 +128,13 @@ public class CraftCalculator {
             }
         }
 
-        memo.put(node.item(), new long[]{result, containerOnly ? 1 : 0});
+        memo.put(node.item(), new MemoEntry(result, containerOnly));
         return result;
     }
 
     private static long computeForRecipe(CraftedItem crafted, RecipeTree tree,
                                          Map<Item, Integer> inventory, Map<Item, Integer> combined,
-                                         int gridSize, Map<Item, long[]> memo) {
+                                         int gridSize, Map<Item, MemoEntry> memo) {
         if (crafted.gridSize() > gridSize) {
             return combined.getOrDefault(crafted.item(), 0);
         }
@@ -104,10 +145,10 @@ public class CraftCalculator {
             long availableForEdge = 0;
 
             for (IngredientOption option : edge.options()) {
-                long[] optMemo = memo.get(option.item());
+                MemoEntry optMemo = memo.get(option.item());
                 long optAvail;
                 if (optMemo != null) {
-                    optAvail = optMemo[0];
+                    optAvail = optMemo.count;
                 } else {
                     RecipeNode optNode = tree.getNode(option.item());
                     if (optNode != null) {
@@ -129,15 +170,15 @@ public class CraftCalculator {
         return maxOps * crafted.outputCount() + alreadyHave;
     }
 
-    private static boolean isRecipeContainerOnly(CraftedItem crafted, Map<Item, long[]> memo) {
+    private static boolean isRecipeContainerOnly(CraftedItem crafted, Map<Item, MemoEntry> memo) {
         for (IngredientEdge edge : crafted.ingredients()) {
             boolean edgeContainerOnly = true;
             boolean edgeHasAvailability = false;
             for (IngredientOption option : edge.options()) {
-                long[] optMemo = memo.get(option.item());
-                if (optMemo != null && optMemo[0] > 0) {
+                MemoEntry optMemo = memo.get(option.item());
+                if (optMemo != null && optMemo.count > 0) {
                     edgeHasAvailability = true;
-                    if (optMemo[1] == 0) {
+                    if (!optMemo.containerOnly) {
                         edgeContainerOnly = false;
                         break;
                     }
@@ -149,7 +190,7 @@ public class CraftCalculator {
     }
 
     private static long calculateDirectOps(CraftedItem crafted, Map<Item, Integer> directInv,
-                                           int gridSize, Map<Item, long[]> memo) {
+                                           int gridSize, Map<Item, MemoEntry> memo) {
         long maxOps = Long.MAX_VALUE;
         for (IngredientEdge edge : crafted.ingredients()) {
             long available = 0;
@@ -194,10 +235,10 @@ public class CraftCalculator {
 
         Map<Item, Integer> combined = combinedInventory(inventory, containerInventory);
 
-        Map<Item, long[]> memo = new HashMap<>();
+        Map<Item, MemoEntry> memo = new HashMap<>();
         for (Map.Entry<Item, Integer> e : existingCounts.entrySet()) {
             if (!affectedItems.contains(e.getKey())) {
-                memo.put(e.getKey(), new long[]{e.getValue(), 0});
+                memo.put(e.getKey(), new MemoEntry(e.getValue(), false));
             }
         }
 
@@ -209,9 +250,9 @@ public class CraftCalculator {
         }
 
         for (Item item : affectedItems) {
-            long[] m = memo.get(item);
-            if (m != null && m[0] > 0) {
-                existingCounts.put(item, clampInt(m[0]));
+            MemoEntry m = memo.get(item);
+            if (m != null && m.count > 0) {
+                existingCounts.put(item, clampInt(m.count));
             } else {
                 existingCounts.remove(item);
             }
