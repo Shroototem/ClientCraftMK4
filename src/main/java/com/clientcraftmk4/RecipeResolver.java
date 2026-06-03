@@ -383,11 +383,6 @@ public class RecipeResolver {
                 int totalRecipes = 0, treeCounted = 0, preCheckSkipped = 0, containerChecked = 0;
                 long treeBuildNs = 0, treeComputeNs = 0;
 
-                // Pre-compute the full set of items reachable from inventory via crafting chains.
-                long tReachable = System.nanoTime();
-                Set<Item> reachableItems = computeReachableItems(invSnapshot, snapGridSize);
-                long reachableMs = (System.nanoTime() - tReachable) / 1_000_000;
-
                 // Build or reuse recipe tree (structure is independent of inventory counts)
                 long tTreeBuild = System.nanoTime();
                 RecipeTree tree;
@@ -398,6 +393,14 @@ public class RecipeResolver {
                     tree = cachedRecipeTree;
                 }
                 treeBuildNs = System.nanoTime() - tTreeBuild;
+
+                // Pre-compute the full set of items reachable from inventory (+ containers if enabled) via crafting chains.
+                long tReachable = System.nanoTime();
+                Map<Item, Integer> reachableSnapshot = checkContainers && !contSnapshot.isEmpty()
+                        ? mergeMaps(invSnapshot, contSnapshot)
+                        : invSnapshot;
+                Set<Item> reachableItems = computeReachableItems(reachableSnapshot, snapGridSize);
+                long reachableMs = (System.nanoTime() - tReachable) / 1_000_000;
 
                 Map<RecipeDisplayId, Integer> treeCounts = Map.of();
                 Map<RecipeDisplayId, Integer> treeCombinedCounts = Map.of();
@@ -916,40 +919,25 @@ public class RecipeResolver {
     }
 
     /**
-     * Computes reachable items by walking the cached RecipeTree in topological order.
-     * Starts with all inventory items, then for each craftable item checks if its
-     * ingredient edges are satisfied by already-reachable items. Topological ordering
-     * guarantees dependencies are resolved before dependents, so a single pass suffices.
-     * O(recipe_items × edges × options) = ~200 × 3 × 5 ≈ 3000 checks vs old O(1050 × 4) reverse-index BFS.
+     * Fixed-point closure: scans all recipesByOutput iteratively until no new items
+     * become reachable. Uses allSlotsReachable which handles tag slots correctly.
+     * This is robust regardless of RecipeTree state or topological order correctness.
      */
     private static Set<Item> computeReachableItems(Map<Item, Integer> inventory, int gridSize) {
         Set<Item> reachable = new HashSet<>(inventory.keySet());
-        RecipeTree tree = cachedRecipeTree;
-        if (tree == null) return reachable;
-
-        for (Item item : tree.getTopologicalOrder()) {
-            if (reachable.contains(item)) continue;
-            List<CraftedItem> recipes = tree.getAllRecipes(item);
-            if (recipes.isEmpty()) continue;
-
-            for (CraftedItem crafted : recipes) {
-                if (crafted.gridSize() > gridSize) continue;
-
-                boolean allEdgesSatisfied = true;
-                for (IngredientEdge edge : crafted.ingredients()) {
-                    boolean edgeSatisfied = false;
-                    for (IngredientOption option : edge.options()) {
-                        if (reachable.contains(option.item())) {
-                            edgeSatisfied = true;
-                            break;
-                        }
+        boolean changed = true;
+        while (changed) {
+            changed = false;
+            for (var entry : recipesByOutput.entrySet()) {
+                Item output = entry.getKey();
+                if (reachable.contains(output)) continue;
+                for (RecipeDisplayEntry recipe : entry.getValue()) {
+                    if (!fitsInGrid(recipe.display(), gridSize)) continue;
+                    if (allSlotsReachable(recipe, reachable)) {
+                        reachable.add(output);
+                        changed = true;
+                        break;
                     }
-                    if (!edgeSatisfied) { allEdgesSatisfied = false; break; }
-                }
-
-                if (allEdgesSatisfied) {
-                    reachable.add(item);
-                    break;
                 }
             }
         }
