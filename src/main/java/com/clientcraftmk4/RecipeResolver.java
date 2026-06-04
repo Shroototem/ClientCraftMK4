@@ -26,9 +26,11 @@ import net.minecraft.world.item.crafting.display.SlotDisplay;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.tags.TagKey;
 
+import net.minecraft.client.gui.screens.recipebook.OverlayRecipeComponent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.lang.ref.WeakReference;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -111,7 +113,65 @@ public class RecipeResolver {
     }
 
     public static IngredientGrid getActiveIngredientGrid() { return activeIngredientGrid; }
-    public static void clearActiveIngredientGrid() { activeIngredientGrid = null; }
+    public static void clearActiveIngredientGrid() {
+        activeIngredientGrid = null;
+        activeOverlayRef = new WeakReference<>(null);
+        activeVariants = List.of();
+        activeVariantIndex = 0;
+        activeCollection = null;
+    }
+
+    // --- Variant browsing state ---
+
+    private static WeakReference<OverlayRecipeComponent> activeOverlayRef = new WeakReference<>(null);
+
+    public static void setActiveOverlay(OverlayRecipeComponent overlay) {
+        activeOverlayRef = new WeakReference<>(overlay);
+    }
+
+    public static OverlayRecipeComponent getActiveOverlay() {
+        return activeOverlayRef.get();
+    }
+
+    private static List<RecipeDisplayEntry> activeVariants = List.of();
+    private static int activeVariantIndex = 0;
+    private static RecipeCollection activeCollection = null;
+    private static int overlayButtonX, overlayButtonY, overlayCenterX, overlayCenterY, overlayButtonWidth;
+
+    public static void setActiveVariants(List<RecipeDisplayEntry> variants, int initialIndex, RecipeCollection collection) {
+        activeVariants = variants;
+        activeVariantIndex = Math.clamp(initialIndex, 0, variants.size() - 1);
+        activeCollection = collection;
+    }
+
+    public static void setOverlayPosition(int buttonX, int buttonY, int centerX, int centerY, int buttonWidth) {
+        overlayButtonX = buttonX;
+        overlayButtonY = buttonY;
+        overlayCenterX = centerX;
+        overlayCenterY = centerY;
+        overlayButtonWidth = buttonWidth;
+    }
+
+    public static int getOverlayButtonX() { return overlayButtonX; }
+    public static int getOverlayButtonY() { return overlayButtonY; }
+    public static int getOverlayCenterX() { return overlayCenterX; }
+    public static int getOverlayCenterY() { return overlayCenterY; }
+    public static int getOverlayButtonWidth() { return overlayButtonWidth; }
+
+    public static int getActiveVariantIndex() { return activeVariantIndex; }
+    public static int getActiveVariantCount() { return activeVariants.size(); }
+    public static RecipeDisplayEntry getActiveVariant() {
+        return activeVariants.isEmpty() ? null : activeVariants.get(activeVariantIndex);
+    }
+    public static RecipeCollection getActiveCollection() { return activeCollection; }
+
+    /** Cycles to the next/previous variant and returns the new entry. */
+    public static RecipeDisplayEntry cycleActiveVariant(int delta) {
+        if (activeVariants.isEmpty()) return null;
+        int count = activeVariants.size();
+        activeVariantIndex = ((activeVariantIndex + delta) % count + count) % count;
+        return activeVariants.get(activeVariantIndex);
+    }
 
     // --- Shared helpers ---
 
@@ -261,7 +321,7 @@ public class RecipeResolver {
 
     }
 
-    private static List<Item> getOrComputeTagMembers(TagKey<Item> tag) {
+    public static List<Item> getOrComputeTagMembers(TagKey<Item> tag) {
         List<Item> cached = tagMembersCache.get(tag);
         if (cached != null) return cached;
         Minecraft client = Minecraft.getInstance();
@@ -345,8 +405,6 @@ public class RecipeResolver {
         Map<Item, Integer> invSnapshot = new HashMap<>(inventory);
         Map<Item, Integer> contSnapshot = new HashMap<>(cachedContainerInventory);
         boolean checkContainers = ClientCraftConfig.searchContainers && !contSnapshot.isEmpty();
-        int snapGridSize = gridSize;
-        long snapCacheKey = cacheKey;
 
         // Build placeholder results so tab is visible while background computes
         if (cachedResults.isEmpty()) {
@@ -399,7 +457,7 @@ public class RecipeResolver {
                 Map<Item, Integer> reachableSnapshot = checkContainers && !contSnapshot.isEmpty()
                         ? mergeMaps(invSnapshot, contSnapshot)
                         : invSnapshot;
-                Set<Item> reachableItems = computeReachableItems(reachableSnapshot, snapGridSize);
+                Set<Item> reachableItems = computeReachableItems(reachableSnapshot, gridSize);
                 long reachableMs = (System.nanoTime() - tReachable) / 1_000_000;
 
                 Map<RecipeDisplayId, Integer> treeCounts = Map.of();
@@ -407,10 +465,10 @@ public class RecipeResolver {
                 if (tree != null) {
                     long tTreeCompute = System.nanoTime();
                     treeCounts = CraftCalculator.calculatePerRecipeCounts(
-                            tree, invSnapshot, Map.of(), snapGridSize, MAX_REPEATS);
+                            tree, invSnapshot, Map.of(), gridSize, MAX_REPEATS);
                     if (checkContainers) {
                         treeCombinedCounts = CraftCalculator.calculatePerRecipeCounts(
-                                tree, invSnapshot, contSnapshot, snapGridSize, MAX_REPEATS);
+                                tree, invSnapshot, contSnapshot, gridSize, MAX_REPEATS);
                     }
                     treeComputeNs = System.nanoTime() - tTreeCompute;
                 }
@@ -424,7 +482,7 @@ public class RecipeResolver {
                     List<RecipeDisplayEntry> allEntries = new ArrayList<>();
 
                     for (RecipeDisplayEntry entry : coll.getRecipes()) {
-                        if (!fitsInGrid(entry.display(), snapGridSize)) continue;
+                        if (!fitsInGrid(entry.display(), gridSize)) continue;
                         ItemStack outputStack = resolveSlot(entry.display().result());
                         Item out = outputStack.isEmpty() ? null : outputStack.getItem();
                         if (out != null && recipeConsumesItem(entry, out)) continue;
@@ -528,7 +586,7 @@ public class RecipeResolver {
                     autoCraftCollections = new HashSet<>(result);
                     containerAvailableItems = finalContainerItemSet;
                     cachedResults = result;
-                    lastCacheKey = snapCacheKey;
+                    lastCacheKey = cacheKey;
                     resolving = false;
 
                     Runnable callback = onResultsPublished;
@@ -682,6 +740,11 @@ public class RecipeResolver {
         inventoryGeneration = 0;
         lastCacheKey = 0;
         activeIngredientGrid = null;
+        activeOverlayRef = new WeakReference<>(null);
+        activeVariants = List.of();
+        activeVariantIndex = 0;
+        activeCollection = null;
+        overlayButtonX = overlayButtonY = overlayCenterX = overlayCenterY = overlayButtonWidth = 0;
         lowerCaseNameCache.clear();
         knownTags.clear();
         itemToTags.clear();
@@ -832,10 +895,9 @@ public class RecipeResolver {
 
     // --- Repeat counting ---
 
-    private static final Map<Object, Integer> sdcNeeded = new HashMap<>();
-    private static final Map<Object, Integer> sdcAvail = new HashMap<>();
-
     private static int skipDirectCrafts(RecipeDisplayEntry target, Map<Item, Integer> sim, int maxRepeats) {
+        Map<Object, Integer> sdcNeeded = new HashMap<>();
+        Map<Object, Integer> sdcAvail = new HashMap<>();
         return computeDirectCrafts(target, sim, maxRepeats, sdcNeeded, sdcAvail);
     }
 
@@ -988,13 +1050,13 @@ public class RecipeResolver {
         return false;
     }
 
-    private static List<SlotDisplay> getSlots(RecipeDisplay display) {
+    public static List<SlotDisplay> getSlots(RecipeDisplay display) {
         if (display instanceof ShapedCraftingRecipeDisplay s) return s.ingredients();
         if (display instanceof ShapelessCraftingRecipeDisplay s) return s.ingredients();
         return null;
     }
 
-    private static boolean fitsInGrid(RecipeDisplay display, int gridSize) {
+    public static boolean fitsInGrid(RecipeDisplay display, int gridSize) {
         if (display instanceof ShapedCraftingRecipeDisplay s) {
             return s.width() <= gridSize && s.height() <= gridSize;
         } else if (display instanceof ShapelessCraftingRecipeDisplay s) {
@@ -1025,19 +1087,19 @@ public class RecipeResolver {
         return total;
     }
 
-    private static Item getOutputItem(RecipeDisplay display) {
+    public static Item getOutputItem(RecipeDisplay display) {
         ItemStack out = resolveSlot(display.result());
         return out.isEmpty() ? null : out.getItem();
     }
 
-    private static int getOutputCount(RecipeDisplay display) {
+    public static int getOutputCount(RecipeDisplay display) {
         ItemStack out = resolveSlot(display.result());
         return out.isEmpty() ? 0 : out.getCount();
     }
 
     // --- Slot resolution ---
 
-    private static ItemStack resolveSlot(SlotDisplay display) {
+    public static ItemStack resolveSlot(SlotDisplay display) {
         return resolveSlot(display, cachedInventory);
     }
 
@@ -1141,7 +1203,7 @@ public class RecipeResolver {
             List<Item> craftable = craftableTagIndex.get(tag);
             if (craftable != null) {
                 for (Item item : craftable) {
-                    if (canSubCraft(item, cachedInventory)) return new ItemStack(item);
+                    if (tryConsumeSubCraft(item, new HashMap<>(cachedInventory))) return new ItemStack(item);
                 }
             }
         } else if (slot instanceof SlotDisplay.Composite d) {
@@ -1151,7 +1213,7 @@ public class RecipeResolver {
                 if (r.isEmpty()) continue;
                 if (fallback.isEmpty()) fallback = r;
                 if (cachedInventory.getOrDefault(r.getItem(), 0) > 0) return r;
-                if (canSubCraft(r.getItem(), cachedInventory)) return r;
+                if (tryConsumeSubCraft(r.getItem(), new HashMap<>(cachedInventory))) return r;
             }
             if (!fallback.isEmpty()) return fallback;
         } else if (slot instanceof SlotDisplay.WithRemainder d) {
@@ -1182,21 +1244,34 @@ public class RecipeResolver {
                     grid.inContainer[i] = true;
                     if (found != item) grid.items[i] = new ItemStack(found);
                 } else {
-                    grid.craftable[i] = canSubCraft(item, remaining);
+                    grid.craftable[i] = tryConsumeSubCraft(item, remaining);
                 }
             } else {
-                grid.craftable[i] = canSubCraft(item, remaining);
+                grid.craftable[i] = tryConsumeSubCraft(item, remaining);
             }
         }
     }
 
-    private static boolean canSubCraft(Item item, Map<Item, Integer> available) {
+    public static void refreshActiveGridCraftability() {
+        if (activeIngredientGrid != null) {
+            computeGridCraftability(activeIngredientGrid);
+        }
+    }
+
+    /** Tests if {@code item} can be sub-crafted from {@code available}, and if so, deducts consumed resources. */
+    private static boolean tryConsumeSubCraft(Item item, Map<Item, Integer> available) {
         List<RecipeDisplayEntry> subs = recipesByOutput.get(item);
         if (subs == null) return false;
         for (RecipeDisplayEntry sub : subs) {
             if (!fitsInGrid(sub.display(), currentGridSize)) continue;
             Map<Item, Integer> temp = new HashMap<>(available);
-            if (resolve(sub, temp, null, new HashSet<>(), 0, null)) return true;
+            if (resolve(sub, temp, null, new HashSet<>(), 0, null)) {
+                available.clear();
+                available.putAll(temp);
+                int outputCount = getOutputCount(sub.display());
+                if (outputCount > 1) available.merge(item, outputCount - 1, Integer::sum);
+                return true;
+            }
         }
         return false;
     }

@@ -1,11 +1,10 @@
 package com.clientcraftmk4.tree;
 
+import com.clientcraftmk4.RecipeResolver;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.recipebook.RecipeCollection;
-import net.minecraft.core.registries.Registries;
 import net.minecraft.tags.TagKey;
 import net.minecraft.world.item.Item;
-import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.crafting.display.RecipeDisplay;
 import net.minecraft.world.item.crafting.display.RecipeDisplayEntry;
 import net.minecraft.world.item.crafting.display.ShapedCraftingRecipeDisplay;
@@ -13,63 +12,38 @@ import net.minecraft.world.item.crafting.display.ShapelessCraftingRecipeDisplay;
 import net.minecraft.world.item.crafting.display.SlotDisplay;
 
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
 
 public class RecipeTreeBuilder {
-
-    private static final Map<TagKey<Item>, List<Item>> tagMemberCache = new ConcurrentHashMap<>();
-
-    private static List<Item> getTagMembers(TagKey<Item> tag, Minecraft client) {
-        List<Item> cached = tagMemberCache.get(tag);
-        if (cached != null) return cached;
-        var reg = client.level.registryAccess().lookupOrThrow(Registries.ITEM);
-        var entriesOpt = reg.get(tag);
-        if (entriesOpt.isEmpty()) {
-            List<Item> empty = List.of();
-            tagMemberCache.put(tag, empty);
-            return empty;
-        }
-        List<Item> items = new ArrayList<>();
-        for (var entry : entriesOpt.get()) items.add(entry.value());
-        tagMemberCache.put(tag, items);
-        return items;
-    }
-
-    public static void clearTagCache() { tagMemberCache.clear(); }
 
     public static RecipeTree build(List<RecipeCollection> allCrafting) {
         Minecraft client = Minecraft.getInstance();
         if (client.level == null) return null;
 
-        // Phase 1: Index all recipes by output item
         Map<Item, List<RecipeDisplayEntry>> recipesByOutput = new HashMap<>();
 
         for (RecipeCollection coll : allCrafting) {
             for (RecipeDisplayEntry entry : coll.getRecipes()) {
-                Item out = getOutputItem(entry.display());
+                Item out = RecipeResolver.getOutputItem(entry.display());
                 if (out != null) {
                     recipesByOutput.computeIfAbsent(out, k -> new ArrayList<>()).add(entry);
                 }
             }
         }
 
-        // Phase 2: Collect all ingredient items to identify base resources
         Set<Item> allIngredientItems = new HashSet<>();
         for (List<RecipeDisplayEntry> entries : recipesByOutput.values()) {
             for (RecipeDisplayEntry entry : entries) {
-                List<SlotDisplay> slots = getSlots(entry.display());
+                List<SlotDisplay> slots = RecipeResolver.getSlots(entry.display());
                 if (slots == null) continue;
                 for (SlotDisplay slot : slots) {
-                    collectItems(slot, allIngredientItems, client);
+                    collectItems(slot, allIngredientItems);
                 }
             }
         }
 
-        // Phase 3: Edge-based dependency tracking + BFS topological sort (Kahn's)
         Map<Item, RecipeNode> resolved = new HashMap<>();
         Set<Item> baseResources = new HashSet<>();
 
-        // Base resources = items needed as ingredients but not craftable
         for (Item item : allIngredientItems) {
             if (!recipesByOutput.containsKey(item)) {
                 resolved.put(item, new BaseResource(item));
@@ -77,24 +51,19 @@ public class RecipeTreeBuilder {
             }
         }
 
-        // Edge-based dependency tracking:
-        // Each ingredient edge (consolidated group of options) is resolved when ANY option is resolved.
-        // inDegree counts unresolved EDGES, not individual items.
         Map<Item, Integer> inDegree = new HashMap<>();
         Map<Item, List<Set<Item>>> edgeDeps = new HashMap<>();
         Map<Item, boolean[]> edgeResolved = new HashMap<>();
-        // Reverse index: option item -> parents that have this item in an unresolved edge
         Map<Item, Set<Item>> optionToParents = new HashMap<>();
 
         for (Map.Entry<Item, List<RecipeDisplayEntry>> e : recipesByOutput.entrySet()) {
             Item outputItem = e.getKey();
 
-            // Find the recipe with the fewest unresolved edges
             List<Set<Item>> bestEdges = null;
             int bestUnresolved = Integer.MAX_VALUE;
 
             for (RecipeDisplayEntry entry : e.getValue()) {
-                List<Set<Item>> edges = getConsolidatedEdges(entry.display(), outputItem, client);
+                List<Set<Item>> edges = getConsolidatedEdges(entry.display(), outputItem);
                 if (edges == null) continue;
 
                 int unresolved = 0;
@@ -114,7 +83,6 @@ public class RecipeTreeBuilder {
 
             if (bestEdges == null) bestEdges = List.of();
 
-            // Compute resolved flags and inDegree
             boolean[] flags = new boolean[bestEdges.size()];
             int unresolvedCount = 0;
             for (int i = 0; i < bestEdges.size(); i++) {
@@ -134,7 +102,6 @@ public class RecipeTreeBuilder {
             edgeResolved.put(outputItem, flags);
             inDegree.put(outputItem, unresolvedCount);
 
-            // Build reverse index
             for (int i = 0; i < bestEdges.size(); i++) {
                 if (!flags[i]) {
                     for (Item option : bestEdges.get(i)) {
@@ -144,7 +111,6 @@ public class RecipeTreeBuilder {
             }
         }
 
-        // BFS Kahn's algorithm
         Queue<Item> queue = new ArrayDeque<>();
         List<Item> topologicalOrder = new ArrayList<>();
 
@@ -163,7 +129,7 @@ public class RecipeTreeBuilder {
             if (resolved.containsKey(item)) continue;
             topologicalOrder.add(item);
 
-            CraftedItem bestNode = buildBestNode(item, recipesByOutput.get(item), resolved, client);
+            CraftedItem bestNode = buildBestNode(item, recipesByOutput.get(item), resolved);
             if (bestNode != null) {
                 resolved.put(item, bestNode);
             } else {
@@ -171,7 +137,6 @@ public class RecipeTreeBuilder {
                 baseResources.add(item);
             }
 
-            // Update parents via reverse index
             Set<Item> parents = optionToParents.getOrDefault(item, Set.of());
             for (Item parent : parents) {
                 if (resolved.containsKey(parent)) continue;
@@ -187,13 +152,12 @@ public class RecipeTreeBuilder {
                         if (newDeg <= 0) {
                             queue.add(parent);
                         }
-                        break; // Each resolved item satisfies at most one edge per parent (consolidated)
+                        break;
                     }
                 }
             }
         }
 
-        // Phase 4: Handle cycles — items still unresolved become BaseResource
         for (Item item : recipesByOutput.keySet()) {
             if (!resolved.containsKey(item)) {
                 resolved.put(item, new BaseResource(item));
@@ -202,13 +166,12 @@ public class RecipeTreeBuilder {
             }
         }
 
-        // Phase 5: Build allRecipes map (with fully resolved nodes)
         Map<Item, List<CraftedItem>> allRecipesMap = new HashMap<>();
         for (Map.Entry<Item, List<RecipeDisplayEntry>> e : recipesByOutput.entrySet()) {
             Item outputItem = e.getKey();
             List<CraftedItem> nodes = new ArrayList<>();
             for (RecipeDisplayEntry entry : e.getValue()) {
-                CraftedItem node = buildCraftedItem(outputItem, entry, resolved, client);
+                CraftedItem node = buildCraftedItem(outputItem, entry, resolved);
                 if (node != null) nodes.add(node);
             }
             if (!nodes.isEmpty()) {
@@ -216,7 +179,6 @@ public class RecipeTreeBuilder {
             }
         }
 
-        // Phase 6: Build reverse dependency index (from allRecipes for completeness)
         Map<Item, Set<Item>> dependents = new HashMap<>();
         for (Map.Entry<Item, List<CraftedItem>> e : allRecipesMap.entrySet()) {
             for (CraftedItem crafted : e.getValue()) {
@@ -233,10 +195,10 @@ public class RecipeTreeBuilder {
 
     private static CraftedItem buildBestNode(
             Item outputItem, List<RecipeDisplayEntry> entries,
-            Map<Item, RecipeNode> resolved, Minecraft client) {
+            Map<Item, RecipeNode> resolved) {
         CraftedItem best = null;
         for (RecipeDisplayEntry entry : entries) {
-            CraftedItem node = buildCraftedItem(outputItem, entry, resolved, client);
+            CraftedItem node = buildCraftedItem(outputItem, entry, resolved);
             if (node == null) continue;
             if (best == null || node.depth() < best.depth()) {
                 best = node;
@@ -247,23 +209,22 @@ public class RecipeTreeBuilder {
 
     private static CraftedItem buildCraftedItem(
             Item outputItem, RecipeDisplayEntry entry,
-            Map<Item, RecipeNode> resolved, Minecraft client) {
+            Map<Item, RecipeNode> resolved) {
         RecipeDisplay display = entry.display();
-        List<SlotDisplay> slots = getSlots(display);
+        List<SlotDisplay> slots = RecipeResolver.getSlots(display);
         if (slots == null) return null;
 
-        int outputCount = getOutputCount(display);
+        int outputCount = RecipeResolver.getOutputCount(display);
         if (outputCount <= 0) return null;
 
         int gridSize = getGridSize(display);
 
-        // Consolidate ingredients, filtering output item from tag options
         Map<List<Item>, ConsolidatedIngredient> consolidated = new LinkedHashMap<>();
         for (SlotDisplay slot : slots) {
             if (slot instanceof SlotDisplay.Empty) continue;
 
-            List<IngredientOption> options = buildOptions(slot, resolved, client, outputItem);
-            if (options.isEmpty()) return null; // Truly self-consuming: no non-self option exists
+            List<IngredientOption> options = buildOptions(slot, resolved, outputItem);
+            if (options.isEmpty()) return null;
 
             List<Item> key = optionsKey(options);
             ConsolidatedIngredient existing = consolidated.get(key);
@@ -289,7 +250,7 @@ public class RecipeTreeBuilder {
     }
 
     private static List<IngredientOption> buildOptions(
-            SlotDisplay slot, Map<Item, RecipeNode> resolved, Minecraft client, Item excludeItem) {
+            SlotDisplay slot, Map<Item, RecipeNode> resolved, Item excludeItem) {
         List<IngredientOption> options = new ArrayList<>();
 
         if (slot instanceof SlotDisplay.ItemSlotDisplay d) {
@@ -306,24 +267,24 @@ public class RecipeTreeBuilder {
             }
         } else if (slot instanceof SlotDisplay.TagSlotDisplay d) {
             TagKey<Item> tag = d.tag();
-            for (Item item : getTagMembers(tag, client)) {
+            for (Item item : RecipeResolver.getOrComputeTagMembers(tag)) {
                 if (item.equals(excludeItem)) continue;
                 RecipeNode node = resolved.getOrDefault(item, new BaseResource(item));
                 options.add(new IngredientOption(item, node));
             }
         } else if (slot instanceof SlotDisplay.Composite d) {
             for (SlotDisplay sub : d.contents()) {
-                options.addAll(buildOptions(sub, resolved, client, excludeItem));
+                options.addAll(buildOptions(sub, resolved, excludeItem));
             }
         } else if (slot instanceof SlotDisplay.WithRemainder d) {
-            options.addAll(buildOptions(d.input(), resolved, client, excludeItem));
+            options.addAll(buildOptions(d.input(), resolved, excludeItem));
         }
 
         return options;
     }
 
-    private static List<Set<Item>> getConsolidatedEdges(RecipeDisplay display, Item outputItem, Minecraft client) {
-        List<SlotDisplay> slots = getSlots(display);
+    private static List<Set<Item>> getConsolidatedEdges(RecipeDisplay display, Item outputItem) {
+        List<SlotDisplay> slots = RecipeResolver.getSlots(display);
         if (slots == null) return null;
 
         Map<List<Item>, Set<Item>> consolidated = new LinkedHashMap<>();
@@ -331,31 +292,15 @@ public class RecipeTreeBuilder {
             if (slot instanceof SlotDisplay.Empty) continue;
 
             Set<Item> options = new LinkedHashSet<>();
-            collectItems(slot, options, client);
+            collectItems(slot, options);
             options.remove(outputItem);
-            if (options.isEmpty()) return null; // Truly self-consuming
+            if (options.isEmpty()) return null;
 
             List<Item> key = itemSetKey(options);
-            consolidated.merge(key, options, (a, b) -> a); // Keep first (same options)
+            consolidated.merge(key, options, (a, b) -> a);
         }
 
         return new ArrayList<>(consolidated.values());
-    }
-
-    public static boolean isSelfConsuming(RecipeDisplayEntry entry, Item outputItem) {
-        Minecraft client = Minecraft.getInstance();
-        if (client.level == null) return true;
-
-        List<SlotDisplay> slots = getSlots(entry.display());
-        if (slots == null) return true;
-        for (SlotDisplay slot : slots) {
-            if (slot instanceof SlotDisplay.Empty) continue;
-            Set<Item> items = new HashSet<>();
-            collectItems(slot, items, client);
-            items.remove(outputItem);
-            if (items.isEmpty()) return true; // This slot has no non-self option
-        }
-        return false;
     }
 
     private static List<Item> optionsKey(List<IngredientOption> options) {
@@ -366,7 +311,6 @@ public class RecipeTreeBuilder {
         return items;
     }
 
-    /** Returns a sorted list of items for use as a deduplication key. */
     private static List<Item> itemSetKey(Set<Item> items) {
         if (items.size() == 1) return List.of(items.iterator().next());
         List<Item> sorted = new ArrayList<>(items);
@@ -374,62 +318,18 @@ public class RecipeTreeBuilder {
         return sorted;
     }
 
-    public static void collectItems(SlotDisplay slot, Set<Item> items, Minecraft client) {
+    public static void collectItems(SlotDisplay slot, Set<Item> items) {
         if (slot instanceof SlotDisplay.ItemSlotDisplay d) {
             items.add(d.item().value());
         } else if (slot instanceof SlotDisplay.ItemStackSlotDisplay d) {
             items.add(d.stack().item().value());
         } else if (slot instanceof SlotDisplay.TagSlotDisplay d) {
-            items.addAll(getTagMembers(d.tag(), client));
+            items.addAll(RecipeResolver.getOrComputeTagMembers(d.tag()));
         } else if (slot instanceof SlotDisplay.Composite d) {
-            for (SlotDisplay sub : d.contents()) collectItems(sub, items, client);
+            for (SlotDisplay sub : d.contents()) collectItems(sub, items);
         } else if (slot instanceof SlotDisplay.WithRemainder d) {
-            collectItems(d.input(), items, client);
+            collectItems(d.input(), items);
         }
-    }
-
-    public static List<SlotDisplay> getSlots(RecipeDisplay display) {
-        if (display instanceof ShapedCraftingRecipeDisplay s) return s.ingredients();
-        if (display instanceof ShapelessCraftingRecipeDisplay s) return s.ingredients();
-        return null;
-    }
-
-    public static boolean fitsInGrid(RecipeDisplay display, int gridSize) {
-        if (display instanceof ShapedCraftingRecipeDisplay s) {
-            return s.width() <= gridSize && s.height() <= gridSize;
-        } else if (display instanceof ShapelessCraftingRecipeDisplay s) {
-            List<SlotDisplay> ingredients = s.ingredients();
-            int count = 0;
-            for (SlotDisplay slot : ingredients) {
-                if (!(slot instanceof SlotDisplay.Empty)) count++;
-            }
-            return count <= gridSize * gridSize;
-        }
-        return false;
-    }
-
-    public static Item getOutputItem(RecipeDisplay display) {
-        ItemStack out = resolveOutputSlot(display.result());
-        return out.isEmpty() ? null : out.getItem();
-    }
-
-    public static int getOutputCount(RecipeDisplay display) {
-        ItemStack out = resolveOutputSlot(display.result());
-        return out.isEmpty() ? 0 : out.getCount();
-    }
-
-    public static ItemStack resolveOutputSlot(SlotDisplay display) {
-        if (display instanceof SlotDisplay.ItemSlotDisplay d) return new ItemStack(d.item().value());
-        if (display instanceof SlotDisplay.ItemStackSlotDisplay d)
-            return new ItemStack(d.stack().item().value(), d.stack().count());
-        if (display instanceof SlotDisplay.Composite d) {
-            for (SlotDisplay sub : d.contents()) {
-                ItemStack r = resolveOutputSlot(sub);
-                if (!r.isEmpty()) return r;
-            }
-        }
-        if (display instanceof SlotDisplay.WithRemainder d) return resolveOutputSlot(d.input());
-        return ItemStack.EMPTY;
     }
 
     private static int getGridSize(RecipeDisplay display) {
