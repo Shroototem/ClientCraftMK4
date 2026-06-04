@@ -26,3 +26,6 @@ remappedSrc/
 
 # Other
 .claude/
+
+# Decompiled Minecraft source (reference only)
+MinecraftSource/
