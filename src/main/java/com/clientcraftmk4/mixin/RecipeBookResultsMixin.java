@@ -18,6 +18,7 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 import java.util.List;
+import java.util.ArrayList;
 
 @Mixin(RecipeBookPage.class)
 public class RecipeBookResultsMixin {
@@ -32,12 +33,9 @@ public class RecipeBookResultsMixin {
 
     @Inject(method = "mouseClicked", at = @At("HEAD"), cancellable = true)
     private void clientcraft$onRightClick(MouseButtonEvent event, int left, int top, int width, int height, boolean bl, CallbackInfoReturnable<Boolean> cir) {
-        if (event.button() != 1) return; // Only right-click
-
-        // If alternatives widget is already open, let vanilla handle it
+        if (event.button() != 1) return;
         if (overlay.isVisible()) return;
 
-        // Find which button the mouse is over
         for (RecipeButton button : buttons) {
             if (!button.visible) continue;
             if (!button.isMouseOver(event.x(), event.y())) continue;
@@ -45,36 +43,55 @@ public class RecipeBookResultsMixin {
             RecipeCollection collection = button.getCollection();
             if (!RecipeResolver.isAutoCraftCollection(collection)) return;
 
-            // Prefer a craftable recipe variant, fall back to the displayed one
-            RecipeDisplayEntry best = null;
+            List<RecipeDisplayEntry> variants = new ArrayList<>();
             for (RecipeDisplayEntry entry : collection.getRecipes()) {
                 if (collection.isCraftable(entry.id()) || RecipeResolver.isContainerCraftable(entry.id())) {
-                    best = entry;
+                    variants.add(entry);
+                }
+            }
+            if (variants.isEmpty()) {
+                for (RecipeDisplayEntry entry : collection.getRecipes()) {
+                    if (entry.id().equals(button.getCurrentRecipe())) {
+                        variants.add(entry);
+                        break;
+                    }
+                }
+            }
+            if (variants.isEmpty()) return;
+
+            int initialIndex = 0;
+            for (int i = 0; i < variants.size(); i++) {
+                if (variants.get(i).id().equals(button.getCurrentRecipe())) {
+                    initialIndex = i;
                     break;
                 }
-                if (best == null && entry.id().equals(button.getCurrentRecipe())) best = entry;
             }
-            if (best != null) {
-                RecipeCollection ingredientCollection = RecipeResolver.buildIngredientCollection(best);
-                if (ingredientCollection == null) return;
 
-                ContextMap context = SlotDisplayContext.fromLevel(
-                        Minecraft.getInstance().level);
+            RecipeDisplayEntry target = variants.get(initialIndex);
+            RecipeCollection ingredientCollection = RecipeResolver.buildIngredientCollection(target);
+            if (ingredientCollection == null) return;
 
-                overlay.init(
-                        ingredientCollection,
-                        context,
-                        false,
-                        button.getX(),
-                        button.getY(),
-                        left + width / 2,
-                        top + 13 + height / 2,
-                        button.getWidth()
-                );
+            RecipeResolver.setActiveVariants(variants, initialIndex, collection);
+            RecipeResolver.setOverlayPosition(
+                    button.getX(), button.getY(),
+                    left + width / 2, top + 13 + height / 2,
+                    button.getWidth());
 
-                cir.setReturnValue(true);
-                return;
-            }
+            ContextMap context = SlotDisplayContext.fromLevel(Minecraft.getInstance().level);
+            overlay.init(
+                    ingredientCollection,
+                    context,
+                    false,
+                    button.getX(),
+                    button.getY(),
+                    left + width / 2,
+                    top + 13 + height / 2,
+                    button.getWidth()
+            );
+            RecipeResolver.setActiveOverlay(overlay);
+
+            cir.setReturnValue(true);
+            return;
         }
     }
 }

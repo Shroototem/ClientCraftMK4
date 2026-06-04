@@ -31,17 +31,19 @@ public abstract class AnimatedResultButtonMixin {
         if (!RecipeResolver.isAutoCraftCollection(getCollection())) return;
 
         RecipeButton self = (RecipeButton) (Object) this;
+        int count = RecipeResolver.getCraftCount(getCurrentRecipe());
+        boolean container = RecipeResolver.isContainerCraftable(getCurrentRecipe());
+        int x = self.getX(), y = self.getY(), w = self.getWidth(), h = self.getHeight();
 
-        if (RecipeResolver.isContainerCraftable(getCurrentRecipe())) {
-            int x = self.getX();
-            int y = self.getY();
-            context.fill(x, y, x + self.getWidth(), y + self.getHeight(), 0x807B2FBE);
+        if (container) {
+            context.fill(x, y, x + w, y + h, 0x807B2FBE);
         }
 
-        int count = RecipeResolver.getCraftCount(getCurrentRecipe());
-        if (count <= 0) return;
-
-        Font textRenderer = Minecraft.getInstance().font;
-        context.itemDecorations(textRenderer, getDisplayStack(), self.getX() + 4, self.getY() + 4, String.valueOf(count));
+        if (count > 0) {
+            Font textRenderer = Minecraft.getInstance().font;
+            context.itemDecorations(textRenderer, getDisplayStack(), x + 4, y + 4, String.valueOf(count));
+        } else if (!container) {
+            context.fill(x, y, x + w, y + h, 0x80555555);
+        }
     }
 }

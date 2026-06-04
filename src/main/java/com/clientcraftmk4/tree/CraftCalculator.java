@@ -9,29 +9,6 @@ public class CraftCalculator {
 
     private record MemoEntry(long count, boolean containerOnly) {}
 
-    public static Map<Item, Integer> calculateAllCounts(
-            RecipeTree tree, Map<Item, Integer> inventory,
-            Map<Item, Integer> containerInventory, int gridSize) {
-
-        Map<Item, Integer> combined = combinedInventory(inventory, containerInventory);
-        Map<Item, MemoEntry> memo = new HashMap<>();
-        Map<Item, Integer> results = new HashMap<>();
-
-        for (Item item : tree.getTopologicalOrder()) {
-            RecipeNode node = tree.getNode(item);
-            if (node == null) continue;
-            computeMemo(node, tree, inventory, combined, gridSize, memo);
-        }
-
-        for (Map.Entry<Item, MemoEntry> e : memo.entrySet()) {
-            if (e.getValue().count > 0) {
-                results.put(e.getKey(), clampInt(e.getValue().count));
-            }
-        }
-
-        return results;
-    }
-
     /**
      * Computes per-recipe craftable counts for all recipes in the tree.
      * Uses the memoized topological approach: builds a memo of per-item max counts,
@@ -87,13 +64,6 @@ public class CraftCalculator {
             }
         }
         return results;
-    }
-
-    public static int maxCraftable(RecipeNode node, RecipeTree tree, Map<Item, Integer> inventory,
-                                   Map<Item, Integer> containerInventory, int gridSize) {
-        Map<Item, Integer> combined = combinedInventory(inventory, containerInventory);
-        Map<Item, MemoEntry> memo = new HashMap<>();
-        return clampInt(computeMemo(node, tree, inventory, combined, gridSize, memo));
     }
 
     private static long computeMemo(RecipeNode node, RecipeTree tree, Map<Item, Integer> inventory,
@@ -289,61 +259,9 @@ public class CraftCalculator {
         return maxOps == Long.MAX_VALUE ? 0 : maxOps;
     }
 
-    public static Set<Item> computeAffectedItems(RecipeTree tree, Set<Item> changedItems) {
-        Set<Item> affected = new HashSet<>(changedItems);
-        Queue<Item> queue = new ArrayDeque<>(changedItems);
-
-        while (!queue.isEmpty()) {
-            Item item = queue.poll();
-            Set<Item> deps = tree.getDependents(item);
-            for (Item dep : deps) {
-                if (affected.add(dep)) {
-                    queue.add(dep);
-                }
-            }
-        }
-
-        return affected;
-    }
-
-    public static void updateCounts(
-            RecipeTree tree, Map<Item, Integer> inventory,
-            Map<Item, Integer> containerInventory, int gridSize,
-            Set<Item> affectedItems, Map<Item, Integer> existingCounts) {
-
-        Map<Item, Integer> combined = combinedInventory(inventory, containerInventory);
-
-        Map<Item, MemoEntry> memo = new HashMap<>();
-        for (Map.Entry<Item, Integer> e : existingCounts.entrySet()) {
-            if (!affectedItems.contains(e.getKey())) {
-                memo.put(e.getKey(), new MemoEntry(e.getValue(), false));
-            }
-        }
-
-        for (Item item : tree.getTopologicalOrder()) {
-            if (!affectedItems.contains(item)) continue;
-            RecipeNode node = tree.getNode(item);
-            if (node == null) continue;
-            computeMemo(node, tree, inventory, combined, gridSize, memo);
-        }
-
-        for (Item item : affectedItems) {
-            MemoEntry m = memo.get(item);
-            if (m != null && m.count > 0) {
-                existingCounts.put(item, clampInt(m.count));
-            } else {
-                existingCounts.remove(item);
-            }
-        }
-    }
-
     private static Map<Item, Integer> combinedInventory(Map<Item, Integer> inventory, Map<Item, Integer> containerInventory) {
         Map<Item, Integer> combined = new HashMap<>(inventory);
         if (containerInventory != null) containerInventory.forEach((k, v) -> combined.merge(k, v, Integer::sum));
         return combined;
-    }
-
-    private static int clampInt(long val) {
-        return (int) Math.min(val, 99999);
     }
 }

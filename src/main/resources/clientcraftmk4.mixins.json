@@ -5,8 +5,10 @@
     "client": [
         "AlternativeButtonWidgetMixin",
         "AnimatedResultButtonMixin",
-        "CraftingRecipeBookWidgetMixin",
         "ClientRecipeBookMixin",
+        "ClientRecipeBookMouseHandlerMixin",
+        "CraftingRecipeBookWidgetMixin",
+        "RecipeBookPageAccessor",
         "RecipeBookResultsMixin",
         "RecipeBookWidgetAccessor",
         "RecipeBookWidgetMixin",
