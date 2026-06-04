@@ -448,8 +448,19 @@ public class RecipeResolver {
                         } else {
                             int count = treeCounts.getOrDefault(entry.id(), 0);
                             if (count > 0) {
-                                resolvedCounts.put(entry.id(), count);
-                                treeCounted++;
+                                // Tree-based DP can over-count when multiple
+                                // edges share the same base resources through
+                                // sub-crafting (e.g. 2 planks → "craftable"
+                                // shovel because both the head AND sticks
+                                // count the same 2 planks independently).
+                                // resolve() simulates actual consumption and
+                                // correctly rejects impossible crafts.
+                                tempInv.clear(); tempInv.putAll(invSnapshot);
+                                sharedInProgress.clear();
+                                if (resolve(entry, tempInv, null, sharedInProgress, 0, null)) {
+                                    resolvedCounts.put(entry.id(), count);
+                                    treeCounted++;
+                                }
                             } else if (checkContainers) {
                                 int contCount = treeCombinedCounts.getOrDefault(entry.id(), 0);
                                 if (contCount > 0) {
