@@ -19,6 +19,8 @@ dependencies {
     implementation "net.fabricmc:fabric-loader:${loader_version}"
     implementation "net.fabricmc.fabric-api:fabric-api:${fabric_api_version}"
     implementation "com.terraformersmc:modmenu:${modmenu_version}"
+
+    testImplementation "net.fabricmc:fabric-loader-junit:${loader_version}"
 }
 
 processResources {
@@ -39,4 +41,37 @@ jar {
     from("LICENSE") {
         rename { "${it}_${base.archivesName.get()}" }
     }
+}
+
+// fabric-loader-junit must initialise in the CLIENT environment so the client-side
+// mixins (including RecipeResultCollectionAccessor, which the resolver casts to) are
+// applied to the test classpath.
+tasks.withType(Test).configureEach {
+    useJUnitPlatform()
+    systemProperty "fabric.dli.env", "client"
+    // Paths to the recipe snapshot (dumped in-game via /ccdump) and the fake inventory.
+    systemProperty "ccmk4.snapshot", System.getProperty("ccmk4.snapshot", "run/benchmark-recipes.dat")
+    systemProperty "ccmk4.inventory", System.getProperty("ccmk4.inventory", "benchmark.json")
+    testLogging {
+        showStandardStreams = true
+        events "passed", "skipped", "failed"
+        exceptionFormat "full"
+    }
+}
+
+// Dedicated task for `./gradlew benchmark`: runs ONLY the resolver benchmark, always
+// re-executes (never cached, so re-dumping or re-running reflects immediately), and
+// streams the timing report to the console.
+tasks.register("benchmarkTest", Test) {
+    group = "other"
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+    filter { includeTestsMatching "com.clientcraftmk4.benchmark.RecipeResolverBenchmark" }
+    outputs.upToDateWhen { false }
+}
+
+tasks.register("benchmark"){
+    group = "other"
+    description = "Runs the resolver benchmark against run/benchmark-recipes.dat + benchmark.json and prints per-stage timings."
+    dependsOn tasks.named("benchmarkTest")
 }

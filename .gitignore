@@ -23,6 +23,7 @@ logs/
 
 # Fabric
 remappedSrc/
+.fabric/
 
 # Other
 .claude/
