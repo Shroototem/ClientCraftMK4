@@ -1,0 +1,22 @@
+[
+  { "id": "minecraft:oak_log", "count": 48 },
+  { "id": "minecraft:oak_planks", "count": 137 },
+  { "id": "minecraft:cobblestone", "count": 192 },
+  { "id": "minecraft:iron_ingot", "count": 61 },
+  { "id": "minecraft:gold_ingot", "count": 23 },
+  { "id": "minecraft:redstone", "count": 88 },
+  { "id": "minecraft:diamond", "count": 14 },
+  { "id": "minecraft:stick", "count": 96 },
+  { "id": "minecraft:string", "count": 27 },
+  { "id": "minecraft:coal", "count": 64 },
+  { "id": "minecraft:leather", "count": 12 },
+  { "id": "minecraft:glass", "count": 45 },
+  { "id": "minecraft:wheat", "count": 73 },
+  { "id": "minecraft:sugar_cane", "count": 39 },
+  { "id": "minecraft:feather", "count": 18 },
+  { "id": "minecraft:flint", "count": 7 },
+  { "id": "minecraft:gunpowder", "count": 33 },
+  { "id": "minecraft:copper_ingot", "count": 128 },
+  { "id": "minecraft:quartz", "count": 52 },
+  { "id": "minecraft:white_wool", "count": 21 }
+]
