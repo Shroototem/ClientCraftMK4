@@ -7,14 +7,9 @@ import com.clientcraftmk4.tree.IngredientEdge;
 import com.clientcraftmk4.tree.IngredientOption;
 import com.clientcraftmk4.tree.RecipeTree;
 import com.clientcraftmk4.tree.RecipeTreeBuilder;
-import net.minecraft.client.Minecraft;
-import net.minecraft.client.gui.screens.inventory.CraftingScreen;
 import net.minecraft.client.gui.screens.recipebook.RecipeCollection;
 import net.minecraft.client.ClientRecipeBook;
 import net.minecraft.client.gui.screens.recipebook.SearchRecipeBookCategory;
-import net.minecraft.core.component.DataComponents;
-import net.minecraft.world.item.component.BundleContents;
-import net.minecraft.world.item.component.ItemContainerContents;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.crafting.display.RecipeDisplayId;
@@ -23,7 +18,6 @@ import net.minecraft.world.item.crafting.display.RecipeDisplay;
 import net.minecraft.world.item.crafting.display.ShapedCraftingRecipeDisplay;
 import net.minecraft.world.item.crafting.display.ShapelessCraftingRecipeDisplay;
 import net.minecraft.world.item.crafting.display.SlotDisplay;
-import net.minecraft.core.registries.Registries;
 import net.minecraft.tags.TagKey;
 
 import net.minecraft.client.gui.screens.recipebook.OverlayRecipeComponent;
@@ -87,6 +81,14 @@ public class RecipeResolver {
 
     private static Map<Item, String> lowerCaseNameCache = new HashMap<>();
     private static IngredientGrid activeIngredientGrid = null;
+
+    // Injectable seam for all live game state. Defaults to the live client;
+    // the benchmark harness swaps in a snapshot-backed implementation.
+    private static volatile ResolverEnvironment env = new LiveClientEnvironment();
+
+    public static void setEnvironment(ResolverEnvironment environment) { env = environment; }
+    public static ResolverEnvironment getEnvironment() { return env; }
+    public static boolean isEnvReady() { return env.isReady(); }
 
     // --- Tag cache ---
     private static Set<TagKey<Item>> knownTags = new HashSet<>();
@@ -176,37 +178,14 @@ public class RecipeResolver {
     // --- Shared helpers ---
 
     private static int getGridSize() {
-        return (Minecraft.getInstance().screen instanceof CraftingScreen) ? 3 : 2;
+        return env.gridSize();
     }
 
     private static Map<Item, Integer> getOrSnapshotInventory() {
-        Minecraft client = Minecraft.getInstance();
-        if (client.level == null || client.player == null) return Map.of();
-        Map<Item, Integer> snapshot = new HashMap<>();
-        Map<Item, Integer> containerSnapshot = new HashMap<>();
-        var inv = client.player.getInventory();
-        for (int i = 0; i < inv.getContainerSize(); i++) {
-            ItemStack stack = inv.getItem(i);
-            if (stack.isEmpty()) continue;
-
-            if (ClientCraftConfig.searchContainers) {
-                ItemContainerContents container = stack.get(DataComponents.CONTAINER);
-                if (container != null) {
-                    container.nonEmptyItemCopyStream().forEach(contained -> {
-                        containerSnapshot.merge(contained.getItem(), contained.getCount(), Integer::sum);
-                    });
-                }
-                BundleContents bundle = stack.get(DataComponents.BUNDLE_CONTENTS);
-                if (bundle != null) {
-                    bundle.itemCopyStream().forEach(contained -> {
-                        containerSnapshot.merge(contained.getItem(), contained.getCount(), Integer::sum);
-                    });
-                }
-            }
-
-            if (stack.has(DataComponents.CUSTOM_NAME)) continue;
-            snapshot.merge(stack.getItem(), stack.getCount(), Integer::sum);
-        }
+        if (!env.isReady()) return Map.of();
+        ResolverEnvironment.InventoryScan scan = env.scanInventory();
+        Map<Item, Integer> snapshot = scan.main();
+        Map<Item, Integer> containerSnapshot = scan.container();
         if (!snapshot.equals(cachedInventory) || !containerSnapshot.equals(cachedContainerInventory)) {
             cachedInventory = snapshot;
             cachedContainerInventory = containerSnapshot;
@@ -217,9 +196,8 @@ public class RecipeResolver {
     }
 
     private static void ensureIndex() {
-        Minecraft client = Minecraft.getInstance();
-        if (client.player == null) return;
-        List<RecipeCollection> allCrafting = client.player.getRecipeBook().getCollection(SearchRecipeBookCategory.CRAFTING);
+        if (!env.isReady()) return;
+        List<RecipeCollection> allCrafting = env.craftingCollections();
         int currentCount = 0;
         for (RecipeCollection c : allCrafting) currentCount += c.getRecipes().size();
         if (!recipeIndexDirty && !recipesByOutput.isEmpty() && currentCount == lastRecipeCount) return;
@@ -254,10 +232,26 @@ public class RecipeResolver {
     // --- Tag cache ---
 
     private static void collectTags(SlotDisplay slot) {
-        if (slot instanceof SlotDisplay.TagSlotDisplay d) knownTags.add(d.tag());
+        collectTags(slot, knownTags);
+    }
+
+    private static void collectTags(SlotDisplay slot, Set<TagKey<Item>> target) {
+        if (slot instanceof SlotDisplay.TagSlotDisplay d) target.add(d.tag());
         else if (slot instanceof SlotDisplay.Composite d) {
-            for (SlotDisplay sub : d.contents()) collectTags(sub);
-        } else if (slot instanceof SlotDisplay.WithRemainder d) collectTags(d.input());
+            for (SlotDisplay sub : d.contents()) collectTags(sub, target);
+        } else if (slot instanceof SlotDisplay.WithRemainder d) collectTags(d.input(), target);
+    }
+
+    /** Collects every item tag referenced by the given crafting collections (used by the snapshot dumper). */
+    public static Set<TagKey<Item>> collectReferencedTags(List<RecipeCollection> collections) {
+        Set<TagKey<Item>> tags = new HashSet<>();
+        for (RecipeCollection coll : collections) {
+            for (RecipeDisplayEntry entry : coll.getRecipes()) {
+                List<SlotDisplay> slots = getSlots(entry.display());
+                if (slots != null) for (SlotDisplay slot : slots) collectTags(slot, tags);
+            }
+        }
+        return tags;
     }
 
     private static Set<TagKey<Item>> computeTagsForItem(Item item) {
@@ -265,9 +259,8 @@ public class RecipeResolver {
         if (existing != null) return existing;
 
         Set<TagKey<Item>> tags = new HashSet<>();
-        var holder = item.builtInRegistryHolder();
         for (TagKey<Item> tag : knownTags) {
-            if (holder.is(tag)) tags.add(tag);
+            if (env.itemHasTag(item, tag)) tags.add(tag);
         }
         Set<TagKey<Item>> result = tags.isEmpty() ? Set.of() : tags;
         itemToTags.put(item, result);
@@ -324,13 +317,8 @@ public class RecipeResolver {
     public static List<Item> getOrComputeTagMembers(TagKey<Item> tag) {
         List<Item> cached = tagMembersCache.get(tag);
         if (cached != null) return cached;
-        Minecraft client = Minecraft.getInstance();
-        if (client.level == null) return null;
-        var regOpt = client.level.registryAccess().lookupOrThrow(Registries.ITEM);
-        var entriesOpt = regOpt.get(tag);
-        if (entriesOpt.isEmpty()) return null;
-        List<Item> items = new ArrayList<>();
-        for (var entry : entriesOpt.get()) items.add(entry.value());
+        List<Item> items = env.tagMembers(tag);
+        if (items == null) return null;
         tagMembersCache.put(tag, items);
         return items;
     }
@@ -384,8 +372,7 @@ public class RecipeResolver {
     // --- Public API ---
 
     public static List<RecipeCollection> resolveForTab(ClientRecipeBook recipeBook) {
-        Minecraft client = Minecraft.getInstance();
-        if (client.player == null || client.level == null) return List.of();
+        if (!env.isReady()) return List.of();
 
         int gridSize = getGridSize();
         currentGridSize = gridSize;
@@ -573,7 +560,7 @@ public class RecipeResolver {
                 }
 
                 Set<Item> finalContainerItemSet = containerItemSet;
-                Minecraft.getInstance().execute(() -> {
+                env.runOnMainThread(() -> {
                     if (recipeIndexDirty || lastRecipeCount != startRecipeCount) {
                         resolving = false;
                         Runnable retry = onResultsPublished;
@@ -594,7 +581,7 @@ public class RecipeResolver {
                 });
             } catch (Exception e) {
                 LOG.error("[CC] Background resolve failed", e);
-                Minecraft.getInstance().execute(() -> resolving = false);
+                env.runOnMainThread(() -> resolving = false);
             }
         });
 
@@ -603,7 +590,7 @@ public class RecipeResolver {
 
     public static AutoCrafter.CraftPlan buildCraftCyclesForMode(RecipeDisplayEntry target, AutoCrafter.Mode mode) {
         long t0 = System.nanoTime();
-        if (Minecraft.getInstance().player == null) return null;
+        if (!env.isReady()) return null;
         prepareContext();
         long tPrep = System.nanoTime();
 
@@ -724,6 +711,186 @@ public class RecipeResolver {
         cachedRecipeTree = null;
     }
 
+    // --- Benchmark harness ---------------------------------------------------
+    //
+    // Runs the exact same stages as the background resolve in resolveForTab, but
+    // synchronously and with per-stage timing, so the full "what is craftable"
+    // pipeline (and auto-craft planning) can be measured headlessly against a
+    // snapshot + fake inventory. Only invoked by the benchmark; the shipped path
+    // never calls this.
+
+    private static String ms(long ns) { return String.format("%8.3f ms", ns / 1_000_000.0); }
+    private static String ms(long ns, int div) { return ms(div > 0 ? ns / div : 0); }
+
+    /**
+     * Exercises the resolver pipeline against whatever {@link ResolverEnvironment} is
+     * installed and prints a per-stage timing report.
+     *
+     * @param warmup     iterations run before measurement (JIT warmup)
+     * @param iterations measured iterations of the full per-resolve pipeline
+     */
+    public static void runBenchmark(int warmup, int iterations) {
+        // --- Cold setup: recipe index + inventory snapshot (recipes don't change) ---
+        markRecipesDirty();
+        currentGridSize = getGridSize();
+
+        long tIndex = System.nanoTime();
+        ensureIndex();
+        long indexNs = System.nanoTime() - tIndex;
+
+        long tSnap = System.nanoTime();
+        getOrSnapshotInventory(); // also builds the inventory tag index
+        long snapNs = System.nanoTime() - tSnap;
+
+        List<RecipeCollection> allCrafting = new ArrayList<>(env.craftingCollections());
+        int gridSize = currentGridSize;
+        Map<Item, Integer> invSnapshot = new HashMap<>(cachedInventory);
+        Map<Item, Integer> contSnapshot = new HashMap<>(cachedContainerInventory);
+        boolean checkContainers = ClientCraftConfig.searchContainers && !contSnapshot.isEmpty();
+
+        long treeAcc = 0, reachAcc = 0, calcAcc = 0, resolveAcc = 0, collAcc = 0;
+        int totalRecipes = 0, craftableCount = 0;
+        List<RecipeDisplayEntry> craftableSample = new ArrayList<>();
+
+        int total = warmup + iterations;
+        for (int iter = 0; iter < total; iter++) {
+            boolean record = iter >= warmup;
+            boolean last = iter == total - 1;
+
+            // Stage 1: recipe tree build
+            long t = System.nanoTime();
+            RecipeTree tree = RecipeTreeBuilder.build(allCrafting);
+            long treeNs = System.nanoTime() - t;
+
+            // Stage 2: reachable-item closure
+            t = System.nanoTime();
+            Map<Item, Integer> reachableSnapshot = checkContainers && !contSnapshot.isEmpty()
+                    ? mergeMaps(invSnapshot, contSnapshot) : invSnapshot;
+            Set<Item> reachableItems = computeReachableItems(reachableSnapshot, gridSize);
+            long reachNs = System.nanoTime() - t;
+
+            // Stage 3: per-recipe craft-count DP
+            t = System.nanoTime();
+            Map<RecipeDisplayId, Integer> treeCounts = tree == null ? Map.of()
+                    : CraftCalculator.calculatePerRecipeCounts(tree, invSnapshot, Map.of(), gridSize, MAX_REPEATS);
+            Map<RecipeDisplayId, Integer> treeCombinedCounts = (tree != null && checkContainers)
+                    ? CraftCalculator.calculatePerRecipeCounts(tree, invSnapshot, contSnapshot, gridSize, MAX_REPEATS)
+                    : Map.of();
+            long calcNs = System.nanoTime() - t;
+
+            // Stage 4: per-entry filtering + resolve() consumption simulation
+            t = System.nanoTime();
+            List<List<RecipeDisplayEntry>> collAllEntries = new ArrayList<>();
+            Map<RecipeDisplayId, Integer> resolvedCounts = new HashMap<>();
+            Set<RecipeDisplayId> containerSet = new HashSet<>();
+            Map<Item, Integer> tempInv = new HashMap<>();
+            Set<Item> sharedInProgress = new HashSet<>();
+            int localTotal = 0;
+            for (RecipeCollection coll : allCrafting) {
+                List<RecipeDisplayEntry> allEntries = new ArrayList<>();
+                for (RecipeDisplayEntry entry : coll.getRecipes()) {
+                    if (!fitsInGrid(entry.display(), gridSize)) continue;
+                    ItemStack outputStack = resolveSlot(entry.display().result());
+                    Item out = outputStack.isEmpty() ? null : outputStack.getItem();
+                    if (out != null && recipeConsumesItem(entry, out)) continue;
+                    allEntries.add(entry);
+                    localTotal++;
+                    if (!allSlotsReachable(entry, reachableItems)) continue;
+
+                    int count = treeCounts.getOrDefault(entry.id(), 0);
+                    if (count > 0) {
+                        tempInv.clear(); tempInv.putAll(invSnapshot);
+                        sharedInProgress.clear();
+                        if (resolve(entry, tempInv, null, sharedInProgress, 0, null)) {
+                            resolvedCounts.put(entry.id(), count);
+                        }
+                    } else if (checkContainers) {
+                        if (treeCombinedCounts.getOrDefault(entry.id(), 0) > 0) containerSet.add(entry.id());
+                    }
+                }
+                collAllEntries.add(allEntries);
+            }
+            long resolveNs = System.nanoTime() - t;
+
+            // Stage 5: build result RecipeCollections (accessor population)
+            t = System.nanoTime();
+            List<RecipeCollection> result = new ArrayList<>();
+            for (List<RecipeDisplayEntry> allEntries : collAllEntries) {
+                if (allEntries.isEmpty()) continue;
+                RecipeCollection nc = new RecipeCollection(allEntries);
+                RecipeResultCollectionAccessor accessor = (RecipeResultCollectionAccessor) nc;
+                for (RecipeDisplayEntry e : allEntries) {
+                    accessor.getDisplayableRecipes().add(e.id());
+                    if (resolvedCounts.getOrDefault(e.id(), 0) > 0 || containerSet.contains(e.id())) {
+                        accessor.getCraftableRecipes().add(e.id());
+                    }
+                }
+                result.add(nc);
+            }
+            long collNs = System.nanoTime() - t;
+
+            if (record) {
+                treeAcc += treeNs; reachAcc += reachNs; calcAcc += calcNs;
+                resolveAcc += resolveNs; collAcc += collNs;
+            }
+            if (last) {
+                totalRecipes = localTotal;
+                craftableCount = resolvedCounts.size();
+                for (List<RecipeDisplayEntry> entries : collAllEntries) {
+                    for (RecipeDisplayEntry e : entries) {
+                        if (resolvedCounts.getOrDefault(e.id(), 0) > 0 && craftableSample.size() < 25) {
+                            craftableSample.add(e);
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- Auto-craft planning over a sample of craftable targets ---
+        long onceNs = 0, stackNs = 0, allNs = 0;
+        for (RecipeDisplayEntry target : craftableSample) {
+            long a = System.nanoTime(); buildCraftCyclesForMode(target, AutoCrafter.Mode.ONCE);  onceNs += System.nanoTime() - a;
+            a = System.nanoTime();      buildCraftCyclesForMode(target, AutoCrafter.Mode.STACK); stackNs += System.nanoTime() - a;
+            a = System.nanoTime();      buildCraftCyclesForMode(target, AutoCrafter.Mode.ALL);   allNs += System.nanoTime() - a;
+        }
+
+        int sample = craftableSample.size();
+        long resolveTotal = (treeAcc + reachAcc + calcAcc + resolveAcc + collAcc);
+
+        // One representative end-to-end pass, warmup excluded: cold index + snapshot +
+        // a single averaged resolve + a single averaged auto-craft (all three modes).
+        long resolvePerPass = iterations > 0 ? resolveTotal / iterations : 0;
+        long autoCraftPerTarget = sample > 0 ? (onceNs + stackNs + allNs) / sample : 0;
+        long overallNs = indexNs + snapNs + resolvePerPass + autoCraftPerTarget;
+
+        StringBuilder r = new StringBuilder();
+        r.append("\n============ ClientCraftMK4 Benchmark ============\n");
+        r.append(String.format("Grid size            : %d%n", gridSize));
+        r.append(String.format("Inventory items      : %d distinct%n", cachedInventory.size()));
+        r.append(String.format("Recipe collections   : %d%n", allCrafting.size()));
+        r.append(String.format("Recipes considered   : %d (in-grid)%n", totalRecipes));
+        r.append(String.format("Craftable now        : %d%n", craftableCount));
+        r.append("-- Cold setup (once) -----------------------------\n");
+        r.append(String.format("Recipe index build   : %s%n", ms(indexNs)));
+        r.append(String.format("Inventory snapshot   : %s%n", ms(snapNs)));
+        r.append(String.format("-- Per-resolve stages (avg of %d iters) --------%n", iterations));
+        r.append(String.format("Recipe tree build    : %s%n", ms(treeAcc, iterations)));
+        r.append(String.format("Reachable closure    : %s%n", ms(reachAcc, iterations)));
+        r.append(String.format("Craft-count DP       : %s%n", ms(calcAcc, iterations)));
+        r.append(String.format("Resolve verify loop  : %s%n", ms(resolveAcc, iterations)));
+        r.append(String.format("Result collections   : %s%n", ms(collAcc, iterations)));
+        r.append(String.format("RESOLVE TOTAL        : %s%n", ms(resolveTotal, iterations)));
+        r.append(String.format("-- Auto-craft plan (avg of %d targets) ---------%n", sample));
+        r.append(String.format("ONCE                 : %s%n", ms(onceNs, sample)));
+        r.append(String.format("STACK                : %s%n", ms(stackNs, sample)));
+        r.append(String.format("ALL                  : %s%n", ms(allNs, sample)));
+        r.append("--------------------------------------------------\n");
+        r.append(String.format("Overall (1 full pass): %s%n", ms(overallNs)));
+        r.append("  = index + snapshot + 1 resolve + 1 auto-craft (warmup excluded)\n");
+        r.append("==================================================\n");
+        System.out.print(r);
+    }
+
     public static void clearCache() {
         resolving = false;
         onResultsPublished = null;
@@ -841,7 +1008,7 @@ public class RecipeResolver {
             // miss items produced by sub-crafting during simulation.
             for (Map.Entry<Item, Integer> e : working.entrySet()) {
                 if (e.getValue() >= 1 && !e.getKey().equals(alreadyTried)
-                        && new ItemStack(e.getKey()).is(tag)) {
+                        && env.itemHasTag(e.getKey(), tag)) {
                     working.put(e.getKey(), e.getValue() - 1);
                     return true;
                 }

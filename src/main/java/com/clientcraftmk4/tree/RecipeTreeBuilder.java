@@ -1,7 +1,6 @@
 package com.clientcraftmk4.tree;
 
 import com.clientcraftmk4.RecipeResolver;
-import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.recipebook.RecipeCollection;
 import net.minecraft.tags.TagKey;
 import net.minecraft.world.item.Item;
@@ -16,8 +15,7 @@ import java.util.*;
 public class RecipeTreeBuilder {
 
     public static RecipeTree build(List<RecipeCollection> allCrafting) {
-        Minecraft client = Minecraft.getInstance();
-        if (client.level == null) return null;
+        if (!RecipeResolver.isEnvReady()) return null;
 
         Map<Item, List<RecipeDisplayEntry>> recipesByOutput = new HashMap<>();
 
