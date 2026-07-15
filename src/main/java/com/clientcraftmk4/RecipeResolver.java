@@ -10,6 +10,7 @@ import com.clientcraftmk4.tree.RecipeTreeBuilder;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.inventory.CraftingScreen;
 import net.minecraft.client.gui.screens.recipebook.RecipeCollection;
+import net.minecraft.client.gui.screens.recipebook.RecipeBookPage;
 import net.minecraft.client.ClientRecipeBook;
 import net.minecraft.client.gui.screens.recipebook.SearchRecipeBookCategory;
 import net.minecraft.core.component.DataComponents;
@@ -124,6 +125,31 @@ public class RecipeResolver {
     // --- Variant browsing state ---
 
     private static WeakReference<OverlayRecipeComponent> activeOverlayRef = new WeakReference<>(null);
+
+    // --- Active recipe book page (for scroll-wheel page cycling) ---
+
+    private static volatile WeakReference<RecipeBookPage> activeRecipeBookPage = new WeakReference<>(null);
+    private static volatile int recipeBookLeft, recipeBookTop;
+    private static volatile int recipeBookWidth = 147, recipeBookHeight = 166;
+
+    public static void setActiveRecipeBookPage(RecipeBookPage page, int left, int top) {
+        activeRecipeBookPage = new WeakReference<>(page);
+        recipeBookLeft = left;
+        recipeBookTop = top;
+    }
+
+    public static void clearActiveRecipeBookPage() {
+        activeRecipeBookPage = new WeakReference<>(null);
+    }
+
+    public static RecipeBookPage getActiveRecipeBookPage() {
+        return activeRecipeBookPage.get();
+    }
+
+    public static boolean isMouseOverRecipeBook(double mouseX, double mouseY) {
+        return mouseX >= recipeBookLeft && mouseX < recipeBookLeft + recipeBookWidth
+                && mouseY >= recipeBookTop && mouseY < recipeBookTop + recipeBookHeight;
+    }
 
     public static void setActiveOverlay(OverlayRecipeComponent overlay) {
         activeOverlayRef = new WeakReference<>(overlay);

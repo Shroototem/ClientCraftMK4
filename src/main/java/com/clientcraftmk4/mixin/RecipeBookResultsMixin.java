@@ -1,5 +1,6 @@
 package com.clientcraftmk4.mixin;
 
+import com.clientcraftmk4.RecipeBookPageCycleAccessor;
 import com.clientcraftmk4.RecipeResolver;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.input.MouseButtonEvent;
@@ -21,7 +22,7 @@ import java.util.List;
 import java.util.ArrayList;
 
 @Mixin(RecipeBookPage.class)
-public class RecipeBookResultsMixin {
+public class RecipeBookResultsMixin implements RecipeBookPageCycleAccessor {
 
     @Shadow
     @Final
@@ -30,6 +31,24 @@ public class RecipeBookResultsMixin {
     @Shadow
     @Final
     private OverlayRecipeComponent overlay;
+
+    @Shadow
+    private int currentPage;
+
+    @Shadow
+    private int totalPages;
+
+    @Shadow
+    private void updateButtonsForPage() {}
+
+    @Override
+    public void clientcraft$cyclePage(int delta) {
+        int next = currentPage + delta;
+        if (next >= 0 && next < totalPages) {
+            currentPage = next;
+            updateButtonsForPage();
+        }
+    }
 
     @Inject(method = "mouseClicked", at = @At("HEAD"), cancellable = true)
     private void clientcraft$onRightClick(MouseButtonEvent event, int left, int top, int width, int height, boolean bl, CallbackInfoReturnable<Boolean> cir) {

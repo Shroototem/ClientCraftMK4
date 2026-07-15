@@ -42,6 +42,15 @@ public class RecipeBookWidgetMixin {
     @Final
     private RecipeBookPage recipeBookPage;
 
+    @Shadow
+    private int width;
+
+    @Shadow
+    private int height;
+
+    @Shadow
+    private int xOffset;
+
     @Unique
     private boolean clientcraft$hasAutoSwitched = false;
 
@@ -91,10 +100,15 @@ public class RecipeBookWidgetMixin {
 
         if (selectedTab == null || !(selectedTab.getCategory() instanceof ClientCraftTab)) {
             RecipeResolver.lastTabWasClientCraft = false;
+            RecipeResolver.clearActiveRecipeBookPage();
             return;
         }
 
         RecipeResolver.lastTabWasClientCraft = true;
+
+        int bookLeft = (width - 147) / 2 - xOffset;
+        int bookTop = (height - 166) / 2;
+        RecipeResolver.setActiveRecipeBookPage(recipeBookPage, bookLeft, bookTop);
 
         // Register callback so background thread can refresh UI when done
         final boolean fc = filteringCraftable;

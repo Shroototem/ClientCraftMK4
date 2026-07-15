@@ -10,4 +10,7 @@ public interface RecipeBookPageAccessor {
 
     @Accessor("overlay")
     OverlayRecipeComponent getOverlay();
+
+    @Accessor("totalPages")
+    int getTotalPages();
 }
