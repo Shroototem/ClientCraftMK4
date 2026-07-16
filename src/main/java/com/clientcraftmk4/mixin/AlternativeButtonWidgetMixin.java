@@ -5,9 +5,11 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.Font;
 import net.minecraft.client.renderer.RenderPipelines;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.gui.screens.recipebook.OverlayRecipeComponent;
 import net.minecraft.client.gui.screens.recipebook.RecipeCollection;
 import net.minecraft.client.input.MouseButtonEvent;
+import net.minecraft.core.component.DataComponents;
 import net.minecraft.util.context.ContextMap;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.crafting.display.RecipeDisplayEntry;
@@ -162,6 +164,15 @@ public class AlternativeButtonWidgetMixin {
                     int ix = tileX + 4, iy = tileY + 4;
                     context.item(stack, ix, iy);
                     context.itemDecorations(Minecraft.getInstance().font, stack, ix, iy);
+
+                    if (mouseX >= tileX && mouseX < tileX + TILE_SIZE && mouseY >= tileY && mouseY < tileY + TILE_SIZE) {
+                        Minecraft mc = Minecraft.getInstance();
+                        context.setComponentTooltipForNextFrame(
+                                mc.font,
+                                Screen.getTooltipFromItem(mc, stack),
+                                mouseX, mouseY,
+                                stack.get(DataComponents.TOOLTIP_STYLE));
+                    }
                 }
             }
         }
