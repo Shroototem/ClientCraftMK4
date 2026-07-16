@@ -39,7 +39,7 @@ public class ClientCraftConfigScreen extends Screen {
         addRenderableWidget(Button.builder(Component.literal("Done"), button -> {
             ClientCraftConfig.save();
             RecipeResolver.clearCache();
-            minecraft.setScreen(parent);
+            minecraft.gui.setScreen(parent);
         }).bounds(centerX, y + 114, 200, 20).build());
     }
 

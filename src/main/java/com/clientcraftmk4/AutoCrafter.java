@@ -128,8 +128,8 @@ public class AutoCrafter {
 
     private static AbstractCraftingMenu getHandler() {
         Minecraft client = Minecraft.getInstance();
-        if (client.screen instanceof CraftingScreen s) return s.getMenu();
-        if (client.screen instanceof InventoryScreen s) return s.getMenu();
+        if (client.gui.screen() instanceof CraftingScreen s) return s.getMenu();
+        if (client.gui.screen() instanceof InventoryScreen s) return s.getMenu();
         return null;
     }
 }

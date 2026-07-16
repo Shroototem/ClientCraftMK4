@@ -202,7 +202,7 @@ public class RecipeResolver {
     // --- Shared helpers ---
 
     private static int getGridSize() {
-        return (Minecraft.getInstance().screen instanceof CraftingScreen) ? 3 : 2;
+        return (Minecraft.getInstance().gui.screen() instanceof CraftingScreen) ? 3 : 2;
     }
 
     private static Map<Item, Integer> getOrSnapshotInventory() {
