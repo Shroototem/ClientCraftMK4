@@ -3,10 +3,10 @@ plugins {
 }
 
 group = maven_group
-version = mod_version
+version = mod_version + "+" + stonecutter.current.version
 
 base {
-    archivesName = "${archives_base_name}-${minecraft_version}"
+    archivesName = "${archives_base_name}"
 }
 
 repositories {
@@ -15,7 +15,7 @@ repositories {
 }
 
 dependencies {
-    minecraft "com.mojang:minecraft:${minecraft_version}"
+    minecraft "com.mojang:minecraft:${stonecutter.current.version}"
     implementation "net.fabricmc:fabric-loader:${loader_version}"
     implementation "net.fabricmc.fabric-api:fabric-api:${fabric_api_version}"
     implementation "com.terraformersmc:modmenu:${modmenu_version}"
@@ -23,8 +23,10 @@ dependencies {
 
 processResources {
     inputs.property "version", version
+    inputs.property "mc_version", stonecutter.current.version
+    filteringCharset "UTF-8"
     filesMatching("fabric.mod.json") {
-        expand "version": version
+        expand "version": version, "mc_version": stonecutter.current.version
     }
 }
 

@@ -1,0 +1,27 @@
+plugins {
+    id "dev.kikugie.stonecutter"
+}
+
+stonecutter.active "26.2"
+
+tasks.register("buildAll") {
+    group = "stonecutter"
+    description = "Builds the mod for all configured Minecraft versions."
+    dependsOn rootProject.subprojects.collect { it.tasks.named("build") }
+}
+
+tasks.register("runActiveClient") {
+    group = "fabric"
+    dependsOn ":${stonecutter.current.project}:runClient"
+}
+
+tasks.register("runActiveServer") {
+    group = "fabric"
+    dependsOn ":${stonecutter.current.project}:runServer"
+}
+
+tasks.register("genSourcesAll") {
+    group = "stonecutter"
+    description = "Runs genSources for all configured Minecraft versions."
+    dependsOn rootProject.subprojects.collect { it.tasks.named("genSources") }
+}
