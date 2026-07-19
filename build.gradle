@@ -11,14 +11,18 @@ base {
 
 repositories {
     mavenCentral()
-    maven { url "https://maven.terraformersmc.com/" }
+    maven {
+        name = "Modrinth"
+        url = "https://api.modrinth.com/maven"
+        content { includeGroup "maven.modrinth" }
+    }
 }
 
 dependencies {
     minecraft "com.mojang:minecraft:${stonecutter.current.version}"
     implementation "net.fabricmc:fabric-loader:${loader_version}"
     implementation "net.fabricmc.fabric-api:fabric-api:${fabric_api_version}"
-    implementation "com.terraformersmc:modmenu:${modmenu_version}"
+    implementation "maven.modrinth:mOgUt4GM:njXb639R"
 }
 
 processResources {

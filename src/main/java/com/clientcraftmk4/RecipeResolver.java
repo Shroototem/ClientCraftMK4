@@ -469,8 +469,8 @@ public class RecipeResolver {
                 Set<Item> sharedInProgress = new HashSet<>();
                 Map<Item, Integer> tempInv = new HashMap<>();
 
-                int totalRecipes = 0, treeCounted = 0, preCheckSkipped = 0, containerChecked = 0;
-                long treeBuildNs = 0, treeComputeNs = 0;
+                int totalRecipes = 0, treeCounted = 0, preCheckSkipped = 0, treeSkipped = 0, containerChecked = 0;
+                long treeBuildNs = 0, treeComputeNs = 0, verifyNs = 0;
 
                 // Build or reuse recipe tree (structure is independent of inventory counts)
                 long tTreeBuild = System.nanoTime();
@@ -488,8 +488,10 @@ public class RecipeResolver {
                 Map<Item, Integer> reachableSnapshot = checkContainers && !contSnapshot.isEmpty()
                         ? mergeMaps(invSnapshot, contSnapshot)
                         : invSnapshot;
-                Set<Item> reachableItems = computeReachableItems(reachableSnapshot, gridSize);
-                long reachableMs = (System.nanoTime() - tReachable) / 1_000_000;
+                Set<Item> reachableItems = tree != null
+                        ? computeReachableFromTree(reachableSnapshot, gridSize, tree)
+                        : new HashSet<>(reachableSnapshot.keySet());
+                long reachableNs = System.nanoTime() - tReachable;
 
                 Map<RecipeDisplayId, Integer> treeCounts = Map.of();
                 Map<RecipeDisplayId, Integer> treeCombinedCounts = Map.of();
@@ -505,6 +507,8 @@ public class RecipeResolver {
                 }
 
                 // Pre-filter entries per collection and compute counts in one pass
+                long tVerify = System.nanoTime();
+                RecipeTree.FlatData flat = tree != null ? tree.flat() : null;
                 List<List<RecipeDisplayEntry>> collAllEntries = new ArrayList<>();
                 Map<RecipeDisplayId, Integer> resolvedCounts = new HashMap<>();
                 Map<RecipeDisplayId, Item> entryOutputItems = new HashMap<>();
@@ -513,57 +517,88 @@ public class RecipeResolver {
                     List<RecipeDisplayEntry> allEntries = new ArrayList<>();
 
                     for (RecipeDisplayEntry entry : coll.getRecipes()) {
-                        if (!fitsInGrid(entry.display(), gridSize)) continue;
-                        ItemStack outputStack = resolveSlot(entry.display().result());
-                        Item out = outputStack.isEmpty() ? null : outputStack.getItem();
-                        if (out != null && recipeConsumesItem(entry, out)) continue;
-                        allEntries.add(entry);
-                        totalRecipes++;
+                        int recIdx = flat != null ? flat.dispIdToRecIdx().getOrDefault(entry.id(), -1) : -1;
 
-                        int outputCount = Math.max(1, outputStack.getCount());
-                        if (out != null) entryOutputItems.put(entry.id(), out);
+                        if (!ClientCraftConfig.quickCountMode && recIdx >= 0) {
+                            // === FLAT ARRAY PATH: zero SlotDisplay processing ===
+                            if (flat.recGridSize()[recIdx] > gridSize) continue;
+                            if (flat.recSelfConsuming()[recIdx]) continue;
 
-                        if (!allSlotsReachable(entry, reachableItems)) {
-                            preCheckSkipped++;
-                            continue;
-                        }
-
-                        if (ClientCraftConfig.quickCountMode) {
-                            tempInv.clear(); tempInv.putAll(invSnapshot);
-                            sharedInProgress.clear();
-                            if (resolve(entry, tempInv, null, sharedInProgress, 0, null)) {
-                                resolvedCounts.put(entry.id(), outputCount);
-                            }
-                        } else {
                             int count = treeCounts.getOrDefault(entry.id(), 0);
+                            if (count == 0 && !checkContainers) {
+                                allEntries.add(entry);
+                                totalRecipes++;
+                                treeSkipped++;
+                                continue;
+                            }
+
+                            allEntries.add(entry);
+                            totalRecipes++;
+
+                            Item out = flat.idToItem()[flat.recOutId()[recIdx]];
+                            int outputCount = flat.recOutCount()[recIdx];
+                            entryOutputItems.put(entry.id(), out);
+
                             if (count > 0) {
-                                // Tree-based DP can over-count when multiple
-                                // edges share the same base resources through
-                                // sub-crafting (e.g. 2 planks → "craftable"
-                                // shovel because both the head AND sticks
-                                // count the same 2 planks independently).
-                                // resolve() simulates actual consumption and
-                                // correctly rejects impossible crafts.
-                                tempInv.clear(); tempInv.putAll(invSnapshot);
-                                sharedInProgress.clear();
-                                if (resolve(entry, tempInv, null, sharedInProgress, 0, null)) {
+                                if (allDirectlyAvailableFlat(flat, recIdx, invSnapshot)) {
                                     resolvedCounts.put(entry.id(), count);
                                     treeCounted++;
+                                } else {
+                                    // Tree-based DP can over-count when multiple
+                                    // edges share the same base resources through
+                                    // sub-crafting. resolve() simulates actual
+                                    // consumption and correctly rejects impossible crafts.
+                                    tempInv.clear(); tempInv.putAll(invSnapshot);
+                                    sharedInProgress.clear();
+                                    if (resolve(entry, tempInv, null, sharedInProgress, 0, null)) {
+                                        resolvedCounts.put(entry.id(), count);
+                                        treeCounted++;
+                                    }
                                 }
                             } else if (checkContainers) {
                                 int contCount = treeCombinedCounts.getOrDefault(entry.id(), 0);
                                 if (contCount > 0) {
                                     containerSet.add(entry.id());
                                     containerChecked++;
-                                    Item oi = entryOutputItems.get(entry.id());
-                                    if (oi != null) containerItemSet.add(oi);
+                                    containerItemSet.add(out);
                                 }
+                            }
+                        } else {
+                            // === SLOTDISPLAY PATH: quickCountMode or recipe not in tree ===
+                            if (!fitsInGrid(entry.display(), gridSize)) continue;
+
+                            if (!ClientCraftConfig.quickCountMode) {
+                                allEntries.add(entry);
+                                totalRecipes++;
+                                treeSkipped++;
+                                continue;
+                            }
+
+                            ItemStack outputStack = resolveSlot(entry.display().result());
+                            Item out = outputStack.isEmpty() ? null : outputStack.getItem();
+                            if (out != null && recipeConsumesItem(entry, out)) continue;
+                            allEntries.add(entry);
+                            totalRecipes++;
+
+                            int outputCount = Math.max(1, outputStack.getCount());
+                            if (out != null) entryOutputItems.put(entry.id(), out);
+
+                            if (!allSlotsReachable(entry, reachableItems)) {
+                                preCheckSkipped++;
+                                continue;
+                            }
+                            tempInv.clear(); tempInv.putAll(invSnapshot);
+                            sharedInProgress.clear();
+                            if (resolve(entry, tempInv, null, sharedInProgress, 0, null)) {
+                                resolvedCounts.put(entry.id(), outputCount);
                             }
                         }
                     }
 
                     collAllEntries.add(allEntries);
                 }
+
+                verifyNs = System.nanoTime() - tVerify;
 
                 // --- Build result collections ---
                 for (int i = 0; i < allCrafting.size(); i++) {
@@ -595,12 +630,12 @@ public class RecipeResolver {
                 }
 
                 if (ClientCraftConfig.debugLogging) {
-                    long totalMs = (System.nanoTime() - t0) / 1_000_000;
-                    LOG.info("[CC] Resolve: {}ms | {} recipes | reachable: {}ms ({} items) | treeBuild: {}ms treeCompute: {}ms | counted:{} preSkip:{} cont:{}",
-                            totalMs, totalRecipes,
-                            reachableMs, reachableItems.size(),
-                            treeBuildNs / 1_000_000, treeComputeNs / 1_000_000,
-                            treeCounted, preCheckSkipped, containerChecked);
+                    long totalNs = System.nanoTime() - t0;
+                    LOG.info("[CC] Resolve: {}us | {} recipes | reachable: {}us ({} items) | treeBuild: {}us treeCompute: {}us verify: {}us | counted:{} preSkip:{} treeSkip:{} cont:{}",
+                            totalNs / 1_000, totalRecipes,
+                            reachableNs / 1_000, reachableItems.size(),
+                            treeBuildNs / 1_000, treeComputeNs / 1_000, verifyNs / 1_000,
+                            treeCounted, preCheckSkipped, treeSkipped, containerChecked);
                 }
 
                 Set<Item> finalContainerItemSet = containerItemSet;
@@ -872,7 +907,7 @@ public class RecipeResolver {
             // miss items produced by sub-crafting during simulation.
             for (Map.Entry<Item, Integer> e : working.entrySet()) {
                 if (e.getValue() >= 1 && !e.getKey().equals(alreadyTried)
-                        && new ItemStack(e.getKey()).is(tag)) {
+                        && e.getKey().builtInRegistryHolder().is(tag)) {
                     working.put(e.getKey(), e.getValue() - 1);
                     return true;
                 }
@@ -1023,22 +1058,23 @@ public class RecipeResolver {
     }
 
     /**
-     * Fixed-point closure: scans all recipesByOutput iteratively until no new items
-     * become reachable. Uses allSlotsReachable which handles tag slots correctly.
-     * This is robust regardless of RecipeTree state or topological order correctness.
+     * Fixed-point reachable computation using the tree's recipes.
+     * Iterates until no new items are added — needed because the topo order
+     * is based on primary recipe edges, but non-primary recipes may depend
+     * on items that appear later in the order.
      */
-    private static Set<Item> computeReachableItems(Map<Item, Integer> inventory, int gridSize) {
+    private static Set<Item> computeReachableFromTree(Map<Item, Integer> inventory, int gridSize, RecipeTree tree) {
         Set<Item> reachable = new HashSet<>(inventory.keySet());
         boolean changed = true;
         while (changed) {
             changed = false;
-            for (var entry : recipesByOutput.entrySet()) {
-                Item output = entry.getKey();
-                if (reachable.contains(output)) continue;
-                for (RecipeDisplayEntry recipe : entry.getValue()) {
-                    if (!fitsInGrid(recipe.display(), gridSize)) continue;
-                    if (allSlotsReachable(recipe, reachable)) {
-                        reachable.add(output);
+            for (Item item : tree.getTopologicalOrder()) {
+                if (reachable.contains(item)) continue;
+                List<CraftedItem> recipes = tree.getAllRecipes(item);
+                for (CraftedItem recipe : recipes) {
+                    if (recipe.gridSize() > gridSize) continue;
+                    if (allTreeEdgesReachable(recipe, reachable)) {
+                        reachable.add(item);
                         changed = true;
                         break;
                     }
@@ -1046,6 +1082,43 @@ public class RecipeResolver {
             }
         }
         return reachable;
+    }
+
+    private static boolean allTreeEdgesReachable(CraftedItem recipe, Set<Item> reachable) {
+        for (IngredientEdge edge : recipe.ingredients()) {
+            boolean any = false;
+            for (IngredientOption option : edge.options()) {
+                if (reachable.contains(option.item())) { any = true; break; }
+            }
+            if (!any) return false;
+        }
+        return true;
+    }
+
+    private static boolean allDirectlyAvailable(RecipeDisplayEntry entry, Map<Item, Integer> inventory) {
+        List<SlotDisplay> slots = getSlots(entry.display());
+        if (slots == null) return false;
+        for (SlotDisplay slot : slots) {
+            if (slot instanceof SlotDisplay.Empty) continue;
+            ItemStack resolved = resolveSlot(slot, inventory);
+            if (resolved.isEmpty() || inventory.getOrDefault(resolved.getItem(), 0) <= 0) return false;
+        }
+        return true;
+    }
+
+    private static boolean allDirectlyAvailableFlat(RecipeTree.FlatData f, int recIdx, Map<Item, Integer> inventory) {
+        for (int ei = f.recEdgeStart()[recIdx]; ei < f.recEdgeEnd()[recIdx]; ei++) {
+            boolean anyAvail = false;
+            for (int oi = f.edgeOptStart()[ei]; oi < f.edgeOptEnd()[ei]; oi++) {
+                Item item = f.optItemObj()[oi];
+                if (inventory.getOrDefault(item, 0) > 0) {
+                    anyAvail = true;
+                    break;
+                }
+            }
+            if (!anyAvail) return false;
+        }
+        return true;
     }
 
     /** Returns true if every non-empty slot has at least one option in the reachable set. */

@@ -7,261 +7,306 @@ import java.util.*;
 
 public class CraftCalculator {
 
-    private record MemoEntry(long count, boolean containerOnly) {}
-
-    /**
-     * Computes per-recipe craftable counts for all recipes in the tree.
-     * Uses the memoized topological approach: builds a memo of per-item max counts,
-     * then derives per-recipe counts from it. Sub-item lookups are cached so each
-     * per-recipe call is O(ingredient edges).
-     */
     public static Map<RecipeDisplayId, Integer> calculatePerRecipeCounts(
             RecipeTree tree,
             Map<Item, Integer> inventory,
             Map<Item, Integer> containerInventory,
             int gridSize,
             int maxOutput) {
-        Map<Item, Integer> combined = combinedInventory(inventory, containerInventory);
-        Map<Item, MemoEntry> memo = new HashMap<>();
 
-        for (Item item : tree.getTopologicalOrder()) {
-            RecipeNode node = tree.getNode(item);
-            if (node != null) {
-                computeMemo(node, tree, inventory, combined, gridSize, memo);
+        RecipeTree.FlatData f = tree.flat();
+        if (f == null) return Map.of();
+
+        Ctx ctx = new Ctx(tree, f, inventory, containerInventory, gridSize);
+        return ctx.compute(maxOutput);
+    }
+
+    private static Map<Item, Integer> combinedInventory(
+            Map<Item, Integer> inventory, Map<Item, Integer> containerInventory) {
+        Map<Item, Integer> combined = new HashMap<>(inventory);
+        if (containerInventory != null)
+            containerInventory.forEach((k, v) -> combined.merge(k, v, Integer::sum));
+        return combined;
+    }
+
+    private static class Ctx {
+        final RecipeTree tree;
+        final RecipeTree.FlatData f;
+        final int gridSize;
+        final Map<Item, Integer> combMap;
+        final Map<Item, Integer> invMap;
+        final long[] comb;
+        final long[] inv;
+        final long[] memoCount;
+        final boolean[] memoSet;
+        final boolean[] memoContOnly;
+        final long[] dOpsCount;
+        final boolean[] dOpsSet;
+        int cycleVersion;
+        final int[] cycleVersions;
+
+        Ctx(RecipeTree tree, RecipeTree.FlatData f,
+            Map<Item, Integer> inventory, Map<Item, Integer> containerInventory,
+            int gridSize) {
+            this.tree = tree;
+            this.f = f;
+            this.gridSize = gridSize;
+            this.combMap = combinedInventory(inventory, containerInventory);
+            this.invMap = inventory;
+
+            int n = f.n();
+            IdentityHashMap<Item, Integer> idMap = f.idMap();
+            comb = new long[n];
+            for (var e : combMap.entrySet()) {
+                Integer id = idMap.get(e.getKey());
+                if (id != null) comb[id] = e.getValue();
             }
+            inv = new long[n];
+            for (var e : invMap.entrySet()) {
+                Integer id = idMap.get(e.getKey());
+                if (id != null) inv[id] = e.getValue();
+            }
+
+            memoCount = new long[n];
+            memoSet = new boolean[n];
+            memoContOnly = new boolean[n];
+            dOpsCount = new long[n];
+            dOpsSet = new boolean[n];
+            cycleVersions = new int[n];
         }
 
-        Map<RecipeDisplayId, Integer> results = new HashMap<>();
-        for (Item item : tree.getTopologicalOrder()) {
-            List<CraftedItem> recipes = tree.getAllRecipes(item);
-            if (recipes.isEmpty()) continue;
-            long alreadyHave = combined.getOrDefault(item, 0);
+        Map<RecipeDisplayId, Integer> compute(int maxOutput) {
+            int n = f.n();
+            for (int i = 0; i < n; i++) {
+                if (!memoSet[i]) computeMemo(i);
+            }
 
-            if (recipes.size() > 1) {
-                MemoEntry itemMemo = memo.get(item);
-                if (itemMemo != null) {
-                    long maxNewItems = Math.max(0, itemMemo.count - alreadyHave);
+            Map<RecipeDisplayId, Integer> results = new HashMap<>();
+            for (int i = 0; i < n; i++) {
+                int rs = f.itemRecStart()[i], re = f.itemRecEnd()[i];
+                if (rs == re) continue;
+                long alreadyHave = comb[i];
+                int recipeCount = re - rs;
+
+                if (recipeCount > 1) {
+                    long maxNewItems = Math.max(0, memoCount[i] - alreadyHave);
                     if (maxNewItems > 0) {
-                        long base = maxNewItems / recipes.size();
-                        int rem = (int) (maxNewItems % recipes.size());
-                        for (int i = 0; i < recipes.size(); i++) {
-                            long share = base + (i < rem ? 1 : 0);
-                            results.put(recipes.get(i).recipeId(),
+                        long base = maxNewItems / recipeCount;
+                        int rem = (int) (maxNewItems % recipeCount);
+                        for (int j = 0; j < recipeCount; j++) {
+                            long share = base + (j < rem ? 1 : 0);
+                            results.put(f.recDispId()[f.itemRecFlat()[rs + j]],
                                     (int) Math.min(share, maxOutput));
                         }
                         continue;
                     }
                 }
-            }
 
-            for (CraftedItem crafted : recipes) {
-                Set<Item> baseOnlyItems = computeCycleIngredients(crafted, tree);
-                long total = computeForRecipe(crafted, tree, inventory, combined, gridSize, memo, baseOnlyItems);
-                long newItems = total - alreadyHave;
-                if (newItems > 0) {
-                    results.put(crafted.recipeId(), (int) Math.min(newItems, maxOutput));
+                for (int k = rs; k < re; k++) {
+                    int ri = f.itemRecFlat()[k];
+                    setCycleFlags(ri);
+                    long total = computeForRecipe(ri, cycleVersion);
+                    long newItems = total - alreadyHave;
+                    if (newItems > 0) {
+                        results.put(f.recDispId()[ri], (int) Math.min(newItems, maxOutput));
+                    }
+                }
+                cycleVersion++;
+            }
+            return results;
+        }
+
+        private void setCycleFlags(int ri) {
+            Set<Item> targets = tree.getReverseDependencyTargets(f.idToItem()[f.recOutId()[ri]]);
+            if (targets.isEmpty()) return;
+            cycleVersion++;
+            for (int ei = f.recEdgeStart()[ri]; ei < f.recEdgeEnd()[ri]; ei++) {
+                for (int oi = f.edgeOptStart()[ei]; oi < f.edgeOptEnd()[ei]; oi++) {
+                    int oid = f.optItemId()[oi];
+                    if (oid >= 0 && targets.contains(f.idToItem()[oid])) {
+                        cycleVersions[oid] = cycleVersion;
+                    }
                 }
             }
         }
-        return results;
-    }
 
-    private static long computeMemo(RecipeNode node, RecipeTree tree, Map<Item, Integer> inventory,
-                                    Map<Item, Integer> combined, int gridSize,
-                                    Map<Item, MemoEntry> memo) {
-        MemoEntry cached = memo.get(node.item());
-        if (cached != null) return cached.count;
+        private void computeMemo(int id) {
+            if (memoSet[id]) return;
 
-        long baseValue = combined.getOrDefault(node.item(), 0);
-        memo.put(node.item(), new MemoEntry(baseValue, false));
+            long baseValue = comb[id];
+            memoSet[id] = true;
+            memoCount[id] = baseValue;
 
-        long result;
-        boolean containerOnly = false;
+            long result;
+            boolean containerOnly = false;
 
-        if (node instanceof BaseResource base) {
-            result = combined.getOrDefault(base.item(), 0);
-            containerOnly = inventory.getOrDefault(base.item(), 0) == 0 && result > 0;
+            if (f.isBaseNode()[id]) {
+                result = comb[id];
+                containerOnly = inv[id] == 0 && result > 0;
 
-            List<CraftedItem> alternatives = tree.getAllRecipes(base.item());
-            if (alternatives != null && !alternatives.isEmpty()) {
-                for (CraftedItem alt : alternatives) {
-                    long altResult = computeForRecipeBaseOnly(alt, combined, gridSize);
+                int rs = f.itemRecStart()[id], re = f.itemRecEnd()[id];
+                for (int k = rs; k < re; k++) {
+                    long altResult = computeForRecipeBaseOnly(f.itemRecFlat()[k]);
                     if (altResult > result) {
                         result = altResult;
                         containerOnly = false;
                     }
                 }
-            }
-        } else {
-            CraftedItem crafted = (CraftedItem) node;
-            result = computeForRecipe(crafted, tree, inventory, combined, gridSize, memo);
+            } else {
+                int pri = f.primaryRecIdx()[id];
+                result = computeForRecipe(pri, -1);
 
-            List<CraftedItem> alternatives = tree.getAllRecipes(crafted.item());
-            if (alternatives != null && alternatives.size() > 1) {
-                for (CraftedItem alt : alternatives) {
-                    if (alt == crafted) continue;
-                    long altResult = computeForRecipe(alt, tree, inventory, combined, gridSize, memo);
-                    result = Math.max(result, altResult);
+                int rs = f.itemRecStart()[id], re = f.itemRecEnd()[id];
+                if (re - rs > 1) {
+                    for (int k = rs; k < re; k++) {
+                        int altRi = f.itemRecFlat()[k];
+                        if (altRi == pri) continue;
+                        long altResult = computeForRecipe(altRi, -1);
+                        result = Math.max(result, altResult);
+                    }
+                }
+
+                containerOnly = result > 0
+                        && inv[id] == 0
+                        && isRecipeContainerOnly(pri);
+
+                if (containerOnly) {
+                    long directOps = calculateDirectOps(id);
+                    if (directOps > 0 || inv[id] > 0) {
+                        containerOnly = false;
+                    }
                 }
             }
 
-            containerOnly = result > 0
-                    && inventory.getOrDefault(node.item(), 0) == 0
-                    && isRecipeContainerOnly(crafted, memo);
-
-            if (containerOnly) {
-                long directOps = calculateDirectOps(crafted, inventory, gridSize, memo);
-                if (directOps > 0 || inventory.getOrDefault(crafted.item(), 0) > 0) {
-                    containerOnly = false;
-                }
-            }
+            memoCount[id] = result;
+            memoContOnly[id] = containerOnly;
         }
 
-        memo.put(node.item(), new MemoEntry(result, containerOnly));
-        return result;
-    }
+        private long computeForRecipe(int ri, int cycleVersionToUse) {
+            if (f.recGridSize()[ri] > gridSize) {
+                return comb[f.recOutId()[ri]];
+            }
 
-    private static long computeForRecipe(CraftedItem crafted, RecipeTree tree,
-                                          Map<Item, Integer> inventory, Map<Item, Integer> combined,
-                                          int gridSize, Map<Item, MemoEntry> memo) {
-        return computeForRecipe(crafted, tree, inventory, combined, gridSize, memo, null);
-    }
+            long maxOps = Long.MAX_VALUE;
+            int[] optItemId = f.optItemId();
+            Item[] optItemObj = f.optItemObj();
+            long[] memoCount = this.memoCount;
+            boolean[] memoSet = this.memoSet;
+            int[] primaryRecIdx = f.primaryRecIdx();
+            long[] comb = this.comb;
 
-    private static long computeForRecipe(CraftedItem crafted, RecipeTree tree,
-                                          Map<Item, Integer> inventory, Map<Item, Integer> combined,
-                                          int gridSize, Map<Item, MemoEntry> memo,
-                                          Set<Item> baseOnlyItems) {
-        if (crafted.gridSize() > gridSize) {
-            return combined.getOrDefault(crafted.item(), 0);
-        }
+            for (int ei = f.recEdgeStart()[ri]; ei < f.recEdgeEnd()[ri]; ei++) {
+                long avail = 0;
 
-        long maxOps = Long.MAX_VALUE;
+                for (int oi = f.edgeOptStart()[ei]; oi < f.edgeOptEnd()[ei]; oi++) {
+                    int oid = optItemId[oi];
+                    if (oid < 0) {
+                        avail += combMap.getOrDefault(optItemObj[oi], 0);
+                        continue;
+                    }
 
-        for (IngredientEdge edge : crafted.ingredients()) {
-            long availableForEdge = 0;
+                    if (cycleVersionToUse >= 0 && cycleVersions[oid] == cycleVersionToUse) {
+                        avail += comb[oid];
+                        continue;
+                    }
 
-            for (IngredientOption option : edge.options()) {
-                if (baseOnlyItems != null && baseOnlyItems.contains(option.item())) {
-                    availableForEdge += combined.getOrDefault(option.item(), 0);
-                    continue;
-                }
-                MemoEntry optMemo = memo.get(option.item());
-                long optAvail;
-                if (optMemo != null) {
-                    optAvail = optMemo.count;
-                } else {
-                    RecipeNode optNode = tree.getNode(option.item());
-                    if (optNode != null) {
-                        optAvail = computeMemo(optNode, tree, inventory, combined, gridSize, memo);
+                    if (memoSet[oid]) {
+                        avail += memoCount[oid];
+                    } else if (primaryRecIdx[oid] >= 0) {
+                        computeMemo(oid);
+                        avail += memoCount[oid];
                     } else {
-                        optAvail = combined.getOrDefault(option.item(), 0);
+                        avail += comb[oid];
                     }
                 }
-                availableForEdge += optAvail;
+
+                maxOps = Math.min(maxOps, avail / f.edgeCnt()[ei]);
             }
 
-            long opsFromEdge = availableForEdge / edge.count();
-            maxOps = Math.min(maxOps, opsFromEdge);
+            if (maxOps == Long.MAX_VALUE) maxOps = 0;
+            return maxOps * f.recOutCount()[ri] + comb[f.recOutId()[ri]];
         }
 
-        if (maxOps == Long.MAX_VALUE) maxOps = 0;
-
-        long alreadyHave = combined.getOrDefault(crafted.item(), 0);
-        return maxOps * crafted.outputCount() + alreadyHave;
-    }
-
-    private static long computeForRecipeBaseOnly(CraftedItem crafted,
-                                                  Map<Item, Integer> combined,
-                                                  int gridSize) {
-        if (crafted.gridSize() > gridSize) {
-            return combined.getOrDefault(crafted.item(), 0);
-        }
-
-        long maxOps = Long.MAX_VALUE;
-
-        for (IngredientEdge edge : crafted.ingredients()) {
-            long availableForEdge = 0;
-            for (IngredientOption option : edge.options()) {
-                availableForEdge += combined.getOrDefault(option.item(), 0);
+        private long computeForRecipeBaseOnly(int ri) {
+            if (f.recGridSize()[ri] > gridSize) {
+                return comb[f.recOutId()[ri]];
             }
-            long opsFromEdge = availableForEdge / edge.count();
-            maxOps = Math.min(maxOps, opsFromEdge);
-        }
 
-        if (maxOps == Long.MAX_VALUE) maxOps = 0;
+            long maxOps = Long.MAX_VALUE;
+            int[] optItemId = f.optItemId();
+            Item[] optItemObj = f.optItemObj();
+            long[] comb = this.comb;
 
-        long alreadyHave = combined.getOrDefault(crafted.item(), 0);
-        return maxOps * crafted.outputCount() + alreadyHave;
-    }
-
-    private static Set<Item> computeCycleIngredients(CraftedItem crafted, RecipeTree tree) {
-        Set<Item> cycles = new HashSet<>();
-        for (IngredientEdge edge : crafted.ingredients()) {
-            for (IngredientOption option : edge.options()) {
-                if (hasReverseConversion(option.item(), crafted.item(), tree)) {
-                    cycles.add(option.item());
-                }
-            }
-        }
-        return cycles;
-    }
-
-    private static boolean hasReverseConversion(Item ingredient, Item output, RecipeTree tree) {
-        List<CraftedItem> altRecipes = tree.getAllRecipes(ingredient);
-        for (CraftedItem alt : altRecipes) {
-            for (IngredientEdge edge : alt.ingredients()) {
-                for (IngredientOption option : edge.options()) {
-                    if (option.item() == output) return true;
-                }
-            }
-        }
-        return false;
-    }
-
-    private static boolean isRecipeContainerOnly(CraftedItem crafted, Map<Item, MemoEntry> memo) {
-        for (IngredientEdge edge : crafted.ingredients()) {
-            boolean edgeContainerOnly = true;
-            boolean edgeHasAvailability = false;
-            for (IngredientOption option : edge.options()) {
-                MemoEntry optMemo = memo.get(option.item());
-                if (optMemo != null && optMemo.count > 0) {
-                    edgeHasAvailability = true;
-                    if (!optMemo.containerOnly) {
-                        edgeContainerOnly = false;
-                        break;
-                    }
-                }
-            }
-            if (edgeContainerOnly && edgeHasAvailability) return true;
-        }
-        return false;
-    }
-
-    private static long calculateDirectOps(CraftedItem crafted, Map<Item, Integer> directInv,
-                                           int gridSize, Map<Item, MemoEntry> memo) {
-        long maxOps = Long.MAX_VALUE;
-        for (IngredientEdge edge : crafted.ingredients()) {
-            long available = 0;
-            for (IngredientOption option : edge.options()) {
-                if (option.node() instanceof BaseResource) {
-                    available += directInv.getOrDefault(option.item(), 0);
-                } else if (option.node() instanceof CraftedItem sub) {
-                    if (sub.gridSize() <= gridSize) {
-                        long subDirect = calculateDirectOps(sub, directInv, gridSize, memo);
-                        available += subDirect * sub.outputCount() + directInv.getOrDefault(option.item(), 0);
+            for (int ei = f.recEdgeStart()[ri]; ei < f.recEdgeEnd()[ri]; ei++) {
+                long avail = 0;
+                for (int oi = f.edgeOptStart()[ei]; oi < f.edgeOptEnd()[ei]; oi++) {
+                    int oid = optItemId[oi];
+                    if (oid >= 0) {
+                        avail += comb[oid];
                     } else {
-                        available += directInv.getOrDefault(option.item(), 0);
+                        avail += combMap.getOrDefault(optItemObj[oi], 0);
                     }
                 }
+                maxOps = Math.min(maxOps, avail / f.edgeCnt()[ei]);
             }
-            maxOps = Math.min(maxOps, available / edge.count());
+            if (maxOps == Long.MAX_VALUE) maxOps = 0;
+            return maxOps * f.recOutCount()[ri] + comb[f.recOutId()[ri]];
         }
-        return maxOps == Long.MAX_VALUE ? 0 : maxOps;
-    }
 
-    private static Map<Item, Integer> combinedInventory(Map<Item, Integer> inventory, Map<Item, Integer> containerInventory) {
-        Map<Item, Integer> combined = new HashMap<>(inventory);
-        if (containerInventory != null) containerInventory.forEach((k, v) -> combined.merge(k, v, Integer::sum));
-        return combined;
+        private boolean isRecipeContainerOnly(int ri) {
+            for (int ei = f.recEdgeStart()[ri]; ei < f.recEdgeEnd()[ri]; ei++) {
+                boolean edgeContOnly = true;
+                boolean edgeHasAvail = false;
+                for (int oi = f.edgeOptStart()[ei]; oi < f.edgeOptEnd()[ei]; oi++) {
+                    int oid = f.optItemId()[oi];
+                    if (oid >= 0 && memoSet[oid] && memoCount[oid] > 0) {
+                        edgeHasAvail = true;
+                        if (!memoContOnly[oid]) {
+                            edgeContOnly = false;
+                            break;
+                        }
+                    }
+                }
+                if (edgeContOnly && edgeHasAvail) return true;
+            }
+            return false;
+        }
+
+        private long calculateDirectOps(int id) {
+            if (dOpsSet[id]) return dOpsCount[id];
+            dOpsSet[id] = true;
+            dOpsCount[id] = 0;
+
+            int ri = f.primaryRecIdx()[id];
+            if (ri < 0) return inv[id];
+
+            long maxOps = Long.MAX_VALUE;
+            for (int ei = f.recEdgeStart()[ri]; ei < f.recEdgeEnd()[ri]; ei++) {
+                long available = 0;
+                for (int oi = f.edgeOptStart()[ei]; oi < f.edgeOptEnd()[ei]; oi++) {
+                    int oid = f.optItemId()[oi];
+                    if (oid < 0) {
+                        available += invMap.getOrDefault(f.optItemObj()[oi], 0);
+                        continue;
+                    }
+
+                    int priOid = f.primaryRecIdx()[oid];
+                    if (priOid < 0) {
+                        available += inv[oid];
+                    } else {
+                        if (f.recGridSize()[priOid] <= gridSize) {
+                            long subDirect = calculateDirectOps(oid);
+                            available += subDirect * f.recOutCount()[priOid] + inv[oid];
+                        } else {
+                            available += inv[oid];
+                        }
+                    }
+                }
+                maxOps = Math.min(maxOps, available / f.edgeCnt()[ei]);
+            }
+            long result = maxOps == Long.MAX_VALUE ? 0 : maxOps;
+            dOpsCount[id] = result;
+            return result;
+        }
     }
 }

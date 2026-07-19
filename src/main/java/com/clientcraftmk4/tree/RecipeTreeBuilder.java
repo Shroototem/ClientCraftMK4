@@ -7,6 +7,7 @@ import net.minecraft.tags.TagKey;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.crafting.display.RecipeDisplay;
 import net.minecraft.world.item.crafting.display.RecipeDisplayEntry;
+import net.minecraft.world.item.crafting.display.RecipeDisplayId;
 import net.minecraft.world.item.crafting.display.ShapedCraftingRecipeDisplay;
 import net.minecraft.world.item.crafting.display.ShapelessCraftingRecipeDisplay;
 import net.minecraft.world.item.crafting.display.SlotDisplay;
@@ -180,17 +181,159 @@ public class RecipeTreeBuilder {
         }
 
         Map<Item, Set<Item>> dependents = new HashMap<>();
+        Map<Item, Set<Item>> reverseDependencyTargets = new HashMap<>();
         for (Map.Entry<Item, List<CraftedItem>> e : allRecipesMap.entrySet()) {
+            Item outputItem = e.getKey();
             for (CraftedItem crafted : e.getValue()) {
                 for (IngredientEdge edge : crafted.ingredients()) {
                     for (IngredientOption option : edge.options()) {
                         dependents.computeIfAbsent(option.item(), k -> new HashSet<>()).add(crafted.item());
+                        reverseDependencyTargets.computeIfAbsent(option.item(), k -> new HashSet<>()).add(outputItem);
                     }
                 }
             }
         }
 
-        return new RecipeTree(resolved, allRecipesMap, dependents, topologicalOrder);
+        RecipeTree.FlatData flat = buildFlatData(topologicalOrder, resolved, allRecipesMap);
+        return new RecipeTree(resolved, allRecipesMap, dependents, topologicalOrder, reverseDependencyTargets, flat);
+    }
+
+    private static RecipeTree.FlatData buildFlatData(
+            List<Item> topo, Map<Item, RecipeNode> resolved, Map<Item, List<CraftedItem>> allRecipesMap) {
+
+        int n = topo.size();
+        IdentityHashMap<Item, Integer> idMap = new IdentityHashMap<>(n * 2);
+        Item[] idToItem = new Item[n];
+        for (int i = 0; i < n; i++) {
+            idToItem[i] = topo.get(i);
+            idMap.put(topo.get(i), i);
+        }
+
+        boolean[] isBaseNode = new boolean[n];
+        for (int i = 0; i < n; i++) {
+            isBaseNode[i] = (resolved.get(idToItem[i]) instanceof BaseResource);
+        }
+
+        int[] primaryRecIdx = new int[n];
+        java.util.Arrays.fill(primaryRecIdx, -1);
+
+        List<List<Integer>> tmpItemRecipes = new ArrayList<>(n);
+        for (int i = 0; i < n; i++) tmpItemRecipes.add(null);
+
+        List<CraftedItem> orderedCrafted = new ArrayList<>();
+        List<int[]> recData = new ArrayList<>();
+
+        int recipeIdx = 0;
+        for (int i = 0; i < n; i++) {
+            List<CraftedItem> recipes = allRecipesMap.getOrDefault(idToItem[i], List.of());
+            if (recipes.isEmpty()) continue;
+
+            List<Integer> rIndices = new ArrayList<>(recipes.size());
+            for (CraftedItem c : recipes) {
+                if (rIndices.isEmpty()) primaryRecIdx[i] = recipeIdx;
+                rIndices.add(recipeIdx);
+
+                int outId = idMap.getOrDefault(c.item(), -1);
+                recData.add(new int[]{outId, c.outputCount(), c.gridSize()});
+                orderedCrafted.add(c);
+                recipeIdx++;
+            }
+            tmpItemRecipes.set(i, rIndices);
+        }
+
+        int totalRecipes = recipeIdx;
+
+        int totalEdges = 0;
+        int totalOpts = 0;
+        for (CraftedItem c : orderedCrafted) {
+            for (IngredientEdge edge : c.ingredients()) {
+                totalEdges++;
+                totalOpts += edge.options().size();
+            }
+        }
+
+        int[] recOutId = new int[totalRecipes];
+        int[] recOutCount = new int[totalRecipes];
+        int[] recGridSize = new int[totalRecipes];
+        RecipeDisplayId[] recDispId = new RecipeDisplayId[totalRecipes];
+        int[] recEdgeStart = new int[totalRecipes];
+        int[] recEdgeEnd = new int[totalRecipes];
+
+        int[] edgeCnt = new int[totalEdges];
+        int[] edgeOptStart = new int[totalEdges];
+        int[] edgeOptEnd = new int[totalEdges];
+
+        int[] optItemId = new int[totalOpts];
+        Item[] optItemObj = new Item[totalOpts];
+
+        int ei = 0, oi = 0;
+        for (int ri = 0; ri < totalRecipes; ri++) {
+            CraftedItem c = orderedCrafted.get(ri);
+            int[] rd = recData.get(ri);
+            recOutId[ri] = rd[0];
+            recOutCount[ri] = rd[1];
+            recGridSize[ri] = rd[2];
+            recDispId[ri] = c.recipeId();
+            recEdgeStart[ri] = ei;
+            for (IngredientEdge edge : c.ingredients()) {
+                edgeCnt[ei] = edge.count();
+                edgeOptStart[ei] = oi;
+                for (IngredientOption opt : edge.options()) {
+                    optItemId[oi] = idMap.getOrDefault(opt.item(), -1);
+                    optItemObj[oi] = opt.item();
+                    oi++;
+                }
+                edgeOptEnd[ei] = oi;
+                ei++;
+            }
+            recEdgeEnd[ri] = ei;
+        }
+
+        int totalItemRecs = 0;
+        int[] itemRecStart = new int[n];
+        int[] itemRecEnd = new int[n];
+        for (int i = 0; i < n; i++) {
+            List<Integer> r = tmpItemRecipes.get(i);
+            if (r == null || r.isEmpty()) continue;
+            itemRecStart[i] = totalItemRecs;
+            totalItemRecs += r.size();
+            itemRecEnd[i] = totalItemRecs;
+        }
+        int[] itemRecFlat = new int[totalItemRecs];
+        int pos = 0;
+        for (int i = 0; i < n; i++) {
+            List<Integer> r = tmpItemRecipes.get(i);
+            if (r == null || r.isEmpty()) continue;
+            for (int idx : r) itemRecFlat[pos++] = idx;
+        }
+
+        Map<RecipeDisplayId, Integer> dispIdToRecIdx = new HashMap<>(totalRecipes * 2);
+        boolean[] recSelfConsuming = new boolean[totalRecipes];
+        for (int ri = 0; ri < totalRecipes; ri++) {
+            dispIdToRecIdx.put(recDispId[ri], ri);
+            int outId = recOutId[ri];
+            if (outId >= 0) {
+                for (int ei2 = recEdgeStart[ri]; ei2 < recEdgeEnd[ri]; ei2++) {
+                    for (int oi2 = edgeOptStart[ei2]; oi2 < edgeOptEnd[ei2]; oi2++) {
+                        if (optItemId[oi2] == outId) {
+                            recSelfConsuming[ri] = true;
+                            break;
+                        }
+                    }
+                    if (recSelfConsuming[ri]) break;
+                }
+            }
+        }
+
+        return new RecipeTree.FlatData(
+                n, idToItem, idMap, isBaseNode, primaryRecIdx,
+                itemRecStart, itemRecEnd, itemRecFlat,
+                totalRecipes, recOutId, recOutCount, recGridSize, recDispId,
+                dispIdToRecIdx, recSelfConsuming,
+                recEdgeStart, recEdgeEnd,
+                totalEdges, edgeCnt, edgeOptStart, edgeOptEnd,
+                totalOpts, optItemId, optItemObj
+        );
     }
 
     private static CraftedItem buildBestNode(
