@@ -5,7 +5,6 @@
   "name": "ClientCraftMK4",
   "description": "A recipe-book-style UI that shows all craftable items recursively and auto-crafts them with one click.",
   "authors": ["Shroototem"],
-
   "contact": {},
   "license": "MIT",
   "icon": "assets/clientcraftmk4/icon.png",
