@@ -8,6 +8,7 @@ import com.clientcraftmk4.tree.IngredientOption;
 import com.clientcraftmk4.tree.RecipeTree;
 import com.clientcraftmk4.tree.RecipeTreeBuilder;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.gui.screens.inventory.CraftingScreen;
 import net.minecraft.client.gui.screens.recipebook.RecipeCollection;
 import net.minecraft.client.gui.screens.recipebook.RecipeBookPage;
@@ -129,20 +130,41 @@ public class RecipeResolver {
     // --- Active recipe book page (for scroll-wheel page cycling) ---
 
     private static volatile WeakReference<RecipeBookPage> activeRecipeBookPage = new WeakReference<>(null);
+    // The screen that owns the active recipe book page. Custom scroll handling is
+    // only active while this exact screen is still open, so closing the crafting
+    // screen (or opening a different GUI) lets vanilla hotbar scrolling through.
+    private static volatile WeakReference<Screen> activeRecipeBookScreen = new WeakReference<>(null);
     private static volatile int recipeBookLeft, recipeBookTop;
     private static volatile int recipeBookWidth = 147, recipeBookHeight = 166;
 
+    /** Version-safe accessor for the currently open screen. */
+    private static Screen currentScreen() {
+        //? if >=26.2 {
+        return Minecraft.getInstance().gui.screen();
+        //?}
+        //? if <26.2 {
+        /*return Minecraft.getInstance().screen;*/
+        //?}
+    }
+
     public static void setActiveRecipeBookPage(RecipeBookPage page, int left, int top) {
         activeRecipeBookPage = new WeakReference<>(page);
+        activeRecipeBookScreen = new WeakReference<>(currentScreen());
         recipeBookLeft = left;
         recipeBookTop = top;
     }
 
     public static void clearActiveRecipeBookPage() {
         activeRecipeBookPage = new WeakReference<>(null);
+        activeRecipeBookScreen = new WeakReference<>(null);
     }
 
     public static RecipeBookPage getActiveRecipeBookPage() {
+        // Block stale custom scroll handling when the owning screen is no longer
+        // open (e.g. crafting screen closed) or a different GUI has taken over.
+        Screen current = currentScreen();
+        Screen owner = activeRecipeBookScreen.get();
+        if (current == null || current != owner) return null;
         return activeRecipeBookPage.get();
     }
 
@@ -525,7 +547,9 @@ public class RecipeResolver {
                             if (flat.recSelfConsuming()[recIdx]) continue;
 
                             int count = treeCounts.getOrDefault(entry.id(), 0);
-                            if (count == 0 && !checkContainers) {
+                            boolean cycleSuspect = hasCycleFlagsFlat(flat, recIdx, tree);
+
+                            if (count == 0 && !checkContainers && !cycleSuspect) {
                                 allEntries.add(entry);
                                 totalRecipes++;
                                 treeSkipped++;
@@ -540,27 +564,60 @@ public class RecipeResolver {
                             entryOutputItems.put(entry.id(), out);
 
                             if (count > 0) {
-                                if (allDirectlyAvailableFlat(flat, recIdx, invSnapshot)) {
+                                // The tree DP can both over-count (when an edge's
+                                // options share base resources via sub-crafting,
+                                // e.g. 4 oak logs -> 28 planks instead of 16) and
+                                // under-count (cycle-avoidance flags force physical-only
+                                // availability). resolve() is the exact oracle, so when
+                                // the DP is not provably exact we compute the true count
+                                // by replaying resolve() until it can no longer craft.
+                                // Perf gate: when the DP isn't cycle-flagged AND every
+                                // edge's physical inventory alone satisfies the DP count,
+                                // the DP value is exactly achievable (memo == physical
+                                // on the binding edge), so skip the simulation.
+                                boolean directOk = allDirectlyAvailableFlat(flat, recIdx, invSnapshot);
+                                boolean dpExact = !cycleSuspect
+                                        && directOk
+                                        && directCountFlat(flat, recIdx, invSnapshot) >= count;
+                                if (dpExact) {
                                     resolvedCounts.put(entry.id(), count);
                                     treeCounted++;
                                 } else {
-                                    // Tree-based DP can over-count when multiple
-                                    // edges share the same base resources through
-                                    // sub-crafting. resolve() simulates actual
-                                    // consumption and correctly rejects impossible crafts.
-                                    tempInv.clear(); tempInv.putAll(invSnapshot);
-                                    sharedInProgress.clear();
-                                    if (resolve(entry, tempInv, null, sharedInProgress, 0, null)) {
-                                        resolvedCounts.put(entry.id(), count);
+                                    int maxCrafts = Math.min((count + outputCount - 1) / outputCount, MAX_REPEATS);
+                                    int exact = simulateCraftCount(entry, invSnapshot, maxCrafts) * outputCount;
+                                    if (exact > 0) {
+                                        resolvedCounts.put(entry.id(), Math.min(exact, MAX_REPEATS));
                                         treeCounted++;
+                                    } else if (checkContainers && tryResolveOnce(entry, combined)) {
+                                        // Inventory alone can't craft this, but combined with
+                                        // container items it can (container-craftable: purple marker).
+                                        containerSet.add(entry.id());
+                                        containerChecked++;
+                                        containerItemSet.add(out);
                                     }
                                 }
-                            } else if (checkContainers) {
-                                int contCount = treeCombinedCounts.getOrDefault(entry.id(), 0);
-                                if (contCount > 0) {
-                                    containerSet.add(entry.id());
-                                    containerChecked++;
-                                    containerItemSet.add(out);
+                            } else if (count == 0) {
+                                // DP under-counted (cycle-avoidance hid a sub-craft path,
+                                // e.g. 9 gold nuggets + 8 ingots can craft a gold block).
+                                // Only worth verifying when every edge is reachable AND
+                                // the recipe's output participates in a craft cycle.
+                                if (cycleSuspect && allEdgesReachableFlat(flat, recIdx, reachableItems)) {
+                                    if (tryResolveOnce(entry, invSnapshot)) {
+                                        int exact = simulateCraftCount(entry, invSnapshot, MAX_REPEATS) * outputCount;
+                                        resolvedCounts.put(entry.id(), Math.min(exact, MAX_REPEATS));
+                                        treeCounted++;
+                                    } else if (checkContainers && tryResolveOnce(entry, combined)) {
+                                        containerSet.add(entry.id());
+                                        containerChecked++;
+                                        containerItemSet.add(out);
+                                    }
+                                } else if (checkContainers) {
+                                    int contCount = treeCombinedCounts.getOrDefault(entry.id(), 0);
+                                    if (contCount > 0 && tryResolveOnce(entry, combined)) {
+                                        containerSet.add(entry.id());
+                                        containerChecked++;
+                                        containerItemSet.add(out);
+                                    }
                                 }
                             }
                         } else {
@@ -1119,6 +1176,82 @@ public class RecipeResolver {
             if (!anyAvail) return false;
         }
         return true;
+    }
+
+    /**
+     * Returns true if this recipe's per-recipe cycle-avoidance flags are active,
+     * i.e. the recipe output has reverse-dependency targets and at least one of
+     * those targets appears as an ingredient option. When active the tree DP uses
+     * physical-inventory-only availability for those options, which can under-count
+     * (e.g. gold block craftable from nuggets-via-ingot is hidden behind the
+     * ingot cycle flag).
+     */
+    private static boolean hasCycleFlagsFlat(RecipeTree.FlatData f, int recIdx, RecipeTree tree) {
+        Set<Item> targets = tree.getReverseDependencyTargets(f.idToItem()[f.recOutId()[recIdx]]);
+        if (targets.isEmpty()) return false;
+        for (int ei = f.recEdgeStart()[recIdx]; ei < f.recEdgeEnd()[recIdx]; ei++) {
+            for (int oi = f.edgeOptStart()[ei]; oi < f.edgeOptEnd()[ei]; oi++) {
+                if (targets.contains(f.optItemObj()[oi])) return true;
+            }
+        }
+        return false;
+    }
+
+    /** Returns true if every edge of this recipe has at least one option in the reachable set. */
+    private static boolean allEdgesReachableFlat(RecipeTree.FlatData f, int recIdx, Set<Item> reachable) {
+        for (int ei = f.recEdgeStart()[recIdx]; ei < f.recEdgeEnd()[recIdx]; ei++) {
+            boolean any = false;
+            for (int oi = f.edgeOptStart()[ei]; oi < f.edgeOptEnd()[ei]; oi++) {
+                if (reachable.contains(f.optItemObj()[oi])) { any = true; break; }
+            }
+            if (!any) return false;
+        }
+        return true;
+    }
+
+    /**
+     * Exact direct (no sub-crafting) craftable item count using physical inventory only.
+     * min over edges of (sum of inventory counts of options) / edge count, times output count.
+     */
+    private static int directCountFlat(RecipeTree.FlatData f, int recIdx, Map<Item, Integer> inventory) {
+        long maxOps = Long.MAX_VALUE;
+        for (int ei = f.recEdgeStart()[recIdx]; ei < f.recEdgeEnd()[recIdx]; ei++) {
+            long avail = 0;
+            for (int oi = f.edgeOptStart()[ei]; oi < f.edgeOptEnd()[ei]; oi++) {
+                avail += inventory.getOrDefault(f.optItemObj()[oi], 0);
+            }
+            maxOps = Math.min(maxOps, avail / f.edgeCnt()[ei]);
+        }
+        if (maxOps == Long.MAX_VALUE || maxOps <= 0) return 0;
+        long items = maxOps * f.recOutCount()[recIdx];
+        return items > MAX_REPEATS ? MAX_REPEATS : (int) items;
+    }
+
+    /** Single resolve() attempt against a fresh copy of the given inventory; returns success. */
+    private static boolean tryResolveOnce(RecipeDisplayEntry entry, Map<Item, Integer> inventory) {
+        if (inventory == null || inventory.isEmpty()) return false;
+        Map<Item, Integer> sim = new HashMap<>(inventory);
+        Set<Item> inProgress = new HashSet<>();
+        return resolve(entry, sim, null, inProgress, 0, null);
+    }
+
+    /**
+     * Replays resolve() against a fresh copy of the inventory until it fails, up to
+     * maxCrafts times. resolve() simulates actual consumption (including sub-crafting
+     * and leftover re-use), so the returned number is the exact achievable craft count
+     * and matches what AutoCrafter would actually perform.
+     */
+    private static int simulateCraftCount(RecipeDisplayEntry entry, Map<Item, Integer> inventory, int maxCrafts) {
+        if (maxCrafts <= 0 || inventory == null || inventory.isEmpty()) return 0;
+        Map<Item, Integer> sim = new HashMap<>(inventory);
+        Set<Item> inProgress = new HashSet<>();
+        int crafts = 0;
+        while (crafts < maxCrafts) {
+            inProgress.clear();
+            if (!resolve(entry, sim, null, inProgress, 0, null)) break;
+            crafts++;
+        }
+        return crafts;
     }
 
     /** Returns true if every non-empty slot has at least one option in the reachable set. */
