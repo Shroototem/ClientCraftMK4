@@ -564,27 +564,34 @@ public class RecipeResolver {
                             entryOutputItems.put(entry.id(), out);
 
                             if (count > 0) {
-                                // The tree DP can both over-count (when an edge's
-                                // options share base resources via sub-crafting,
-                                // e.g. 4 oak logs -> 28 planks instead of 16) and
-                                // under-count (cycle-avoidance flags force physical-only
-                                // availability). resolve() is the exact oracle, so when
-                                // the DP is not provably exact we compute the true count
-                                // by replaying resolve() until it can no longer craft.
-                                // Perf gate: when the DP isn't cycle-flagged AND every
-                                // edge's physical inventory alone satisfies the DP count,
-                                // the DP value is exactly achievable (memo == physical
-                                // on the binding edge), so skip the simulation.
+                                // The tree DP can both over- (issue #5: an edge's options share
+                                // a base resource via sub-crafting — oak_log + oak_wood-from-
+                                // oak_log => 28 planks; and cross-edge sharing — chest_boat's
+                                // chest & oak_boat both draw from planks => 56 not 19) and under-
+                                // count (issue #6: cycle-avoidance hides nuggets->ingot behind
+                                // the ingot cycle flag => gold block shows 0). There is no closed
+                                // form that covers all three; resolve() simulates actual
+                                // consumption (sub-crafting, leftovers, cycle-safe recipe
+                                // selection) and is exact. The loop stops as soon as a craft
+                                // fails, so it runs the *true* craft count — not the (possibly
+                                // inflated) DP count — and is capped at MAX_REPEATS (999) which
+                                // also bounds the displayed value.
+                                //
+                                // Perf gate: when the DP is provably exact — not cycle-flagged,
+                                // no intra-edge option sharing, and the physical inventory alone
+                                // already satisfies the DP count (memo == physical on the binding
+                                // edge) — we skip simulation entirely and trust the DP value.
+                                boolean sharingSuspect = hasSharingSuspectEdgeFlat(flat, recIdx);
                                 boolean directOk = allDirectlyAvailableFlat(flat, recIdx, invSnapshot);
                                 boolean dpExact = !cycleSuspect
+                                        && !sharingSuspect
                                         && directOk
                                         && directCountFlat(flat, recIdx, invSnapshot) >= count;
                                 if (dpExact) {
                                     resolvedCounts.put(entry.id(), count);
                                     treeCounted++;
                                 } else {
-                                    int maxCrafts = Math.min((count + outputCount - 1) / outputCount, MAX_REPEATS);
-                                    int exact = simulateCraftCount(entry, invSnapshot, maxCrafts) * outputCount;
+                                    int exact = simulateCraftCount(entry, invSnapshot, MAX_REPEATS) * outputCount;
                                     if (exact > 0) {
                                         resolvedCounts.put(entry.id(), Math.min(exact, MAX_REPEATS));
                                         treeCounted++;
@@ -602,8 +609,8 @@ public class RecipeResolver {
                                 // Only worth verifying when every edge is reachable AND
                                 // the recipe's output participates in a craft cycle.
                                 if (cycleSuspect && allEdgesReachableFlat(flat, recIdx, reachableItems)) {
-                                    if (tryResolveOnce(entry, invSnapshot)) {
-                                        int exact = simulateCraftCount(entry, invSnapshot, MAX_REPEATS) * outputCount;
+                                    int exact = simulateCraftCount(entry, invSnapshot, MAX_REPEATS) * outputCount;
+                                    if (exact > 0) {
                                         resolvedCounts.put(entry.id(), Math.min(exact, MAX_REPEATS));
                                         treeCounted++;
                                     } else if (checkContainers && tryResolveOnce(entry, combined)) {
@@ -1227,6 +1234,46 @@ public class RecipeResolver {
         return items > MAX_REPEATS ? MAX_REPEATS : (int) items;
     }
 
+    /**
+     * Detects the intra-edge option-sharing over-count pattern (issue #5): an edge
+     * with at least one non-base option whose primary recipe's ingredients include
+     * another option of the same edge. In that case the DP sums memoirs of options
+     * that draw from the same base resource (e.g. oak_log + oak_wood-crafted-from-
+     * oak_log => "7 logs" => 28 planks), inflating the count. For such edges the
+     * physical-only count is the true count; for non-suspect edges the DP count is exact.
+     * Returns true if any edge of this recipe is sharing-suspect.
+     */
+    private static boolean hasSharingSuspectEdgeFlat(RecipeTree.FlatData f, int recIdx) {
+        Item[] optItemObj = f.optItemObj();
+        for (int ei = f.recEdgeStart()[recIdx]; ei < f.recEdgeEnd()[recIdx]; ei++) {
+            int optStart = f.edgeOptStart()[ei], optEnd = f.edgeOptEnd()[ei];
+            int optCount = optEnd - optStart;
+            if (optCount < 2) continue;
+            int[] optItemId = f.optItemId();
+            int[] primaryRecIdx = f.primaryRecIdx();
+            int[] recEdgeStart = f.recEdgeStart(), recEdgeEnd = f.recEdgeEnd();
+            int[] edgeOptStart = f.edgeOptStart(), edgeOptEnd = f.edgeOptEnd();
+            for (int oi = optStart; oi < optEnd; oi++) {
+                int optId = optItemId[oi];
+                if (optId < 0) continue;
+                int pri = primaryRecIdx[optId];
+                if (pri < 0) continue;
+                // Does this option's primary recipe use another option of the same edge?
+                for (int pei = recEdgeStart[pri]; pei < recEdgeEnd[pri]; pei++) {
+                    for (int poi = edgeOptStart[pei]; poi < edgeOptEnd[pei]; poi++) {
+                        Item ingredient = optItemObj[poi];
+                        if (ingredient.equals(optItemObj[oi])) continue;
+                        // Is ingredient among this edge's other options?
+                        for (int oi2 = optStart; oi2 < optEnd; oi2++) {
+                            if (oi2 != oi && optItemObj[oi2].equals(ingredient)) return true;
+                        }
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
     /** Single resolve() attempt against a fresh copy of the given inventory; returns success. */
     private static boolean tryResolveOnce(RecipeDisplayEntry entry, Map<Item, Integer> inventory) {
         if (inventory == null || inventory.isEmpty()) return false;
@@ -1236,22 +1283,161 @@ public class RecipeResolver {
     }
 
     /**
-     * Replays resolve() against a fresh copy of the inventory until it fails, up to
-     * maxCrafts times. resolve() simulates actual consumption (including sub-crafting
-     * and leftover re-use), so the returned number is the exact achievable craft count
-     * and matches what AutoCrafter would actually perform.
+     * Exact craft count via binary search over a batched feasibility check
+     * ({@link #tryResolveQty}). O(log(maxCrafts) * recipe-tree) — independent of the
+     * count magnitude — instead of O(count). tryResolveQty satisfies k crafts in a
+     * single pass: each slot's per-craft need is multiplied by k, deficits are
+     * sub-crafted in bulk (ceil(deficit/subOutput) crafts producing >= deficit),
+     * and sub-craft leftovers stay available for later edges (matching single-craft
+     * resolve() cross-edge reuse). Cycle guards ({@link #recipeConsumesItem}) and
+     * tag fallback apply, so it sees the same sharing/cycle behaviour resolve() does.
      */
     private static int simulateCraftCount(RecipeDisplayEntry entry, Map<Item, Integer> inventory, int maxCrafts) {
         if (maxCrafts <= 0 || inventory == null || inventory.isEmpty()) return 0;
-        Map<Item, Integer> sim = new HashMap<>(inventory);
-        Set<Item> inProgress = new HashSet<>();
-        int crafts = 0;
-        while (crafts < maxCrafts) {
-            inProgress.clear();
-            if (!resolve(entry, sim, null, inProgress, 0, null)) break;
-            crafts++;
+        // Feasibility is monotonic (if k crafts work, fewer work). Find the largest
+        // k in [0, maxCrafts] that tryResolveQty accepts.
+        int lo = 0, hi = maxCrafts;
+        while (lo < hi) {
+            int mid = lo + (hi - lo + 1) / 2;
+            if (tryResolveQty(entry, inventory, mid)) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
         }
-        return crafts;
+        return lo;
+    }
+
+    /** True if k crafts of entry can be made from a copy of inventory in one batch. */
+    private static boolean tryResolveQty(RecipeDisplayEntry entry, Map<Item, Integer> inventory, int k) {
+        if (k <= 0) return true;
+        Map<Item, Integer> work = new HashMap<>(inventory);
+        Set<Item> inProgress = new HashSet<>();
+        return resolveQty(entry, work, k, null, inProgress, 0, null);
+    }
+
+    /**
+     * Batched resolve(): tries to make qty crafts of entry, deducting qty per slot
+     * and bulk sub-crafting deficits. Full-map snapshot rollback on failure — simple
+     * and provably correct (mirrors resolve()'s snapshot-branch semantics, applied
+     * uniformly since every slot here is a bulk deduction). inProgress/output cycle
+     * guards and tag fallback match resolve().
+     */
+    private static boolean resolveQty(
+            RecipeDisplayEntry entry, Map<Item, Integer> work, int qty,
+            List<RecipeDisplayId> stepsOut, Set<Item> inProgress, int depth, Item rootOutput) {
+        if (depth > MAX_DEPTH || qty <= 0) return false;
+
+        List<SlotDisplay> slots = getSlots(entry.display());
+        if (slots == null || slots.isEmpty()) return false;
+
+        Item outputItem = getOutputItem(entry.display());
+        if (outputItem != null && !inProgress.add(outputItem)) return false;
+        if (rootOutput == null) rootOutput = outputItem;
+
+        Map<Item, Integer> snapshot = new HashMap<>(work);
+        int stepsStart = stepsOut != null ? stepsOut.size() : 0;
+
+        for (SlotDisplay slot : slots) {
+            if (slot instanceof SlotDisplay.Empty) continue;
+
+            ItemStack resolved = resolveSlot(slot, work);
+            if (resolved.isEmpty()) { work.clear(); work.putAll(snapshot); rollbackSteps(stepsOut, stepsStart); inProgress.remove(outputItem); return false; }
+            Item item = resolved.getItem();
+            int need = qty;
+
+            int have = work.getOrDefault(item, 0);
+            int take = Math.min(have, need);
+            if (take > 0) work.put(item, have - take);
+            int deficit = need - take;
+
+            if (deficit > 0) {
+                if (!trySubCraftQty(item, deficit, work, stepsOut, inProgress, depth, rootOutput)
+                        && !(depth <= 1 && tryTagFallbackQty(slot, item, deficit, work, stepsOut, inProgress, depth, rootOutput))) {
+                    work.clear(); work.putAll(snapshot); rollbackSteps(stepsOut, stepsStart); inProgress.remove(outputItem); return false;
+                }
+            }
+        }
+
+        if (stepsOut != null) stepsOut.add(entry.id());
+        inProgress.remove(outputItem);
+        return true;
+    }
+
+    /** Produce `deficit` units of item via sub-crafting (uses ceil(deficit/subOutput) crafts, keeps leftovers). */
+    private static boolean trySubCraftQty(
+            Item item, int deficit, Map<Item, Integer> work,
+            List<RecipeDisplayId> stepsOut, Set<Item> inProgress, int depth, Item rootOutput) {
+        List<RecipeDisplayEntry> subs = recipesByOutput.get(item);
+        if (subs == null) return false;
+        for (int i = 0, len = subs.size(); i < len; i++) {
+            RecipeDisplayEntry sub = subs.get(i);
+            if (!fitsInGrid(sub.display(), currentGridSize)) continue;
+            int subOutput = getOutputCount(sub.display());
+            if (subOutput <= 0) continue;
+            if (rootOutput != null && recipeConsumesItem(sub, rootOutput)) continue;
+
+            int crafts = (deficit + subOutput - 1) / subOutput;
+            Map<Item, Integer> beforeSub = new HashMap<>(work);
+            if (resolveQty(sub, work, crafts, stepsOut, inProgress, depth + 1, rootOutput)) {
+                int produced = crafts * subOutput;
+                work.merge(item, produced - deficit, Integer::sum); // keep leftovers
+                return true;
+            }
+            // sub failed; restore sub-tree mutations and try next alternative
+            work.clear(); work.putAll(beforeSub);
+        }
+        return false;
+    }
+
+    private static boolean tryTagFallbackQty(
+            SlotDisplay slot, Item alreadyTried, int deficit, Map<Item, Integer> work,
+            List<RecipeDisplayId> stepsOut, Set<Item> inProgress, int depth, Item rootOutput) {
+        if (slot instanceof SlotDisplay.WithRemainder d)
+            return tryTagFallbackQty(d.input(), alreadyTried, deficit, work, stepsOut, inProgress, depth, rootOutput);
+
+        if (slot instanceof SlotDisplay.TagSlotDisplay d) {
+            TagKey<Item> tag = d.tag();
+            int need = deficit;
+            for (Map.Entry<Item, Integer> e : new ArrayList<>(work.entrySet())) {
+                if (need <= 0) break;
+                if (e.getValue() >= 1 && !e.getKey().equals(alreadyTried)
+                        && e.getKey().builtInRegistryHolder().is(tag)) {
+                    int take = Math.min(need, e.getValue());
+                    work.merge(e.getKey(), -take, Integer::sum);
+                    need -= take;
+                }
+            }
+            if (need <= 0) return true;
+            List<Item> craftable = craftableTagIndex.get(tag);
+            if (craftable != null) {
+                for (Item alt : craftable) {
+                    if (alt.equals(alreadyTried)) continue;
+                    if (trySubCraftQty(alt, need, work, stepsOut, inProgress, depth, rootOutput)) return true;
+                }
+            }
+            return false;
+        }
+
+        if (slot instanceof SlotDisplay.Composite d) {
+            int need = deficit;
+            for (SlotDisplay sub : d.contents()) {
+                if (need <= 0) break;
+                ItemStack r = resolveSlot(sub, work);
+                if (r.isEmpty() || r.getItem().equals(alreadyTried)) continue;
+                Item it = r.getItem();
+                int have = work.getOrDefault(it, 0);
+                int take = Math.min(need, have);
+                if (take > 0) { work.merge(it, -take, Integer::sum); need -= take; }
+                if (need > 0 && trySubCraftQty(it, need, work, stepsOut, inProgress, depth, rootOutput)) need = 0;
+            }
+            return need <= 0;
+        }
+        return false;
+    }
+
+    private static void rollbackSteps(List<RecipeDisplayId> stepsOut, int stepsStart) {
+        if (stepsOut != null) while (stepsOut.size() > stepsStart) stepsOut.removeLast();
     }
 
     /** Returns true if every non-empty slot has at least one option in the reachable set. */
