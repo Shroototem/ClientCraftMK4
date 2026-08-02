@@ -3,17 +3,17 @@
     "package": "com.clientcraftmk4.mixin",
     "compatibilityLevel": "JAVA_25",
     "client": [
-        "AlternativeButtonWidgetMixin",
-        "AnimatedResultButtonMixin",
+        "CraftingRecipeBookComponentMixin",
+        "RecipeBookComponentMixin",
         "ClientRecipeBookMixin",
-        "ClientRecipeBookMouseHandlerMixin",
-        "CraftingRecipeBookWidgetMixin",
-        "RecipeBookPageAccessor",
-        "RecipeBookResultsMixin",
-        "RecipeBookWidgetAccessor",
-        "RecipeBookWidgetMixin",
-        "RecipeResultCollectionAccessor",
-        "RecipeResultCollectionMixin"
+        "RecipeButtonMixin",
+        "RecipeBookPageMixin",
+        "OverlayRecipeComponentMixin",
+        "MouseHandlerMixin",
+        "RecipeCollectionMixin",
+        "accessor.RecipeBookPageAccessor",
+        "accessor.RecipeBookComponentAccessor",
+        "accessor.RecipeCollectionAccessor"
     ],
     "injectors": {
         "defaultRequire": 1

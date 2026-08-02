@@ -3,7 +3,7 @@
   "id": "clientcraftmk4",
   "version": "${version}",
   "name": "ClientCraftMK4",
-  "description": "A recipe-book-style UI that shows all craftable items recursively and auto-crafts them with one click.",
+  "description": "A recipe-book-style UI that shows all craftable items recursively and auto-crafts them with one click. Faster and cleaner remake of ClientCraftMK4.",
   "authors": ["Shroototem"],
   "contact": {},
   "license": "MIT",
@@ -14,7 +14,7 @@
       "com.clientcraftmk4.ClientCraftMod"
     ],
     "modmenu": [
-      "com.clientcraftmk4.ClientCraftModMenuIntegration"
+      "com.clientcraftmk4.config.ClientCraftModMenuIntegration"
     ]
   },
   "mixins": [
