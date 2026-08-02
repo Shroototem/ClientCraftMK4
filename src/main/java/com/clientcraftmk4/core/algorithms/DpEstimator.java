@@ -94,22 +94,15 @@ public final class DpEstimator {
                 int rs = f.itemRecStart()[i], re = f.itemRecEnd()[i];
                 if (rs == re) continue;
                 long alreadyHave = comb[i];
-                int recipeCount = re - rs;
 
-                if (recipeCount > 1) {
-                    long maxNewItems = Math.max(0, memoCount[i] - alreadyHave);
-                    if (maxNewItems > 0) {
-                        long base = maxNewItems / recipeCount;
-                        int rem = (int) (maxNewItems % recipeCount);
-                        for (int j = 0; j < recipeCount; j++) {
-                            long share = base + (j < rem ? 1 : 0);
-                            results.put(f.recDispId()[f.itemRecFlat()[rs + j]],
-                                    (int) Math.min(share, maxOutput));
-                        }
-                        continue;
-                    }
-                }
-
+                // Each recipe is counted on its own merits: memoCount[i] is derived
+                // from a single primary recipe, so dividing it evenly across all of
+                // the item's recipes could hand 0 to a directly-craftable recipe
+                // (e.g. yellow_dye_from_wildflowers with 3 wildflowers) and phantom
+                // counts to recipes that aren't craftable at all. computeForRecipe
+                // below is per-recipe and never under-counts a craftable recipe; any
+                // residual over-count is rejected by CountEngine's dpExact gate and
+                // corrected by the exact simulator.
                 for (int k = rs; k < re; k++) {
                     int ri = f.itemRecFlat()[k];
                     setCycleFlags(ri);
