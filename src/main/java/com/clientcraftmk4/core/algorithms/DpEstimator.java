@@ -105,22 +105,29 @@ public final class DpEstimator {
                 // corrected by the exact simulator.
                 for (int k = rs; k < re; k++) {
                     int ri = f.itemRecFlat()[k];
-                    setCycleFlags(ri);
-                    long total = computeForRecipe(ri, cycleVersion);
+                    long total = computeForRecipe(ri, setCycleFlags(ri));
                     long newItems = total - alreadyHave;
                     if (newItems > 0) {
                         results.put(f.recDispId()[ri], (int) Math.min(newItems, maxOutput));
                     }
                 }
-                cycleVersion++;
             }
             return results;
         }
 
-        private void setCycleFlags(int ri) {
-            Set<Item> targets = f.recReverseTargets()[ri];
-            if (targets.isEmpty()) return;
+        /**
+         * Allocates a fresh cycle version for the given recipe and marks the option
+         * items that must be treated as physical-inventory-only for this recipe's
+         * count (cycle avoidance). Every recipe gets its own version — a stale
+         * version would leak physical-only treatment into unrelated recipes and
+         * under-count them (version 0 also collides with the unmarked default).
+         *
+         * @return the fresh version to pass to {@link #computeForRecipe}.
+         */
+        private int setCycleFlags(int ri) {
             cycleVersion++;
+            Set<Item> targets = f.recReverseTargets()[ri];
+            if (targets.isEmpty()) return cycleVersion;
             for (int ei = f.recEdgeStart()[ri]; ei < f.recEdgeEnd()[ri]; ei++) {
                 for (int oi = f.edgeOptStart()[ei]; oi < f.edgeOptEnd()[ei]; oi++) {
                     int oid = f.optItemId()[oi];
@@ -129,6 +136,7 @@ public final class DpEstimator {
                     }
                 }
             }
+            return cycleVersion;
         }
 
         private void computeMemo(int id) {

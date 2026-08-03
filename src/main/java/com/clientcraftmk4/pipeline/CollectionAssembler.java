@@ -50,26 +50,35 @@ public final class CollectionAssembler {
             List<RecipeDisplayEntry> allEntries = collAllEntries.get(i);
             if (allEntries.isEmpty()) continue;
 
-            List<RecipeDisplayEntry> craftable = new ArrayList<>();
+            List<RecipeDisplayEntry> direct = new ArrayList<>();
             boolean hasDirect = false;
             boolean hasContainer = false;
 
             for (RecipeDisplayEntry entry : allEntries) {
                 int finalCount = c.counts().getOrDefault(entry.id(), 0);
                 if (finalCount > 0) {
-                    craftable.add(entry);
+                    direct.add(entry);
                     hasDirect = true;
                     counts.put(entry.id(), finalCount);
                 } else if (c.containerCraftable().contains(entry.id())) {
-                    craftable.add(entry);
                     hasContainer = true;
                 }
             }
 
-            RecipeCollection nc = new RecipeCollection(allEntries);
+            // When the player can craft a variant of the item, the container-only
+            // variants (e.g. bundles found with items inside) must not be shown —
+            // they are not craftable, only lootable. Without a craftable variant the
+            // container-only variants are kept so the player can still see them.
+            List<RecipeDisplayEntry> shown = hasDirect ? direct : allEntries;
+
+            RecipeCollection nc = new RecipeCollection(shown);
             RecipeCollectionAccessor acc = (RecipeCollectionAccessor) nc;
-            for (RecipeDisplayEntry e : allEntries) acc.displayable().add(e.id());
-            for (RecipeDisplayEntry e : craftable) acc.craftable().add(e.id());
+            for (RecipeDisplayEntry e : shown) acc.displayable().add(e.id());
+            for (RecipeDisplayEntry e : shown) {
+                if (c.counts().getOrDefault(e.id(), 0) > 0 || c.containerCraftable().contains(e.id())) {
+                    acc.craftable().add(e.id());
+                }
+            }
             ranks.put(nc, hasDirect ? 0 : hasContainer ? 1 : 2);
             result.add(nc);
         }
