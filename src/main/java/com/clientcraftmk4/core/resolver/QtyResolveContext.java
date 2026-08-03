@@ -32,21 +32,33 @@ public final class QtyResolveContext {
     private final TagIndex tags;
     private final RecipeGraph graph;
     private final int gridSize;
+    private final long modelGeneration;
 
-    private QtyResolveContext(RecipeIndex index, TagIndex tags, RecipeGraph graph, int gridSize) {
+    private QtyResolveContext(RecipeIndex index, TagIndex tags, RecipeGraph graph, int gridSize, long modelGeneration) {
         this.index = index;
         this.tags = tags;
         this.graph = graph;
         this.gridSize = gridSize;
+        this.modelGeneration = modelGeneration;
     }
 
     public static QtyResolveContext of(CraftModel model, int gridSize) {
-        return new QtyResolveContext(model.recipeIndex(), model.tagIndex(), model.graph(), gridSize);
+        return new QtyResolveContext(model.recipeIndex(), model.tagIndex(), model.graph(), gridSize, model.modelGeneration());
     }
 
     /** Test-friendly factory over explicit components (no Minecraft required). */
     public static QtyResolveContext of(RecipeIndex index, TagIndex tags, RecipeGraph graph, int gridSize) {
-        return new QtyResolveContext(index, tags, graph, gridSize);
+        return new QtyResolveContext(index, tags, graph, gridSize, -1);
+    }
+
+    /** Model generation this context was built from (stale-cache detection). */
+    public long modelGeneration() {
+        return modelGeneration;
+    }
+
+    /** Grid size this context was built for (stale-cache detection). */
+    public int gridSize() {
+        return gridSize;
     }
 
     public boolean resolveQty(RecipeDisplayEntry entry, WorkMap work, int qty,

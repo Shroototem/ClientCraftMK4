@@ -56,12 +56,7 @@ public final class ExactSimulator {
         work.resetTo(inventory, model.graph());
         Set<Item> inProgress = IN_PROGRESS.get();
         inProgress.clear();
-        ResolveContext ctx = CTX.get();
-        if (ctx == null) {
-            ctx = ResolveContext.of(model, gridSize);
-            CTX.set(ctx);
-        }
-        return ctx.resolve(entry, work, null, inProgress, 0, null);
+        return resolveCtx(model, gridSize).resolve(entry, work, null, inProgress, 0, null);
     }
 
     private static boolean tryResolveQty(CraftModel model, int gridSize,
@@ -71,12 +66,31 @@ public final class ExactSimulator {
         work.resetTo(inventory, model.graph());
         Set<Item> inProgress = IN_PROGRESS.get();
         inProgress.clear();
+        return qtyCtx(model, gridSize).resolveQty(entry, work, k, null, inProgress, 0, null);
+    }
+
+    /**
+     * The cached per-thread resolve contexts must be rebuilt whenever the model
+     * (recipe set — e.g. a randomized-recipe datapack) or the grid size changes;
+     * a stale context references a differently-sized flat graph and reading item
+     * ids from the work map would index out of bounds.
+     */
+    private static ResolveContext resolveCtx(CraftModel model, int gridSize) {
+        ResolveContext ctx = CTX.get();
+        if (ctx == null || ctx.modelGeneration() != model.modelGeneration() || ctx.gridSize() != gridSize) {
+            ctx = ResolveContext.of(model, gridSize);
+            CTX.set(ctx);
+        }
+        return ctx;
+    }
+
+    private static QtyResolveContext qtyCtx(CraftModel model, int gridSize) {
         QtyResolveContext ctx = QTY_CTX.get();
-        if (ctx == null) {
+        if (ctx == null || ctx.modelGeneration() != model.modelGeneration() || ctx.gridSize() != gridSize) {
             ctx = QtyResolveContext.of(model, gridSize);
             QTY_CTX.set(ctx);
         }
-        return ctx.resolveQty(entry, work, k, null, inProgress, 0, null);
+        return ctx;
     }
 
     private static WorkMap scratch(RecipeGraph graph) {

@@ -95,6 +95,15 @@ public final class CountEngine {
 
             for (RecipeDisplayEntry entry : coll.getRecipes()) {
                 int recIdx = flat != null ? flat.dispIdToRecIdx().getOrDefault(entry.id(), -1) : -1;
+                String entryName = null;
+                if (ClientCraftConfig.debugLogging) {
+                    if (recIdx >= 0) {
+                        entryName = model.recipeIndex().getLowerCaseName(flat.idToItem()[flat.recOutId()[recIdx]]);
+                    } else {
+                        ItemStack rs = RecipeDisplays.resolveResult(entry.display(), model.tagIndex());
+                        entryName = rs.isEmpty() ? "?" : model.recipeIndex().getLowerCaseName(rs.getItem());
+                    }
+                }
 
                 if (!ClientCraftConfig.quickCountMode && recIdx >= 0) {
                     // === FLAT ARRAY PATH: zero SlotDisplay processing ===
@@ -108,6 +117,7 @@ public final class CountEngine {
                         allEntries.add(entry);
                         totalRecipes++;
                         treeSkipped++;
+                        logEntry(entryName, count, "treeSkip");
                         continue;
                     }
 
@@ -132,6 +142,7 @@ public final class CountEngine {
                             resolvedCounts.put(entry.id(), count);
                             treeCounted++;
                             dpExactCount++;
+                            logEntry(entryName, count, "dpExact", count);
                         } else {
                             int hi = simulateUpperBound(flat, recIdx, outputCount, count, cycleSuspect);
                             int exact = ExactSimulator.simulateCraftCount(
@@ -140,10 +151,14 @@ public final class CountEngine {
                             if (exact > 0) {
                                 resolvedCounts.put(entry.id(), Math.min(exact, Constants.MAX_REPEATS));
                                 treeCounted++;
+                                logEntry(entryName, count, "sim", exact);
                             } else if (checkContainers && ExactSimulator.tryResolveOnce(model, gridSize, entry, combined)) {
                                 containerSet.add(entry.id());
                                 containerChecked++;
                                 containerItemSet.add(out);
+                                logEntry(entryName, count, "container");
+                            } else {
+                                logEntry(entryName, count, "sim0");
                             }
                         }
                     } else {
@@ -157,18 +172,41 @@ public final class CountEngine {
                             if (exact > 0) {
                                 resolvedCounts.put(entry.id(), Math.min(exact, Constants.MAX_REPEATS));
                                 treeCounted++;
+                                logEntry(entryName, count, "sim-cycle", exact);
                             } else if (checkContainers && ExactSimulator.tryResolveOnce(model, gridSize, entry, combined)) {
                                 containerSet.add(entry.id());
                                 containerChecked++;
                                 containerItemSet.add(out);
+                                logEntry(entryName, count, "container");
+                            } else {
+                                logEntry(entryName, count, "cycle-skip");
                             }
                         } else if (checkContainers) {
                             int contCount = treeCombinedCounts.getOrDefault(entry.id(), 0);
-                            if (contCount > 0 && ExactSimulator.tryResolveOnce(model, gridSize, entry, combined)) {
-                                containerSet.add(entry.id());
-                                containerChecked++;
-                                containerItemSet.add(out);
+                            if (contCount > 0) {
+                                // The DP under-counted this recipe, so its craftability
+                                // must be verified exactly. Check the inventory alone
+                                // first: a recipe craftable from the inventory is counted
+                                // as craftable, never mislabeled as container-craftable.
+                                int exact = ExactSimulator.simulateCraftCount(
+                                        model, gridSize, entry, invSnapshot, Constants.MAX_REPEATS) * outputCount;
+                                if (exact > 0) {
+                                    resolvedCounts.put(entry.id(), Math.min(exact, Constants.MAX_REPEATS));
+                                    treeCounted++;
+                                    logEntry(entryName, count, "sim-recover", exact);
+                                } else if (ExactSimulator.tryResolveOnce(model, gridSize, entry, combined)) {
+                                    containerSet.add(entry.id());
+                                    containerChecked++;
+                                    containerItemSet.add(out);
+                                    logEntry(entryName, count, "container");
+                                } else {
+                                    logEntry(entryName, count, "cont-skip");
+                                }
+                            } else {
+                                logEntry(entryName, count, "cont0");
                             }
+                        } else {
+                            logEntry(entryName, count, "cycle-skip");
                         }
                     }
                 } else {
@@ -179,6 +217,7 @@ public final class CountEngine {
                         allEntries.add(entry);
                         totalRecipes++;
                         treeSkipped++;
+                        logEntry(entryName, 0, "notInTree");
                         continue;
                     }
 
@@ -198,6 +237,9 @@ public final class CountEngine {
                     Set<Item> sharedInProgress = new HashSet<>();
                     if (ResolveContext.of(model, gridSize).resolve(entry, temp, null, sharedInProgress, 0, null)) {
                         resolvedCounts.put(entry.id(), outputCount);
+                        logEntry(entryName, 0, "resolve", outputCount);
+                    } else {
+                        logEntry(entryName, 0, "resolve0");
                     }
                 }
             }
@@ -222,9 +264,20 @@ public final class CountEngine {
                 new CraftCounts.Stats(System.nanoTime() - t0, treeCounted, preCheckSkipped, treeSkipped, containerChecked));
     }
 
+    /** Debug-log one recipe's counting decision (only when {@code debugLogging} is on). */
+    private static void logEntry(String name, int dpCount, String decision, int value) {
+        if (ClientCraftConfig.debugLogging) {
+            LOG.info("[CC]   {} | dp={} -> {}{}", name, dpCount, decision,
+                    value > 0 ? " (" + value + ")" : "");
+        }
+    }
+
+    private static void logEntry(String name, int dpCount, String decision) {
+        logEntry(name, dpCount, decision, 0);
+    }
+
     /** True if every edge of the flat recipe has at least one option in the physical inventory. */
-    private static boolean allDirectlyAvailableFlat(GraphFlatData f, int recIdx, Map<Item, Integer> inventory) {
-        for (int ei = f.recEdgeStart()[recIdx]; ei < f.recEdgeEnd()[recIdx]; ei++) {
+    private static boolean allDirectlyAvailableFlat(GraphFlatData f, int recIdx, Map<Item, Integer> inventory) {        for (int ei = f.recEdgeStart()[recIdx]; ei < f.recEdgeEnd()[recIdx]; ei++) {
             boolean anyAvail = false;
             for (int oi = f.edgeOptStart()[ei]; oi < f.edgeOptEnd()[ei]; oi++) {
                 Item item = f.optItemObj()[oi];

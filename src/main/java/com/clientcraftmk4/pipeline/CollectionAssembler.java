@@ -51,40 +51,50 @@ public final class CollectionAssembler {
             if (allEntries.isEmpty()) continue;
 
             List<RecipeDisplayEntry> direct = new ArrayList<>();
-            boolean hasDirect = false;
-            boolean hasContainer = false;
+            List<RecipeDisplayEntry> containerOnly = new ArrayList<>();
 
             for (RecipeDisplayEntry entry : allEntries) {
                 int finalCount = c.counts().getOrDefault(entry.id(), 0);
                 if (finalCount > 0) {
                     direct.add(entry);
-                    hasDirect = true;
                     counts.put(entry.id(), finalCount);
                 } else if (c.containerCraftable().contains(entry.id())) {
-                    hasContainer = true;
+                    containerOnly.add(entry);
                 }
             }
 
-            // When the player can craft a variant of the item, the container-only
-            // variants (e.g. bundles found with items inside) must not be shown —
-            // they are not craftable, only lootable. Without a craftable variant the
-            // container-only variants are kept so the player can still see them.
-            List<RecipeDisplayEntry> shown = hasDirect ? direct : allEntries;
-
-            RecipeCollection nc = new RecipeCollection(shown);
-            RecipeCollectionAccessor acc = (RecipeCollectionAccessor) nc;
-            for (RecipeDisplayEntry e : shown) acc.displayable().add(e.id());
-            for (RecipeDisplayEntry e : shown) {
-                if (c.counts().getOrDefault(e.id(), 0) > 0 || c.containerCraftable().contains(e.id())) {
-                    acc.craftable().add(e.id());
+            // Craftable variants take priority: they form the main collection (rank 0)
+            // so the button shows a craftable variant first. Container-only variants
+            // (e.g. beds/wool you can't make yet, filled bundles) go into a separate
+            // group (rank 1) so they never tint the craftable button purple.
+            if (!direct.isEmpty()) {
+                ranks.put(addCollection(result, direct, c), 0);
+                if (!containerOnly.isEmpty()) {
+                    ranks.put(addCollection(result, containerOnly, c), 1);
                 }
+            } else if (!containerOnly.isEmpty()) {
+                ranks.put(addCollection(result, allEntries, c), 1);
+            } else {
+                ranks.put(addCollection(result, allEntries, c), 2);
             }
-            ranks.put(nc, hasDirect ? 0 : hasContainer ? 1 : 2);
-            result.add(nc);
         }
         autoCraft.addAll(result);
 
         return new ResolveResult(result, counts, c.containerCraftable(), c.containerAvailableItems(),
                 ranks, autoCraft, r.cacheKey(), r.snapshot().generation(), r.modelGeneration());
+    }
+
+    private static RecipeCollection addCollection(List<RecipeCollection> out,
+                                                  List<RecipeDisplayEntry> entries, CountEngine.CraftCounts c) {
+        RecipeCollection nc = new RecipeCollection(entries);
+        RecipeCollectionAccessor acc = (RecipeCollectionAccessor) nc;
+        for (RecipeDisplayEntry e : entries) acc.displayable().add(e.id());
+        for (RecipeDisplayEntry e : entries) {
+            if (c.counts().getOrDefault(e.id(), 0) > 0 || c.containerCraftable().contains(e.id())) {
+                acc.craftable().add(e.id());
+            }
+        }
+        out.add(nc);
+        return nc;
     }
 }
