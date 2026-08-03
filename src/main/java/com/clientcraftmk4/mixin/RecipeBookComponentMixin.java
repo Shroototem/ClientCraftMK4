@@ -9,6 +9,7 @@ import com.clientcraftmk4.ui.ClientCraftTab;
 import com.clientcraftmk4.ui.ResultButtonRenderer;
 import com.clientcraftmk4.ui.ScrollController;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.screens.recipebook.RecipeBookComponent;
 import net.minecraft.client.gui.screens.recipebook.RecipeBookPage;
@@ -21,7 +22,6 @@ import org.lwjgl.glfw.GLFW;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
-import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
@@ -59,8 +59,23 @@ public class RecipeBookComponentMixin {
     @Shadow
     private int xOffset;
 
-    @Unique
-    private boolean clientcraft$hasAutoSwitched = false;
+    /**
+     * The last tab the user chose via a tab-button click. Only explicit clicks
+     * write this, and only on books that actually have the ClientCraft tab
+     * (crafting table / inventory) — furnace & co. tabs are a different book
+     * and must never clear the crafting-book memory.
+     */
+    @Inject(method = "onTabButtonPress", at = @At("HEAD"))
+    private void clientcraft$rememberTabChoice(Button button, CallbackInfo ci) {
+        if (!(button instanceof RecipeBookTabButton recipeBookTabButton)) return;
+        List<RecipeBookTabButton> tabs = ((RecipeBookComponentAccessor) this).getTabButtons();
+        for (RecipeBookTabButton tab : tabs) {
+            if (tab.getCategory() instanceof ClientCraftTab) {
+                ClientCraftTab.lastTabWasClientCraft = recipeBookTabButton.getCategory() instanceof ClientCraftTab;
+                break;
+            }
+        }
+    }
 
     @Inject(method = "tryPlaceRecipe", at = @At("HEAD"), cancellable = true)
     private void clientcraft$onSelect(RecipeCollection results, RecipeDisplayId recipeId, boolean craftAll, CallbackInfoReturnable<Boolean> cir) {
@@ -89,10 +104,11 @@ public class RecipeBookComponentMixin {
 
     @Inject(method = "updateCollections", at = @At("HEAD"), cancellable = true)
     private void clientcraft$refreshResults(boolean resetCurrentPage, boolean filteringCraftable, CallbackInfo ci) {
-        // Auto-switch to the ClientCraft tab once per screen open if it was the last used tab
-        if (!clientcraft$hasAutoSwitched && ClientCraftTab.lastTabWasClientCraft
+        // Auto-switch to the ClientCraft tab whenever it was the last tab the
+        // user selected. Runs on every refresh (not once per screen), so it
+        // survives opening other inventories in between.
+        if (ClientCraftTab.lastTabWasClientCraft
                 && selectedTab != null && !(selectedTab.getCategory() instanceof ClientCraftTab)) {
-            clientcraft$hasAutoSwitched = true;
             List<RecipeBookTabButton> tabs = ((RecipeBookComponentAccessor) this).getTabButtons();
             for (RecipeBookTabButton tab : tabs) {
                 if (tab.getCategory() instanceof ClientCraftTab) {
@@ -105,7 +121,6 @@ public class RecipeBookComponentMixin {
         }
 
         if (selectedTab == null || !(selectedTab.getCategory() instanceof ClientCraftTab)) {
-            ClientCraftTab.lastTabWasClientCraft = false;
             ScrollController.clearActivePage();
             return;
         }

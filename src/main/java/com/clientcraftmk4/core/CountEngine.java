@@ -113,7 +113,8 @@ public final class CountEngine {
                     int count = treeCounts.getOrDefault(entry.id(), 0);
                     boolean cycleSuspect = flat.recCycleSuspect()[recIdx];
 
-                    if (count == 0 && !checkContainers && !cycleSuspect) {
+                    if (count == 0 && !checkContainers && !cycleSuspect
+                            && !Reachability.allEdgesReachableFlat(flat, recIdx, reachableItems)) {
                         allEntries.add(entry);
                         totalRecipes++;
                         treeSkipped++;
@@ -163,10 +164,13 @@ public final class CountEngine {
                         }
                     } else {
                         // DP under-counted (cycle-avoidance hid a sub-craft path, e.g.
-                        // 9 gold nuggets + 8 ingots can craft a gold block). Only worth
-                        // verifying when every edge is reachable AND the recipe's output
-                        // participates in a craft cycle.
-                        if (cycleSuspect && Reachability.allEdgesReachableFlat(flat, recIdx, reachableItems)) {
+                        // 9 gold nuggets + 8 ingots can craft a gold block, or the
+                        // straw -> tall dry grass -> short dry grass -> torch chain).
+                        // Verify whenever every edge is reachable — the cycle flag
+                        // alone misses recipes whose sub-craft chain passes through a
+                        // cycle without the recipe's own output being part of it.
+                        boolean edgesReachable = Reachability.allEdgesReachableFlat(flat, recIdx, reachableItems);
+                        if (edgesReachable) {
                             int exact = ExactSimulator.simulateCraftCount(
                                     model, gridSize, entry, invSnapshot, Constants.MAX_REPEATS) * outputCount;
                             if (exact > 0) {
