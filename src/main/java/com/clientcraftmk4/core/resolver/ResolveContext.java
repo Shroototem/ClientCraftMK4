@@ -138,7 +138,7 @@ public final class ResolveContext {
             return tryTagFallback(d.input(), alreadyTried, work, stepsOut, inProgress, depth, rootOutput);
 
         if (slot instanceof SlotDisplay.TagSlotDisplay d) {
-            TagKey<Item> tag = d.tag();
+            TagKey<Item> tag = RecipeDisplays.getSlotTag(d);
             // Scan the working map directly for items matching this tag (deterministic
             // insertion order; the global tag indices miss sub-crafted leftovers).
             GraphFlatData f = graph.flat();
@@ -189,7 +189,7 @@ public final class ResolveContext {
             return new ItemStack(d.stack().item().value(), d.stack().count());
         }
         if (slot instanceof SlotDisplay.TagSlotDisplay d) {
-            TagKey<Item> tag = d.tag();
+            TagKey<Item> tag = RecipeDisplays.getSlotTag(d);
             Set<Item> matches = tags.inventoryTagMembers(tag);
             if (matches != null) {
                 for (Item item : matches) {

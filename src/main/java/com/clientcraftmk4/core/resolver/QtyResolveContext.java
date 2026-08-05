@@ -142,7 +142,7 @@ public final class QtyResolveContext {
             return tryTagFallbackQty(d.input(), alreadyTried, deficit, work, stepsOut, inProgress, depth, rootOutput);
 
         if (slot instanceof SlotDisplay.TagSlotDisplay d) {
-            TagKey<Item> tag = d.tag();
+            TagKey<Item> tag = RecipeDisplays.getSlotTag(d);
             int need = deficit;
             GraphFlatData f = graph.flat();
             for (int i = 0; i < work.presentSize() && need > 0; i++) {
@@ -192,7 +192,7 @@ public final class QtyResolveContext {
             return new ItemStack(d.stack().item().value(), d.stack().count());
         }
         if (slot instanceof SlotDisplay.TagSlotDisplay d) {
-            TagKey<Item> tag = d.tag();
+            TagKey<Item> tag = RecipeDisplays.getSlotTag(d);
             Set<Item> matches = tags.inventoryTagMembers(tag);
             if (matches != null) {
                 for (Item item : matches) {

@@ -18,7 +18,9 @@ import net.minecraft.client.gui.screens.recipebook.RecipeCollection;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.crafting.display.RecipeDisplayEntry;
 import net.minecraft.world.item.crafting.display.RecipeDisplayId;
-import org.lwjgl.glfw.GLFW;
+//? if <26.3-snapshot-7 {
+/*import org.lwjgl.glfw.GLFW;
+*///?}
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
@@ -92,9 +94,14 @@ public class RecipeBookComponentMixin {
         }
         if (target == null) return;
 
-        long window = Minecraft.getInstance().getWindow().handle();
+        //? if >=26.3-snapshot-7 {
+        boolean ctrlHeld = Minecraft.getInstance().hasControlDown();
+        //?}
+        //? if <26.3-snapshot-7 {
+        /*long window = Minecraft.getInstance().getWindow().handle();
         boolean ctrlHeld = GLFW.glfwGetKey(window, GLFW.GLFW_KEY_LEFT_CONTROL) == GLFW.GLFW_PRESS
                 || GLFW.glfwGetKey(window, GLFW.GLFW_KEY_RIGHT_CONTROL) == GLFW.GLFW_PRESS;
+        *///?}
         AutoCrafter.Mode mode = !craftAll ? AutoCrafter.Mode.ONCE
                 : ctrlHeld ? AutoCrafter.Mode.ALL : AutoCrafter.Mode.STACK;
 

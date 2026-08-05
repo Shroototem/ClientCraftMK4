@@ -103,7 +103,12 @@ public class OverlayRecipeComponentMixin {
         }
 
         // Right-click on an ingredient tile → navigate to that item's recipe
-        if (event.button() == 1) {
+        //? if >=26.3-snapshot-7 {
+        if (event.button() == 3) {
+        //?}
+        //? if <26.3-snapshot-7 {
+        /*if (event.button() == 1) {
+        *///?}
             int col = (mouseX - (uiX + BORDER)) / TILE_SIZE;
             int row = (mouseY - (uiY + BORDER)) / TILE_SIZE;
             if (col >= 0 && col < 3 && row >= 0 && row < 3) {
@@ -118,11 +123,20 @@ public class OverlayRecipeComponentMixin {
             return;
         }
 
-        if (event.button() != 0) {
+        //? if >=26.3-snapshot-7 {
+        if (event.button() != 1) {
             this.lastRecipeClicked = null;
             cir.setReturnValue(true);
             return;
         }
+        //?}
+        //? if <26.3-snapshot-7 {
+        /*if (event.button() != 0) {
+            this.lastRecipeClicked = null;
+            cir.setReturnValue(true);
+            return;
+        }
+        *///?}
 
         // Variant arrows (left/right)
         int counterY = uiY + gridPixelSize + 2 * BORDER;

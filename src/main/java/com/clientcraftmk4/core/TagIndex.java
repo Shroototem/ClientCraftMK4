@@ -37,7 +37,8 @@ public final class TagIndex {
     /** Recursively collects the tags referenced by a slot tree. */
     public void collectTags(SlotDisplay slot) {
         if (slot instanceof SlotDisplay.TagSlotDisplay d) {
-            knownTags.add(d.tag());
+            TagKey<Item> tag = RecipeDisplays.getSlotTag(d);
+            if (tag != null) knownTags.add(tag);
         } else if (slot instanceof SlotDisplay.Composite d) {
             for (SlotDisplay sub : d.contents()) collectTags(sub);
         } else if (slot instanceof SlotDisplay.WithRemainder d) {
@@ -52,7 +53,7 @@ public final class TagIndex {
         Set<TagKey<Item>> tags = new HashSet<>();
         var holder = item.builtInRegistryHolder();
         for (TagKey<Item> tag : knownTags) {
-            if (holder.is(tag)) tags.add(tag);
+            if (tag != null && holder.is(tag)) tags.add(tag);
         }
         Set<TagKey<Item>> result = tags.isEmpty() ? Set.of() : tags;
         itemToTags.put(item, result);
@@ -180,7 +181,7 @@ public final class TagIndex {
             for (SlotDisplay slot : slots) {
                 if (slot instanceof SlotDisplay.Empty) continue;
                 if (slot instanceof SlotDisplay.TagSlotDisplay t) {
-                    if (inventoryTagIndex.containsKey(t.tag())) continue;
+                    if (inventoryTagIndex.containsKey(RecipeDisplays.getSlotTag(t))) continue;
                     continue outer;
                 }
                 if (slot instanceof SlotDisplay.Composite d) {
@@ -195,7 +196,7 @@ public final class TagIndex {
                 if (slot instanceof SlotDisplay.WithRemainder d) {
                     SlotDisplay inner = d.input();
                     if (inner instanceof SlotDisplay.TagSlotDisplay t) {
-                        if (inventoryTagIndex.containsKey(t.tag())) continue;
+                        if (inventoryTagIndex.containsKey(RecipeDisplays.getSlotTag(t))) continue;
                         continue outer;
                     }
                 }

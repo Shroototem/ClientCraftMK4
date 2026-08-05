@@ -470,7 +470,7 @@ public final class GraphBuilder {
                 options.add(new IngredientOption(item, node));
             }
         } else if (slot instanceof SlotDisplay.TagSlotDisplay d) {
-            TagKey<Item> tag = d.tag();
+            TagKey<Item> tag = RecipeDisplays.getSlotTag(d);
             List<Item> members = tagIndex.members(tag);
             if (members != null) {
                 for (Item item : members) {
@@ -531,7 +531,7 @@ public final class GraphBuilder {
         } else if (slot instanceof SlotDisplay.ItemStackSlotDisplay d) {
             items.add(d.stack().item().value());
         } else if (slot instanceof SlotDisplay.TagSlotDisplay d) {
-            List<Item> members = tagIndex.members(d.tag());
+            List<Item> members = tagIndex.members(RecipeDisplays.getSlotTag(d));
             if (members != null) items.addAll(members);
         } else if (slot instanceof SlotDisplay.Composite d) {
             for (SlotDisplay sub : d.contents()) collectItems(sub, items, tagIndex);

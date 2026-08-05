@@ -84,7 +84,7 @@ public final class Reachability {
         if (slot instanceof SlotDisplay.ItemSlotDisplay d) return reachable.contains(d.item().value());
         if (slot instanceof SlotDisplay.ItemStackSlotDisplay d) return reachable.contains(d.stack().item().value());
         if (slot instanceof SlotDisplay.TagSlotDisplay d) {
-            List<Item> members = tags.members(d.tag());
+            List<Item> members = tags.members(RecipeDisplays.getSlotTag(d));
             if (members != null) {
                 for (Item m : members) {
                     if (reachable.contains(m)) return true;

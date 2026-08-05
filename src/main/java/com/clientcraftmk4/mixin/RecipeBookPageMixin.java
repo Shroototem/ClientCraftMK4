@@ -59,7 +59,12 @@ public class RecipeBookPageMixin implements RecipeBookPageCycleAccessor {
 
     @Inject(method = "mouseClicked", at = @At("HEAD"), cancellable = true)
     private void clientcraft$onRightClick(MouseButtonEvent event, int left, int top, int width, int height, boolean bl, CallbackInfoReturnable<Boolean> cir) {
-        if (event.button() != 1) return;
+        //? if >=26.3-snapshot-7 {
+        if (event.button() != 3) return;
+        //?}
+        //? if <26.3-snapshot-7 {
+        /*if (event.button() != 1) return;
+        *///?}
         if (overlay.isVisible()) return;
 
         for (RecipeButton button : buttons) {

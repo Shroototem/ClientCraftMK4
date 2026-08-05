@@ -23,9 +23,47 @@ public final class RecipeDisplays {
     private RecipeDisplays() {}
 
     public static List<SlotDisplay> getSlots(RecipeDisplay display) {
-        if (display instanceof ShapedCraftingRecipeDisplay s) return s.ingredients();
-        if (display instanceof ShapelessCraftingRecipeDisplay s) return s.ingredients();
+        if (display instanceof ShapedCraftingRecipeDisplay s) {
+            //? if >=26.3-snapshot-7 {
+            return s.ingredients().stream().map(RecipeDisplays::normalize).toList();
+            //?}
+            //? if <26.3-snapshot-7 {
+            /*return s.ingredients();*/
+            //?}
+        }
+        if (display instanceof ShapelessCraftingRecipeDisplay s) {
+            //? if >=26.3-snapshot-7 {
+            return s.ingredients().stream().map(RecipeDisplays::normalize).toList();
+            //?}
+            //? if <26.3-snapshot-7 {
+            /*return s.ingredients();*/
+            //?}
+        }
         return null;
+    }
+
+    /**
+     * 26.3 tag slots may hold a direct item list (no tag key); unwrap those into
+     * item slots so tag-only logic never sees them (26.2 built them as Composites).
+     */
+    public static SlotDisplay normalize(SlotDisplay slot) {
+        //? if >=26.3-snapshot-7 {
+        if (slot instanceof SlotDisplay.TagSlotDisplay d && d.tag().unwrapKey().isEmpty()) {
+            return new SlotDisplay.Composite(d.tag().stream()
+                    .map(h -> (SlotDisplay) new SlotDisplay.ItemSlotDisplay(h))
+                    .toList());
+        }
+        if (slot instanceof SlotDisplay.Composite c) {
+            return new SlotDisplay.Composite(c.contents().stream().map(RecipeDisplays::normalize).toList());
+        }
+        if (slot instanceof SlotDisplay.WithRemainder r) {
+            return new SlotDisplay.WithRemainder(normalize(r.input()), r.remainder());
+        }
+        return slot;
+        //?}
+        //? if <26.3-snapshot-7 {
+        /*return slot;*/
+        //?}
     }
 
     public static boolean fitsInGrid(RecipeDisplay display, int gridSize) {
@@ -89,7 +127,7 @@ public final class RecipeDisplays {
             return new ItemStack(d.stack().item().value(), d.stack().count());
         }
         if (display instanceof SlotDisplay.TagSlotDisplay d) {
-            TagKey<Item> tag = d.tag();
+            TagKey<Item> tag = getSlotTag(d);
             Set<Item> matches = tags.inventoryTagMembers(tag);
             if (matches != null) {
                 for (Item item : matches) {
@@ -150,7 +188,14 @@ public final class RecipeDisplays {
     }
 
     public static TagKey<Item> getSlotTag(SlotDisplay slot) {
-        if (slot instanceof SlotDisplay.TagSlotDisplay d) return d.tag();
+        if (slot instanceof SlotDisplay.TagSlotDisplay d) {
+            //? if >=26.3-snapshot-7 {
+            return d.tag().unwrapKey().orElse(null);
+            //?}
+            //? if <26.3-snapshot-7 {
+            /*return d.tag();
+            *///?}
+        }
         if (slot instanceof SlotDisplay.WithRemainder d) return getSlotTag(d.input());
         return null;
     }

@@ -140,7 +140,7 @@ public final class OverlayBuilder {
     private static ItemStack findCraftableForSlot(SlotDisplay slot, CraftModel model, int gridSize, InventorySnapshot snap) {
         TagIndex tags = model.tagIndex();
         if (slot instanceof SlotDisplay.TagSlotDisplay d) {
-            TagKey<Item> tag = d.tag();
+            TagKey<Item> tag = RecipeDisplays.getSlotTag(d);
             Set<Item> invMatches = tags.inventoryTagMembers(tag);
             if (invMatches != null && !invMatches.isEmpty()) {
                 return new ItemStack(invMatches.iterator().next());
@@ -225,11 +225,11 @@ public final class OverlayBuilder {
     private static Item findInSet(SlotDisplay slot, Item resolved, Set<Item> items, TagIndex tags) {
         if (items.contains(resolved)) return resolved;
         if (slot instanceof SlotDisplay.TagSlotDisplay d) {
-            Set<Item> contMatches = tags.containerTagMembers(d.tag());
+            Set<Item> contMatches = tags.containerTagMembers(RecipeDisplays.getSlotTag(d));
             if (contMatches != null) {
                 for (Item item : contMatches) if (items.contains(item)) return item;
             }
-            List<Item> members = tags.members(d.tag());
+            List<Item> members = tags.members(RecipeDisplays.getSlotTag(d));
             if (members != null) {
                 for (Item member : members) if (items.contains(member)) return member;
             }
