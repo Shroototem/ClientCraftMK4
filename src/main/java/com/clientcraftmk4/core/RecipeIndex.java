@@ -4,6 +4,7 @@ import net.minecraft.client.gui.screens.recipebook.RecipeCollection;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.crafting.display.RecipeDisplayEntry;
+import net.minecraft.world.item.crafting.display.RecipeDisplayId;
 import net.minecraft.world.item.crafting.display.SlotDisplay;
 
 import java.util.*;
@@ -15,10 +16,13 @@ import java.util.*;
  */
 public final class RecipeIndex {
     private final Map<Item, List<RecipeDisplayEntry>> byOutput;
+    private final TagIndex tagIndex;
     private final Map<Item, String> lowerCaseNames = new HashMap<>();
+    private final Map<RecipeDisplayId, String> entryDisplayNames = new HashMap<>();
 
-    private RecipeIndex(Map<Item, List<RecipeDisplayEntry>> byOutput) {
+    private RecipeIndex(Map<Item, List<RecipeDisplayEntry>> byOutput, TagIndex tagIndex) {
         this.byOutput = byOutput;
+        this.tagIndex = tagIndex;
     }
 
     /** Recipe entries producing {@code item}, in recipe-book order; null if none. */
@@ -46,6 +50,19 @@ public final class RecipeIndex {
                 i -> new ItemStack(i).getHoverName().getString().toLowerCase(Locale.ROOT));
     }
 
+    /**
+     * Lower-case display name of an entry's resolved output, memoised per
+     * {@link RecipeDisplayId}. The search filter calls this for every entry on
+     * every keystroke — resolving the result slot display each time dominated
+     * that cost; after the first pass this is a single map hit.
+     */
+    public String lowerCaseDisplayName(RecipeDisplayEntry entry) {
+        return entryDisplayNames.computeIfAbsent(entry.id(), id -> {
+            ItemStack out = RecipeDisplays.resolveResult(entry.display(), tagIndex);
+            return out.isEmpty() ? "" : getLowerCaseName(out.getItem());
+        });
+    }
+
     /** Builds the index and collects the known tag set (MK4's {@code ensureIndex} body). */
     public static RecipeIndex build(List<RecipeCollection> allCrafting, TagIndex tagIndex) {
         Map<Item, List<RecipeDisplayEntry>> index = new LinkedHashMap<>();
@@ -58,6 +75,6 @@ public final class RecipeIndex {
             }
         }
         for (Item item : index.keySet()) tagIndex.tagsOf(item);
-        return new RecipeIndex(index);
+        return new RecipeIndex(index, tagIndex);
     }
 }

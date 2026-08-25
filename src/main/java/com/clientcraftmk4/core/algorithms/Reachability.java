@@ -11,15 +11,18 @@ import net.minecraft.world.item.Item;
 import net.minecraft.world.item.crafting.display.RecipeDisplayEntry;
 import net.minecraft.world.item.crafting.display.SlotDisplay;
 
+import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
 /**
  * Fixed-point reachability over the graph's topological order (port of MK4's
- * computeReachableFromTree). Iterates until no new items are added because the
- * topo order is based on primary recipe edges only.
+ * computeReachableFromTree). Iterates only over the not-yet-reachable items,
+ * shrinking the work list as items resolve, because the topo order is based on
+ * primary recipe edges only.
  */
 public final class Reachability {
     private Reachability() {}
@@ -27,16 +30,21 @@ public final class Reachability {
     public static Set<Item> compute(RecipeGraph graph, Map<Item, Integer> inventory, int gridSize) {
         if (graph == null) return new HashSet<>(inventory.keySet());
         Set<Item> reachable = new HashSet<>(inventory.keySet());
+        List<Item> pending = new ArrayList<>();
+        for (Item item : graph.topoOrder()) {
+            if (!reachable.contains(item)) pending.add(item);
+        }
         boolean changed = true;
         while (changed) {
             changed = false;
-            for (Item item : graph.topoOrder()) {
-                if (reachable.contains(item)) continue;
-                List<CraftedItem> recipes = graph.recipesOf(item);
-                for (CraftedItem recipe : recipes) {
+            Iterator<Item> it = pending.iterator();
+            while (it.hasNext()) {
+                Item item = it.next();
+                for (CraftedItem recipe : graph.recipesOf(item)) {
                     if (recipe.gridSize() > gridSize) continue;
                     if (allTreeEdgesReachable(recipe, reachable)) {
                         reachable.add(item);
+                        it.remove();
                         changed = true;
                         break;
                     }

@@ -46,10 +46,11 @@ public record RecipeGraph(
 
     /**
      * All per-recipe / per-edge / per-option data as primitive arrays.
-     * {@code recCycleSuspect} and {@code recSharingSuspect} are the DP-exactness
-     * gates, computed once at graph build time instead of per resolve
-     * (plan §6.3); {@code recReverseTargets} pre-computes the per-recipe
-     * reverse-dependency target set.
+     * {@code recCycleSuspect}, {@code recSharingSuspect} and
+     * {@code recCrossEdgeShared} are the DP-exactness gates, computed once at
+     * graph build time instead of per resolve (plan §6.3);
+     * {@code recReverseTargets} pre-computes the per-recipe reverse-dependency
+     * target set.
      */
     public record GraphFlatData(
             int n,
@@ -65,6 +66,7 @@ public record RecipeGraph(
             boolean[] recSelfConsuming,
             boolean[] recCycleSuspect,
             boolean[] recSharingSuspect,
+            boolean[] recCrossEdgeShared,
             Set<Item>[] recReverseTargets,
             int[] recEdgeStart, int[] recEdgeEnd,
             int totalEdges,

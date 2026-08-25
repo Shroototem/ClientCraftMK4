@@ -19,6 +19,7 @@ import java.util.*;
  * <ul>
  *   <li>{@code recCycleSuspect} — MK4's {@code hasCycleFlagsFlat};</li>
  *   <li>{@code recSharingSuspect} — MK4's {@code hasSharingSuspectEdgeFlat};</li>
+ *   <li>{@code recCrossEdgeShared} — items shared across distinct edges of one recipe;</li>
  *   <li>{@code recReverseTargets} — per-recipe reverse-dependency target set.</li>
  * </ul>
  */
@@ -332,6 +333,7 @@ public final class GraphBuilder {
         Set<Item>[] recReverseTargets = new Set[totalRecipes];
         boolean[] recCycleSuspect = new boolean[totalRecipes];
         boolean[] recSharingSuspect = new boolean[totalRecipes];
+        boolean[] recCrossEdgeShared = new boolean[totalRecipes];
         for (int ri = 0; ri < totalRecipes; ri++) {
             Item outItem = recOutId[ri] >= 0 ? idToItem[recOutId[ri]] : null;
             Set<Item> targets = outItem != null
@@ -352,13 +354,17 @@ public final class GraphBuilder {
             recSharingSuspect[ri] = hasSharingSuspectEdgeFlat(
                     recEdgeStart, recEdgeEnd, edgeOptStart, edgeOptEnd, optItemId, optItemObj, primaryRecIdx, ri);
         }
+        for (int ri = 0; ri < totalRecipes; ri++) {
+            recCrossEdgeShared[ri] = hasCrossEdgeSharedOptionFlat(
+                    recEdgeStart, recEdgeEnd, edgeOptStart, edgeOptEnd, optItemObj, ri);
+        }
 
         return new GraphFlatData(
                 n, idToItem, idMap, isBaseNode, primaryRecIdx,
                 itemRecStart, itemRecEnd, itemRecFlat,
                 totalRecipes, recOutId, recOutCount, recGridSize, recDispId,
                 dispIdToRecIdx, recSelfConsuming,
-                recCycleSuspect, recSharingSuspect, recReverseTargets,
+                recCycleSuspect, recSharingSuspect, recCrossEdgeShared, recReverseTargets,
                 recEdgeStart, recEdgeEnd,
                 totalEdges, edgeCnt, edgeOptStart, edgeOptEnd,
                 totalOpts, optItemId, optItemObj
@@ -392,6 +398,25 @@ public final class GraphBuilder {
                         }
                     }
                 }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Detects the cross-edge option-sharing over-count pattern: an item appearing as an
+     * option in two distinct edges of one recipe. Both edges then draw from the same
+     * physical pool, so per-edge independent counting (tree DP and directCountFlat)
+     * double-counts it. Static per recipe — never recomputed.
+     */
+    private static boolean hasCrossEdgeSharedOptionFlat(
+            int[] recEdgeStart, int[] recEdgeEnd, int[] edgeOptStart, int[] edgeOptEnd,
+            Item[] optItemObj, int recIdx) {
+        Map<Item, Integer> lastEdgeOfItem = new HashMap<>();
+        for (int ei = recEdgeStart[recIdx]; ei < recEdgeEnd[recIdx]; ei++) {
+            for (int oi = edgeOptStart[ei]; oi < edgeOptEnd[ei]; oi++) {
+                Integer prev = lastEdgeOfItem.put(optItemObj[oi], ei);
+                if (prev != null && prev != ei) return true;
             }
         }
         return false;
@@ -514,14 +539,14 @@ public final class GraphBuilder {
         if (options.size() == 1) return List.of(options.getFirst().item());
         List<Item> items = new ArrayList<>(options.size());
         for (IngredientOption opt : options) items.add(opt.item());
-        items.sort(Comparator.comparingInt(System::identityHashCode));
+        items.sort(Comparator.comparingInt(Item::getId));
         return items;
     }
 
     private static List<Item> itemSetKey(Set<Item> items) {
         if (items.size() == 1) return List.of(items.iterator().next());
         List<Item> sorted = new ArrayList<>(items);
-        sorted.sort(Comparator.comparingInt(System::identityHashCode));
+        sorted.sort(Comparator.comparingInt(Item::getId));
         return sorted;
     }
 

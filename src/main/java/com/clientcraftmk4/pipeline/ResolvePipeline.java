@@ -10,6 +10,7 @@ import com.clientcraftmk4.craft.AutoCrafter;
 import net.minecraft.client.ClientRecipeBook;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.recipebook.RecipeCollection;
+import net.minecraft.client.gui.screens.recipebook.SearchRecipeBookCategory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -60,22 +61,21 @@ public final class ResolvePipeline {
 
         int gridSize = GameContext.gridSize();
         CraftModel model = CraftModel.current();
-        InventoryProvider.current();
         if (model == null || model.recipeIndex().isEmpty()) return List.of();
 
         InventorySnapshot snap = InventoryProvider.current();
-        long cacheKey = snap.generation() * 7L + gridSize;
-        submit(new ResolveRequest(book, gridSize, cacheKey, model.modelGeneration(), snap));
+        List<RecipeCollection> allCrafting = book.getCollection(SearchRecipeBookCategory.CRAFTING);
+        submit(new ResolveRequest(allCrafting, gridSize,
+                ResolveRequest.cacheKey(snap.generation(), gridSize), model.modelGeneration(), snap));
 
         ResolveResult cur = latest;
         if (cur.collections().isEmpty()) {
             // First open (or after a recipe reload): show a placeholder so the tab is
             // populated instantly while the background resolve runs.
             if (ClientCraftConfig.debugLogging) {
-                LOG.info("[CC] Tab: returning placeholder ({} collections)",
-                        book.getCollection(net.minecraft.client.gui.screens.recipebook.SearchRecipeBookCategory.CRAFTING).size());
+                LOG.info("[CC] Tab: returning placeholder ({} collections)", allCrafting.size());
             }
-            List<RecipeCollection> placeholder = CollectionAssembler.placeholder(book);
+            List<RecipeCollection> placeholder = CollectionAssembler.placeholder(allCrafting);
             latest = cur.withCollections(placeholder);
             return placeholder;
         }
@@ -102,13 +102,13 @@ public final class ResolvePipeline {
     public static void refreshNow() {
         Minecraft mc = Minecraft.getInstance();
         if (mc.player == null) return;
-        submit(ResolveRequests.fromContext(mc.player.getRecipeBook()));
+        submit(ResolveRequests.fromContext());
     }
 
     private static void compute(ResolveRequest r) {
         try {
             long t0 = System.nanoTime();
-            var counts = CountEngine.compute(r.recipeBook(), r.gridSize(), r.snapshot(), r.modelGeneration());
+            var counts = CountEngine.compute(r.allCrafting(), r.gridSize(), r.snapshot(), r.modelGeneration());
             if (counts.isEmpty()) {
                 // Stale (model advanced / no world) — the newer queued request will follow.
                 if (ClientCraftConfig.debugLogging) {
@@ -164,14 +164,26 @@ public final class ResolvePipeline {
     }
 
     /**
-     * Submits the queued request, if any, unless it is a duplicate of the request that
-     * was just published (cacheKey encodes the inventory generation — monotonic).
+     * Submits the queued request, if any, unless it is stale relative to the
+     * request that was just published: an older inventory generation, or the
+     * exact same (generation, grid size) pair. A same-generation grid-size
+     * change is a genuine environment change and must re-run — dropping it
+     * would leave, say, 3×3 results rendered in the 2×2 grid.
      */
     private static void drainPending(long justPublishedKey) {
         ResolveRequest next = pending.getAndSet(null);
-        if (next != null && next.cacheKey() > justPublishedKey) {
+        if (next != null && !shouldDropQueued(next.cacheKey(), justPublishedKey)) {
             WORKER.submit(() -> compute(next));
         }
+    }
+
+    /** Pure drop-decision for {@link #drainPending} (unit-tested without Minecraft state). */
+    static boolean shouldDropQueued(long queuedKey, long justPublishedKey) {
+        long queuedGen = ResolveRequest.generationOf(queuedKey);
+        long pubGen = ResolveRequest.generationOf(justPublishedKey);
+        return queuedGen < pubGen
+                || (queuedGen == pubGen
+                    && ResolveRequest.gridSizeOf(queuedKey) == ResolveRequest.gridSizeOf(justPublishedKey));
     }
 
     /** Clears everything (world leave / config change). */

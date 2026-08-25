@@ -2,9 +2,7 @@ package com.clientcraftmk4.pipeline;
 
 import com.clientcraftmk4.core.CountEngine;
 import com.clientcraftmk4.mixin.accessor.RecipeCollectionAccessor;
-import net.minecraft.client.ClientRecipeBook;
 import net.minecraft.client.gui.screens.recipebook.RecipeCollection;
-import net.minecraft.client.gui.screens.recipebook.SearchRecipeBookCategory;
 import net.minecraft.world.item.crafting.display.RecipeDisplayEntry;
 import net.minecraft.world.item.crafting.display.RecipeDisplayId;
 
@@ -25,9 +23,9 @@ public final class CollectionAssembler {
     private CollectionAssembler() {}
 
     /** Uncounted placeholder collections so the tab is populated on first open. */
-    public static List<RecipeCollection> placeholder(ClientRecipeBook book) {
+    public static List<RecipeCollection> placeholder(List<RecipeCollection> allCrafting) {
         List<RecipeCollection> out = new ArrayList<>();
-        for (RecipeCollection coll : book.getCollection(SearchRecipeBookCategory.CRAFTING)) {
+        for (RecipeCollection coll : allCrafting) {
             List<RecipeDisplayEntry> entries = coll.getRecipes();
             if (entries.isEmpty()) continue;
             RecipeCollection nc = new RecipeCollection(entries);
@@ -39,7 +37,7 @@ public final class CollectionAssembler {
     }
 
     public static ResolveResult assemble(ResolveRequest r, CountEngine.CraftCounts c) {
-        List<RecipeCollection> allCrafting = r.recipeBook().getCollection(SearchRecipeBookCategory.CRAFTING);
+        List<RecipeCollection> allCrafting = r.allCrafting();
         List<RecipeCollection> result = new ArrayList<>();
         Map<RecipeCollection, Integer> ranks = new IdentityHashMap<>();
         Set<RecipeCollection> autoCraft = new HashSet<>();

@@ -1,7 +1,7 @@
 package com.clientcraftmk4.mixin;
 
 import com.clientcraftmk4.core.CraftModel;
-import com.clientcraftmk4.core.RecipeDisplays;
+import com.clientcraftmk4.core.RecipeIndex;
 import com.clientcraftmk4.craft.AutoCrafter;
 import com.clientcraftmk4.mixin.accessor.RecipeBookComponentAccessor;
 import com.clientcraftmk4.pipeline.ResolvePipeline;
@@ -15,7 +15,6 @@ import net.minecraft.client.gui.screens.recipebook.RecipeBookComponent;
 import net.minecraft.client.gui.screens.recipebook.RecipeBookPage;
 import net.minecraft.client.gui.screens.recipebook.RecipeBookTabButton;
 import net.minecraft.client.gui.screens.recipebook.RecipeCollection;
-import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.crafting.display.RecipeDisplayEntry;
 import net.minecraft.world.item.crafting.display.RecipeDisplayId;
 //? if <26.3-snapshot-7 {
@@ -92,7 +91,10 @@ public class RecipeBookComponentMixin {
         for (RecipeDisplayEntry entry : results.getRecipes()) {
             if (entry.id().equals(recipeId)) { target = entry; break; }
         }
-        if (target == null) return;
+        if (target == null) {
+            cir.setReturnValue(false);
+            return;
+        }
 
         //? if >=26.3-snapshot-7 {
         boolean ctrlHeld = Minecraft.getInstance().hasControlDown();
@@ -159,13 +161,11 @@ public class RecipeBookComponentMixin {
         if (model != null) {
             String query = searchBox != null ? searchBox.getValue().toLowerCase(Locale.ROOT) : "";
             if (!query.isEmpty()) {
+                RecipeIndex index = model.recipeIndex();
                 filtered.removeIf(coll -> {
                     for (RecipeDisplayEntry entry : coll.getRecipes()) {
-                        ItemStack result = RecipeDisplays.resolveResult(entry.display(), model.tagIndex());
-                        if (!result.isEmpty()) {
-                            String name = model.recipeIndex().getLowerCaseName(result.getItem());
-                            if (name.contains(query)) return false;
-                        }
+                        String name = index.lowerCaseDisplayName(entry);
+                        if (!name.isEmpty() && name.contains(query)) return false;
                     }
                     return true;
                 });

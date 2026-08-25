@@ -11,6 +11,7 @@ import com.clientcraftmk4.core.WorkMap;
 import com.clientcraftmk4.core.resolver.ResolveContext;
 import com.clientcraftmk4.mixin.accessor.RecipeCollectionAccessor;
 import com.clientcraftmk4.pipeline.ResolvePipeline;
+import com.clientcraftmk4.pipeline.ResolveResult;
 import net.minecraft.client.gui.screens.recipebook.RecipeCollection;
 import net.minecraft.tags.TagKey;
 import net.minecraft.world.item.Item;
@@ -52,6 +53,16 @@ public final class OverlayBuilder {
     }
 
     private static IngredientGrid activeGrid;
+    private static CraftabilityCache craftabilityCache;
+
+    /**
+     * Memoisation key for the craftability pass. Grid contents are pinned by
+     * identity (a new grid instance is built for every variant switch), and the
+     * resolve-result reference pins the container-available set — so the pass
+     * reruns only when an input that can change its outcome has changed.
+     */
+    private record CraftabilityCache(IngredientGrid grid, long snapshotGeneration,
+                                     long modelGeneration, int gridSize, ResolveResult result) {}
 
     private OverlayBuilder() {}
 
@@ -61,6 +72,7 @@ public final class OverlayBuilder {
 
     public static void clearActiveGrid() {
         activeGrid = null;
+        craftabilityCache = null;
     }
 
     public static RecipeCollection buildIngredientCollection(RecipeDisplayEntry originalEntry) {
@@ -76,18 +88,36 @@ public final class OverlayBuilder {
         IngredientGrid grid = new IngredientGrid();
         Arrays.fill(grid.items, ItemStack.EMPTY);
         fillGrid(grid, display, slots, model, gridSize, snap);
-        computeGridCraftability(grid, model, gridSize, snap);
 
         activeGrid = grid;
+        refreshActiveGridCraftability();
         return buildFakeCollection(grid, originalEntry);
     }
 
+    /**
+     * Refreshes the active grid's craftability/container tints. Called every
+     * frame from the overlay's render-state extraction; the memoisation above
+     * keeps the common case (nothing changed) allocation-free.
+     */
     public static void refreshActiveGridCraftability() {
-        if (activeGrid != null) {
-            CraftModel model = CraftModel.current();
-            if (model == null) return;
-            computeGridCraftability(activeGrid, model, GameContext.gridSize(), InventoryProvider.current());
+        IngredientGrid grid = activeGrid;
+        if (grid == null) return;
+        CraftModel model = CraftModel.current();
+        if (model == null) return;
+        int gridSize = GameContext.gridSize();
+        InventorySnapshot snap = InventoryProvider.current();
+        ResolveResult result = ResolvePipeline.current();
+        CraftabilityCache cached = craftabilityCache;
+        if (cached != null && cached.grid() == grid
+                && cached.snapshotGeneration() == snap.generation()
+                && cached.modelGeneration() == model.modelGeneration()
+                && cached.gridSize() == gridSize
+                && cached.result() == result) {
+            return;
         }
+        computeGridCraftability(grid, model, gridSize, snap, result.containerAvailableItems());
+        craftabilityCache = new CraftabilityCache(
+                grid, snap.generation(), model.modelGeneration(), gridSize, result);
     }
 
     // --- Grid filling (plan §5.8 G1/G2) ---
@@ -169,9 +199,9 @@ public final class OverlayBuilder {
 
     // --- Craftability / container tints (plan §5.8 G3/G4) ---
 
-    private static void computeGridCraftability(IngredientGrid grid, CraftModel model, int gridSize, InventorySnapshot snap) {
+    private static void computeGridCraftability(IngredientGrid grid, CraftModel model, int gridSize,
+                                                InventorySnapshot snap, Set<Item> containerAvailable) {
         Map<Item, Integer> remaining = new HashMap<>(snap.inventory());
-        Set<Item> containerAvailable = ResolvePipeline.current().containerAvailableItems();
         boolean hasContainer = !containerAvailable.isEmpty();
 
         for (int i = 0; i < 9; i++) {
