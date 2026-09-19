@@ -24,18 +24,18 @@ public final class RecipeDisplays {
 
     public static List<SlotDisplay> getSlots(RecipeDisplay display) {
         if (display instanceof ShapedCraftingRecipeDisplay s) {
-            //? if >=26.3-snapshot-7 {
+            //? if >=26.3 {
             return s.ingredients().stream().map(RecipeDisplays::normalize).toList();
             //?}
-            //? if <26.3-snapshot-7 {
+            //? if <26.3 {
             /*return s.ingredients();*/
             //?}
         }
         if (display instanceof ShapelessCraftingRecipeDisplay s) {
-            //? if >=26.3-snapshot-7 {
+            //? if >=26.3 {
             return s.ingredients().stream().map(RecipeDisplays::normalize).toList();
             //?}
-            //? if <26.3-snapshot-7 {
+            //? if <26.3 {
             /*return s.ingredients();*/
             //?}
         }
@@ -47,7 +47,7 @@ public final class RecipeDisplays {
      * item slots so tag-only logic never sees them (26.2 built them as Composites).
      */
     public static SlotDisplay normalize(SlotDisplay slot) {
-        //? if >=26.3-snapshot-7 {
+        //? if >=26.3 {
         if (slot instanceof SlotDisplay.TagSlotDisplay d && d.tag().unwrapKey().isEmpty()) {
             return new SlotDisplay.Composite(d.tag().stream()
                     .map(h -> (SlotDisplay) new SlotDisplay.ItemSlotDisplay(h))
@@ -61,7 +61,7 @@ public final class RecipeDisplays {
         }
         return slot;
         //?}
-        //? if <26.3-snapshot-7 {
+        //? if <26.3 {
         /*return slot;*/
         //?}
     }
@@ -189,10 +189,10 @@ public final class RecipeDisplays {
 
     public static TagKey<Item> getSlotTag(SlotDisplay slot) {
         if (slot instanceof SlotDisplay.TagSlotDisplay d) {
-            //? if >=26.3-snapshot-7 {
+            //? if >=26.3 {
             return d.tag().unwrapKey().orElse(null);
             //?}
-            //? if <26.3-snapshot-7 {
+            //? if <26.3 {
             /*return d.tag();
             *///?}
         }

@@ -57,11 +57,11 @@ public final class InventoryProvider {
                 }
                 BundleContents bundle = stack.get(DataComponents.BUNDLE_CONTENTS);
                 if (bundle != null) {
-                    //? if >=26.3-snapshot-7 {
+                    //? if >=26.3 {
                     bundle.itemCopies().forEach(contained ->
                             cont.merge(contained.getItem(), contained.getCount(), Integer::sum));
                     //?}
-                    //? if <26.3-snapshot-7 {
+                    //? if <26.3 {
                     /*bundle.itemCopyStream().forEach(contained ->
                             cont.merge(contained.getItem(), contained.getCount(), Integer::sum));
                     *///?}

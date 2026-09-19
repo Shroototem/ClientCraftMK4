@@ -31,7 +31,7 @@ tasks.withType(Test).configureEach {
     useJUnitPlatform()
 }
 
-// ~X.Y- : allows snapshots of X.Y and blocks newer minors (e.g. 26.3-snapshot-7 -> "~26.3-")
+// ~X.Y- : allows snapshots of X.Y and blocks newer minors (e.g. 26.3 -> "~26.3-")
 def mcPredicate = {
     def parts = stonecutter.current.version.toString().replaceAll(/-snapshot.*$/, '').tokenize('.')
     return "~" + parts[0..Math.min(1, parts.size() - 1)].join('.') + "-"

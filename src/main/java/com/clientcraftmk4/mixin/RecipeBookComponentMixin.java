@@ -17,7 +17,7 @@ import net.minecraft.client.gui.screens.recipebook.RecipeBookTabButton;
 import net.minecraft.client.gui.screens.recipebook.RecipeCollection;
 import net.minecraft.world.item.crafting.display.RecipeDisplayEntry;
 import net.minecraft.world.item.crafting.display.RecipeDisplayId;
-//? if <26.3-snapshot-7 {
+//? if <26.3 {
 /*import org.lwjgl.glfw.GLFW;
 *///?}
 import org.spongepowered.asm.mixin.Final;
@@ -96,10 +96,10 @@ public class RecipeBookComponentMixin {
             return;
         }
 
-        //? if >=26.3-snapshot-7 {
+        //? if >=26.3 {
         boolean ctrlHeld = Minecraft.getInstance().hasControlDown();
         //?}
-        //? if <26.3-snapshot-7 {
+        //? if <26.3 {
         /*long window = Minecraft.getInstance().getWindow().handle();
         boolean ctrlHeld = GLFW.glfwGetKey(window, GLFW.GLFW_KEY_LEFT_CONTROL) == GLFW.GLFW_PRESS
                 || GLFW.glfwGetKey(window, GLFW.GLFW_KEY_RIGHT_CONTROL) == GLFW.GLFW_PRESS;
