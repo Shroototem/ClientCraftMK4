@@ -121,4 +121,32 @@ class WorkMapTest {
         assertEquals(64, new WorkMap(64).capacity());
         assertEquals(16, new WorkMap(1).capacity(), "capacity is floored at 16");
     }
+
+    @Test
+    void ensureCapacityGrowsInsteadOfDroppingState() {
+        WorkMap wm = new WorkMap(16);
+        wm.add(5, 3);
+        wm.ensureCapacity(1112);
+        assertTrue(wm.capacity() >= 1112);
+        assertEquals(3, wm.get(5), "existing counts must survive growth");
+        // High ids usable after growth (old resetTo silently no-op'd when undersized).
+        wm.add(1000, 7);
+        assertEquals(7, wm.get(1000));
+        int mark = wm.mark();
+        wm.consume(1000, 2);
+        assertEquals(5, wm.get(1000));
+        wm.rollbackTo(mark);
+        assertEquals(7, wm.get(1000));
+    }
+
+    @Test
+    void presentListSurvivesGrowth() {
+        WorkMap wm = new WorkMap(16);
+        wm.add(3, 1);
+        wm.ensureCapacity(512);
+        wm.add(400, 2);
+        assertEquals(1, wm.get(3));
+        assertEquals(2, wm.get(400));
+        assertTrue(wm.presentSize() >= 2);
+    }
 }

@@ -3,6 +3,7 @@ package com.clientcraftmk4.core.resolver;
 import com.clientcraftmk4.core.Constants;
 import com.clientcraftmk4.core.CraftModel;
 import com.clientcraftmk4.core.RecipeGraph.GraphFlatData;
+import com.clientcraftmk4.core.InventoryProvider;
 import com.clientcraftmk4.core.RecipeDisplays;
 import com.clientcraftmk4.core.RecipeGraph;
 import com.clientcraftmk4.core.RecipeIndex;
@@ -15,7 +16,10 @@ import net.minecraft.world.item.crafting.display.RecipeDisplayEntry;
 import net.minecraft.world.item.crafting.display.RecipeDisplayId;
 import net.minecraft.world.item.crafting.display.SlotDisplay;
 
+import java.util.BitSet;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -61,15 +65,50 @@ public final class QtyResolveContext {
         return gridSize;
     }
 
+    /**
+     * Memoised recipe outputs, keyed by live-inventory-map identity (same scheme as
+     * {@link ResolveContext}: the published map is never mutated, so identity is an exact
+     * change detector and the cache reproduces uncached behavior exactly).
+     */
+    private Map<Item, Integer> outBasis = null;
+    private final Map<RecipeDisplayId, ResolvedOutput> outCache = new HashMap<>();
+
+    private record ResolvedOutput(Item item, int count) {}
+
+    /** Recipe output item under the live inventory (null = unresolvable), memoised. */
+    public Item outItem(RecipeDisplayEntry entry) {
+        return outFor(entry).item();
+    }
+
+    /** Recipe output count under the live inventory (0 = unresolvable), memoised. */
+    public int outCount(RecipeDisplayEntry entry) {
+        return outFor(entry).count();
+    }
+
+    private ResolvedOutput outFor(RecipeDisplayEntry entry) {
+        Map<Item, Integer> live = InventoryProvider.latest().inventory();
+        if (live != outBasis) {
+            outCache.clear();
+            outBasis = live;
+        }
+        ResolvedOutput o = outCache.get(entry.id());
+        if (o == null) {
+            ItemStack s = RecipeDisplays.resolveSlot(entry.display().result(), live, tags, false);
+            o = s.isEmpty() ? new ResolvedOutput(null, 0) : new ResolvedOutput(s.getItem(), s.getCount());
+            outCache.put(entry.id(), o);
+        }
+        return o;
+    }
+
     public boolean resolveQty(RecipeDisplayEntry entry, WorkMap work, int qty,
                               List<RecipeDisplayId> stepsOut, Set<Item> inProgress,
                               int depth, Item rootOutput) {
         if (depth > Constants.MAX_DEPTH || qty <= 0) return false;
 
-        List<SlotDisplay> slots = RecipeDisplays.getSlots(entry.display());
+        List<SlotDisplay> slots = RecipeDisplays.getSlots(entry);
         if (slots == null || slots.isEmpty()) return false;
 
-        Item outputItem = RecipeDisplays.getOutputItem(entry.display(), tags);
+        Item outputItem = outItem(entry);
         if (outputItem != null && !inProgress.add(outputItem)) return false;
         if (rootOutput == null) rootOutput = outputItem;
 
@@ -79,14 +118,14 @@ public final class QtyResolveContext {
         for (SlotDisplay slot : slots) {
             if (slot instanceof SlotDisplay.Empty) continue;
 
-            ItemStack resolved = resolveSlot(slot, work);
-            if (resolved.isEmpty()) {
+            // Item fast path: no ItemStack alloc per slot (see RecipeDisplays.resolveSlotItem).
+            Item item = RecipeDisplays.resolveSlotItem(slot, work, graph, tags);
+            if (item == null) {
                 work.rollbackTo(mark);
                 rollbackSteps(stepsOut, stepsStart);
                 if (outputItem != null) inProgress.remove(outputItem);
                 return false;
             }
-            Item item = resolved.getItem();
             int id = graph.id(item);
             int need = qty;
 
@@ -119,9 +158,11 @@ public final class QtyResolveContext {
         for (int i = 0, len = subs.size(); i < len; i++) {
             RecipeDisplayEntry sub = subs.get(i);
             if (!RecipeDisplays.fitsInGrid(sub.display(), gridSize)) continue;
-            int subOutput = RecipeDisplays.getOutputCount(sub.display(), tags);
+            int subOutput = outCount(sub);
             if (subOutput <= 0) continue;
-            if (rootOutput != null && RecipeDisplays.recipeConsumesItem(sub, rootOutput)) continue;
+            // Precomputed required set (pure slot-tree function, see RecipeIndex):
+            // one contains instead of a slot walk per candidate per deficit per attempt.
+            if (rootOutput != null && index.requiredItems(sub).contains(rootOutput)) continue;
 
             int crafts = (deficit + subOutput - 1) / subOutput;
             int mark = work.mark();    // MK4: full-map copy per alternative — now O(1)
@@ -145,12 +186,14 @@ public final class QtyResolveContext {
             TagKey<Item> tag = RecipeDisplays.getSlotTag(d);
             int need = deficit;
             GraphFlatData f = graph.flat();
+            BitSet bits = tags.flatTagBits(tag);
             for (int i = 0; i < work.presentSize() && need > 0; i++) {
                 int pid = work.presentIdAt(i);
                 if (work.get(pid) < 1) continue;
                 Item it = f.idToItem()[pid];
                 if (it.equals(alreadyTried)) continue;
-                if (it.builtInRegistryHolder().is(tag)) {
+                boolean matches = bits != null ? bits.get(pid) : it.builtInRegistryHolder().is(tag);
+                if (matches) {
                     int take = Math.min(need, work.get(pid));
                     work.consume(pid, take);
                     need -= take;
@@ -171,9 +214,8 @@ public final class QtyResolveContext {
             int need = deficit;
             for (SlotDisplay sub : d.contents()) {
                 if (need <= 0) break;
-                ItemStack r = resolveSlot(sub, work);
-                if (r.isEmpty() || r.getItem().equals(alreadyTried)) continue;
-                Item it = r.getItem();
+                Item it = RecipeDisplays.resolveSlotItem(sub, work, graph, tags);
+                if (it == null || it.equals(alreadyTried)) continue;
                 int id = graph.id(it);
                 int have = work.get(id);
                 int take = Math.min(need, have);
@@ -183,44 +225,6 @@ public final class QtyResolveContext {
             return need <= 0;
         }
         return false;
-    }
-
-    private ItemStack resolveSlot(SlotDisplay slot, WorkMap work) {
-        if (slot instanceof SlotDisplay.Empty) return ItemStack.EMPTY;
-        if (slot instanceof SlotDisplay.ItemSlotDisplay d) return new ItemStack(d.item());
-        if (slot instanceof SlotDisplay.ItemStackSlotDisplay d) {
-            return new ItemStack(d.stack().item().value(), d.stack().count());
-        }
-        if (slot instanceof SlotDisplay.TagSlotDisplay d) {
-            TagKey<Item> tag = RecipeDisplays.getSlotTag(d);
-            Set<Item> matches = tags.inventoryTagMembers(tag);
-            if (matches != null) {
-                for (Item item : matches) {
-                    if (work.get(graph.id(item)) > 0) return new ItemStack(item);
-                }
-            }
-            List<Item> craft = tags.craftableMembers(tag);
-            if (craft != null) {
-                for (Item item : craft) {
-                    if (work.get(graph.id(item)) > 0) return new ItemStack(item);
-                }
-            }
-            if (craft != null && !craft.isEmpty()) return new ItemStack(craft.getFirst());
-            return tags.anyTagMember(tag);
-        }
-        if (slot instanceof SlotDisplay.WithRemainder d) return resolveSlot(d.input(), work);
-        if (slot instanceof SlotDisplay.Composite d) {
-            ItemStack fallback = ItemStack.EMPTY;
-            for (SlotDisplay sub : d.contents()) {
-                ItemStack r = resolveSlot(sub, work);
-                if (!r.isEmpty()) {
-                    if (work.get(graph.id(r.getItem())) > 0) return r;
-                    if (fallback.isEmpty()) fallback = r;
-                }
-            }
-            return fallback;
-        }
-        return ItemStack.EMPTY;
     }
 
     private static void rollbackSteps(List<RecipeDisplayId> stepsOut, int stepsStart) {

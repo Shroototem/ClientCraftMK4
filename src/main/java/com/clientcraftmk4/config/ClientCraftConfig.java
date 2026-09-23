@@ -2,6 +2,7 @@ package com.clientcraftmk4.config;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import com.google.gson.JsonSyntaxException;
 import net.fabricmc.loader.api.FabricLoader;
 
 import java.io.IOException;
@@ -9,6 +10,7 @@ import java.io.Reader;
 import java.io.Writer;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 
 /**
  * JSON config with identical field semantics to MK4 (plan §5.6 / §16).
@@ -32,7 +34,9 @@ public class ClientCraftConfig {
     private static Data read(Path path) {
         try (Reader reader = Files.newBufferedReader(path)) {
             return GSON.fromJson(reader, Data.class);
-        } catch (IOException e) {
+        } catch (IOException | JsonSyntaxException e) {
+            // Malformed JSON previously escaped and killed onInitializeClient; fall back
+            // to defaults instead (normal-path behavior unchanged).
             return null;
         }
     }
@@ -50,9 +54,21 @@ public class ClientCraftConfig {
         data.searchContainers = searchContainers;
         data.quickCountMode = quickCountMode;
         data.debugLogging = debugLogging;
-        try (Writer writer = Files.newBufferedWriter(CONFIG_PATH)) {
+        // Atomic write: a crash mid-save previously left a truncated
+        // clientcraftmk4.json behind. Same file content on success.
+        Path tmp = CONFIG_PATH.resolveSibling(CONFIG_PATH.getFileName() + ".tmp");
+        try (Writer writer = Files.newBufferedWriter(tmp)) {
             GSON.toJson(data, writer);
-        } catch (IOException ignored) {}
+        } catch (IOException ignored) {
+            return;
+        }
+        try {
+            Files.move(tmp, CONFIG_PATH, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException atomicFailed) {
+            try {
+                Files.move(tmp, CONFIG_PATH, StandardCopyOption.REPLACE_EXISTING);
+            } catch (IOException ignored) {}
+        }
     }
 
     private static class Data {

@@ -2,6 +2,7 @@ package com.clientcraftmk4.core;
 
 import net.minecraft.world.item.Item;
 
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -18,8 +19,10 @@ public record InventorySnapshot(
     public static final InventorySnapshot EMPTY = new InventorySnapshot(Map.of(), Map.of(), 0);
 
     public InventorySnapshot {
-        inventory = Map.copyOf(inventory);
-        container = Map.copyOf(container);
+        // The sole producer (InventoryProvider) builds fresh maps per read and never mutates
+        // them afterwards, so a view suffices — Map.copyOf rehashed both maps on every frame.
+        inventory = Collections.unmodifiableMap(inventory);
+        container = Collections.unmodifiableMap(container);
     }
 
     public boolean isEmpty() {

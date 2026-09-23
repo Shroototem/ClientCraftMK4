@@ -24,7 +24,7 @@ public final class CollectionAssembler {
 
     /** Uncounted placeholder collections so the tab is populated on first open. */
     public static List<RecipeCollection> placeholder(List<RecipeCollection> allCrafting) {
-        List<RecipeCollection> out = new ArrayList<>();
+        List<RecipeCollection> out = new ArrayList<>(allCrafting.size());
         for (RecipeCollection coll : allCrafting) {
             List<RecipeDisplayEntry> entries = coll.getRecipes();
             if (entries.isEmpty()) continue;
@@ -38,18 +38,19 @@ public final class CollectionAssembler {
 
     public static ResolveResult assemble(ResolveRequest r, CountEngine.CraftCounts c) {
         List<RecipeCollection> allCrafting = r.allCrafting();
-        List<RecipeCollection> result = new ArrayList<>();
-        Map<RecipeCollection, Integer> ranks = new IdentityHashMap<>();
-        Set<RecipeCollection> autoCraft = new HashSet<>();
-        Map<RecipeDisplayId, Integer> counts = new HashMap<>();
+        List<RecipeCollection> result = new ArrayList<>(allCrafting.size());
+        Map<RecipeCollection, Integer> ranks = new IdentityHashMap<>(allCrafting.size() + 1);
+        Set<RecipeCollection> autoCraft = new HashSet<>(allCrafting.size() + 1);
+        Map<RecipeDisplayId, Integer> counts =
+                new HashMap<>((int) (c.counts().size() / 0.75f) + 1);
 
         List<List<RecipeDisplayEntry>> collAllEntries = c.collAllEntries();
         for (int i = 0; i < allCrafting.size(); i++) {
             List<RecipeDisplayEntry> allEntries = collAllEntries.get(i);
             if (allEntries.isEmpty()) continue;
 
-            List<RecipeDisplayEntry> direct = new ArrayList<>();
-            List<RecipeDisplayEntry> containerOnly = new ArrayList<>();
+            List<RecipeDisplayEntry> direct = new ArrayList<>(allEntries.size());
+            List<RecipeDisplayEntry> containerOnly = new ArrayList<>(4);
 
             for (RecipeDisplayEntry entry : allEntries) {
                 int finalCount = c.counts().getOrDefault(entry.id(), 0);
@@ -79,15 +80,16 @@ public final class CollectionAssembler {
         autoCraft.addAll(result);
 
         return new ResolveResult(result, counts, c.containerCraftable(), c.containerAvailableItems(),
-                ranks, autoCraft, r.cacheKey(), r.snapshot().generation(), r.modelGeneration());
+                ranks, autoCraft, r.cacheKey(), r.snapshot().generation(), r.modelGeneration(), r.snapshot());
     }
 
     private static RecipeCollection addCollection(List<RecipeCollection> out,
-                                                  List<RecipeDisplayEntry> entries, CountEngine.CraftCounts c) {
+                                                   List<RecipeDisplayEntry> entries, CountEngine.CraftCounts c) {
         RecipeCollection nc = new RecipeCollection(entries);
         RecipeCollectionAccessor acc = (RecipeCollectionAccessor) nc;
-        for (RecipeDisplayEntry e : entries) acc.displayable().add(e.id());
+        // Single pass (was one loop per flag list).
         for (RecipeDisplayEntry e : entries) {
+            acc.displayable().add(e.id());
             if (c.counts().getOrDefault(e.id(), 0) > 0 || c.containerCraftable().contains(e.id())) {
                 acc.craftable().add(e.id());
             }

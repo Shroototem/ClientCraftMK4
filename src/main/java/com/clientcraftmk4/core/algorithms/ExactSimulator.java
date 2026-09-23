@@ -31,12 +31,34 @@ public final class ExactSimulator {
 
     private ExactSimulator() {}
 
-    /** The largest k in [0, maxCrafts] such that {@code tryResolveQty(entry, inventory, k)} succeeds. */
+    /**
+     * The largest k in [0, maxCrafts] such that {@code tryResolveQty(entry, inventory, k)} succeeds.
+     *
+     * <p>Two monotonicity-based shortcuts over the naive binary search (feasibility only shrinks
+     * with k, so all three preserve the exact result):
+     * <ol>
+     *   <li>Probe {@code k=1} first. Most simulations fail (the DP said 0 and was right), and the
+     *       naive search proves that with ~10 top-down attempts — the first at a huge k, which is
+     *       the single most expensive attempt. One tiny probe decides every failure.</li>
+     *   <li>Seed {@code lo} from {@code loHint} (the caller's direct-only craft count), verified
+     *       by an actual attempt — never trusted blindly, so an over-estimating hint only costs
+     *       one attempt and can never corrupt the result.</li>
+     * </ol>
+     */
     public static int simulateCraftCount(CraftModel model, int gridSize,
                                          RecipeDisplayEntry entry, Map<Item, Integer> inventory,
-                                         int maxCrafts) {
+                                         int maxCrafts, int loHint) {
         if (maxCrafts <= 0 || inventory == null || inventory.isEmpty()) return 0;
-        int lo = 0, hi = maxCrafts;
+        int hi = maxCrafts;
+        int lo = 0;
+        int hint = Math.min(loHint, hi - 1);
+        if (hint > 0 && tryResolveQty(model, gridSize, entry, inventory, hint)) {
+            lo = hint;
+        }
+        if (lo == 0) {
+            if (!tryResolveQty(model, gridSize, entry, inventory, 1)) return 0;
+            lo = 1;
+        }
         while (lo < hi) {
             int mid = lo + (hi - lo + 1) / 2;
             if (tryResolveQty(model, gridSize, entry, inventory, mid)) {
@@ -46,6 +68,13 @@ public final class ExactSimulator {
             }
         }
         return lo;
+    }
+
+    /** Backwards-compatible entry point without a lower-bound hint (probes from scratch). */
+    public static int simulateCraftCount(CraftModel model, int gridSize,
+                                         RecipeDisplayEntry entry, Map<Item, Integer> inventory,
+                                         int maxCrafts) {
+        return simulateCraftCount(model, gridSize, entry, inventory, maxCrafts, 0);
     }
 
     /** Single resolve() attempt against a fresh copy of the given inventory. */

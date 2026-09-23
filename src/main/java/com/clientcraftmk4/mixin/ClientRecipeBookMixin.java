@@ -29,5 +29,8 @@ public class ClientRecipeBookMixin {
     private void clientcraft$onRecipesRefreshed(CallbackInfo ci) {
         CraftModel.markDirty();
         ResolvePipeline.resetLatest();
+        // Caches are cold after a sync: warm them on the worker as soon as the world is
+        // ready (tick), instead of paying the cold resolve on first tab open.
+        ResolvePipeline.requestWarmup();
     }
 }

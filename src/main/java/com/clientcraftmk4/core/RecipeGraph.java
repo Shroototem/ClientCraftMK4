@@ -1,5 +1,6 @@
 package com.clientcraftmk4.core;
 
+import net.minecraft.tags.TagKey;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.crafting.display.RecipeDisplayId;
 
@@ -72,6 +73,11 @@ public record RecipeGraph(
             int totalEdges,
             int[] edgeCnt, int[] edgeOptStart, int[] edgeOptEnd,
             int totalOpts,
-            int[] optItemId, Item[] optItemObj
+            int[] optItemId, Item[] optItemObj,
+            // Incremental-resolve support (built once per model, read every resolve):
+            // itemId -> parent output itemIds (dependents, as flat ids), and
+            // tag -> recipe indices using that tag (for tag-propagation of dirtiness).
+            int[][] dependentItems,
+            Map<TagKey<Item>, int[]> tagRecIdx
     ) {}
 }

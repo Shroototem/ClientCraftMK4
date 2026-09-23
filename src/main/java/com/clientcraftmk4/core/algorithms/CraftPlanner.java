@@ -39,14 +39,56 @@ import java.util.Set;
  * {@code (recipeId, mode, inventoryGeneration, modelGeneration, gridSize)}.
  */
 public final class CraftPlanner {
-    private static final Logger LOG = LoggerFactory.getLogger("clientcraftmk4");
+    private static final Logger LOG = LoggerFactory.getLogger(com.clientcraftmk4.core.Constants.MOD_ID);
 
-    private record PlanKey(RecipeDisplayId id, AutoCrafter.Mode mode, long invGen, long modelGen, int gridSize) {}
+    /**
+     * Cache key with a precomputed hash: the record version rehashed 5 fields (including
+     * a RecipeDisplayId) on every lookup. Lookups happen per craft click; the fields are
+     * immutable so hashing once at construction is exactly equivalent.
+     */
+    private static final class PlanKey {
+        final RecipeDisplayId id;
+        final AutoCrafter.Mode mode;
+        final long invGen;
+        final long modelGen;
+        final int gridSize;
+        final int hash;
 
-    private static final LinkedHashMap<PlanKey, AutoCrafter.CraftPlan> planCache = new LinkedHashMap<>(16, 0.75f, true) {
+        PlanKey(RecipeDisplayId id, AutoCrafter.Mode mode, long invGen, long modelGen, int gridSize) {
+            this.id = id;
+            this.mode = mode;
+            this.invGen = invGen;
+            this.modelGen = modelGen;
+            this.gridSize = gridSize;
+            int h = id.hashCode();
+            h = 31 * h + mode.hashCode();
+            h = 31 * h + Long.hashCode(invGen);
+            h = 31 * h + Long.hashCode(modelGen);
+            h = 31 * h + Integer.hashCode(gridSize);
+            this.hash = h;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (!(o instanceof PlanKey k)) return false;
+            return hash == k.hash && gridSize == k.gridSize && invGen == k.invGen
+                    && modelGen == k.modelGen && mode == k.mode && id.equals(k.id);
+        }
+
+        @Override
+        public int hashCode() {
+            return hash;
+        }
+    }
+
+    // Guarded by its own lock: plan() can race craft clicks against the stabilizing
+    // tick handler. Cap raised 8 -> 32: ALL/STACK cycling thrashed the old cap and
+    // recomputed 999-deep plans from scratch on every miss.
+    private static final LinkedHashMap<PlanKey, AutoCrafter.CraftPlan> planCache = new LinkedHashMap<>(32, 0.75f, true) {
         @Override
         protected boolean removeEldestEntry(Map.Entry<PlanKey, AutoCrafter.CraftPlan> eldest) {
-            return size() > 8;
+            return size() > 32;
         }
     };
 
@@ -62,11 +104,17 @@ public final class CraftPlanner {
         InventorySnapshot snap = InventoryProvider.current();
 
         PlanKey key = new PlanKey(target.id(), mode, snap.generation(), model.modelGeneration(), gridSize);
-        AutoCrafter.CraftPlan cached = planCache.get(key);
-        if (cached != null) return cached;
+        synchronized (planCache) {
+            AutoCrafter.CraftPlan cached = planCache.get(key);
+            if (cached != null) return cached;
+        }
 
         AutoCrafter.CraftPlan plan = buildPlan(target, mode, model, gridSize, snap);
-        if (plan != null) planCache.put(key, plan);
+        if (plan != null) {
+            synchronized (planCache) {
+                planCache.put(key, plan);
+            }
+        }
         return plan;
     }
 
@@ -75,8 +123,11 @@ public final class CraftPlanner {
         long t0 = ClientCraftConfig.debugLogging ? System.nanoTime() : 0;
 
         WorkMap available = WorkMap.from(snap.inventory(), model.graph());
+        // One shared context per plan: the old code built a fresh ResolveContext per repeat
+        // (up to 999x per ALL click); the context is stateless w.r.t. the work map.
+        ResolveContext ctx = ResolveContext.of(model, gridSize);
         List<RecipeDisplayId> firstSteps = new ArrayList<>();
-        if (!ResolveContext.of(model, gridSize).resolve(target, available, firstSteps, new HashSet<>(), 0, null)) {
+        if (!ctx.resolve(target, available, firstSteps, new HashSet<>(), 0, null)) {
             return null;
         }
 
@@ -99,7 +150,7 @@ public final class CraftPlanner {
             return new AutoCrafter.CraftPlan(List.of(firstSteps), false);
         }
 
-        List<List<RecipeDisplayId>> cycles = new ArrayList<>();
+        List<List<RecipeDisplayId>> cycles = new ArrayList<>(Math.min(maxRepeats, 64));
         cycles.add(firstSteps);
 
         if (directCraft) {
@@ -119,23 +170,28 @@ public final class CraftPlanner {
             deductDirect(needed, available, model);
             for (int r = directCount; r < maxRepeats; r++) {
                 List<RecipeDisplayId> steps = new ArrayList<>();
-                if (!ResolveContext.of(model, gridSize).resolve(target, available, steps, new HashSet<>(), 0, null)) break;
+                if (!ctx.resolve(target, available, steps, new HashSet<>(), 0, null)) break;
                 cycles.add(steps);
             }
         } else {
             for (int r = 1; r < maxRepeats; r++) {
                 List<RecipeDisplayId> steps = new ArrayList<>();
-                if (!ResolveContext.of(model, gridSize).resolve(target, available, steps, new HashSet<>(), 0, null)) break;
+                if (!ctx.resolve(target, available, steps, new HashSet<>(), 0, null)) break;
                 cycles.add(steps);
             }
         }
 
         // Direct craft flag only applies if ALL cycles are single-step direct.
-        boolean allDirect = directCraft && cycles.stream().allMatch(c -> c.size() == 1);
+        // Single loop (was 2 stream passes with spliterator+lambda allocs).
+        boolean allDirect = directCraft;
+        int totalSteps = 0;
+        for (List<RecipeDisplayId> c : cycles) {
+            totalSteps += c.size();
+            if (c.size() != 1) allDirect = false;
+        }
 
         if (ClientCraftConfig.debugLogging) {
             long elapsed = System.nanoTime() - t0;
-            int totalSteps = cycles.stream().mapToInt(List::size).sum();
             LOG.info("[CC] BuildCraft({}): {}ms | {} cycles, {} steps, direct={}",
                     mode, elapsed / 1_000_000, cycles.size(), totalSteps, allDirect);
         }
@@ -148,7 +204,7 @@ public final class CraftPlanner {
      */
     private static int computeDirectCrafts(RecipeDisplayEntry target, Map<Item, Integer> sim, int maxRepeats,
             Map<Object, Integer> needed, Map<Object, Integer> avail, CraftModel model, int gridSize) {
-        List<SlotDisplay> slots = RecipeDisplays.getSlots(target.display());
+        List<SlotDisplay> slots = RecipeDisplays.getSlots(target);
         if (slots == null || maxRepeats <= 0) return 0;
 
         needed.clear();
@@ -164,9 +220,8 @@ public final class CraftPlanner {
             } else if (slot instanceof SlotDisplay.Composite) {
                 return 0;
             } else {
-                ItemStack resolved = RecipeDisplays.resolveSlot(slot, sim, tags, true);
-                if (resolved.isEmpty()) return 0;
-                Item item = resolved.getItem();
+                Item item = RecipeDisplays.resolveSlotItem(slot, sim, tags, true);
+                if (item == null) return 0;
                 if (sim.getOrDefault(item, 0) <= 0) return 0;
                 needed.merge(item, 1, Integer::sum);
                 avail.putIfAbsent(item, sim.getOrDefault(item, 0));

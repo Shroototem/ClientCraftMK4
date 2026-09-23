@@ -1,6 +1,7 @@
 package com.clientcraftmk4.core;
 
 import net.minecraft.client.gui.screens.recipebook.RecipeCollection;
+import net.minecraft.tags.TagKey;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.crafting.display.RecipeDisplayEntry;
@@ -8,6 +9,7 @@ import net.minecraft.world.item.crafting.display.RecipeDisplayId;
 import net.minecraft.world.item.crafting.display.SlotDisplay;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * {@code Item → List<RecipeDisplayEntry>} in vanilla iteration order
@@ -19,10 +21,33 @@ public final class RecipeIndex {
     private final TagIndex tagIndex;
     private final Map<Item, String> lowerCaseNames = new HashMap<>();
     private final Map<RecipeDisplayId, String> entryDisplayNames = new HashMap<>();
+    private final int totalEntries;
+    /**
+     * Items some ingredient slot of the entry strictly requires (see {@link #requiredItems}).
+     * Static per entry (slot structure never changes within a model); shared across threads,
+     * so a concurrent map. Lets the resolver's sub-candidate loop replace a full slot-tree
+     * walk per candidate per deficit per attempt with one {@code contains}.
+     */
+    private final ConcurrentHashMap<RecipeDisplayId, Set<Item>> requiredCache = new ConcurrentHashMap<>();
 
-    private RecipeIndex(Map<Item, List<RecipeDisplayEntry>> byOutput, TagIndex tagIndex) {
+    /**
+     * Tags referenced per entry (pre-expansion — unlike the graph edges, this retains which
+     * tags each recipe's slots use). Built once per model; feeds the incremental-resolve
+     * tag→recipes index. Only entries with tag slots allocate.
+     */
+    private final Map<RecipeDisplayId, List<TagKey<Item>>> entryTags;
+
+    private RecipeIndex(Map<Item, List<RecipeDisplayEntry>> byOutput, TagIndex tagIndex,
+                        int totalEntries, Map<RecipeDisplayId, List<TagKey<Item>>> entryTags) {
         this.byOutput = byOutput;
         this.tagIndex = tagIndex;
+        this.totalEntries = totalEntries;
+        this.entryTags = entryTags;
+    }
+
+    /** Tags referenced by each entry's slots (entries without tag slots absent). */
+    public Map<RecipeDisplayId, List<TagKey<Item>>> entryTags() {
+        return entryTags;
     }
 
     /** Recipe entries producing {@code item}, in recipe-book order; null if none. */
@@ -40,9 +65,7 @@ public final class RecipeIndex {
 
     /** Total number of recipe entries (used to detect recipe-set changes cheaply). */
     public int totalCount() {
-        int n = 0;
-        for (List<RecipeDisplayEntry> entries : byOutput.values()) n += entries.size();
-        return n;
+        return totalEntries;
     }
 
     public String getLowerCaseName(Item item) {
@@ -63,18 +86,89 @@ public final class RecipeIndex {
         });
     }
 
+    /**
+     * Items that some ingredient slot of {@code entry} strictly requires — i.e. the set form
+     * of {@code slotRequiresItem}: single-item slots contribute their item, tag slots never do,
+     * composites contribute the intersection of their options (all must require), remainders
+     * unwrap. {@code recipeConsumesItem(entry, target)} ⟺ {@code requiredItems(entry).contains(target)}
+     * exactly (empty composite and unknown slot types contribute nothing, matching the
+     * {@code false} branches). Pure function of the slot tree: safe to share per model.
+     */
+    public Set<Item> requiredItems(RecipeDisplayEntry entry) {
+        return requiredCache.computeIfAbsent(entry.id(), id -> buildRequired(entry));
+    }
+
+    private static Set<Item> buildRequired(RecipeDisplayEntry entry) {
+        List<SlotDisplay> slots = RecipeDisplays.getSlots(entry);
+        if (slots == null || slots.isEmpty()) return Set.of();
+        Set<Item> out = null;
+        for (SlotDisplay slot : slots) {
+            Set<Item> r = requiredOf(slot);
+            if (r.isEmpty()) continue;
+            if (out == null) out = new HashSet<>(r);
+            else out.addAll(r);
+        }
+        return out == null ? Set.of() : Collections.unmodifiableSet(out);
+    }
+
+    private static Set<Item> requiredOf(SlotDisplay slot) {
+        if (slot instanceof SlotDisplay.Empty) return Set.of();
+        if (slot instanceof SlotDisplay.ItemSlotDisplay d) return Set.of(d.item().value());
+        if (slot instanceof SlotDisplay.ItemStackSlotDisplay d) return Set.of(d.stack().item().value());
+        if (slot instanceof SlotDisplay.TagSlotDisplay) return Set.of();
+        if (slot instanceof SlotDisplay.WithRemainder d) return requiredOf(d.input());
+        if (slot instanceof SlotDisplay.Composite d) {
+            if (d.contents().isEmpty()) return Set.of();
+            Set<Item> acc = null;
+            for (SlotDisplay sub : d.contents()) {
+                Set<Item> r = requiredOf(sub);
+                if (acc == null) acc = new HashSet<>(r);
+                else acc.retainAll(r);
+                if (acc.isEmpty()) break;
+            }
+            return acc == null ? Set.of() : acc;
+        }
+        return Set.of();
+    }
+
     /** Builds the index and collects the known tag set (MK4's {@code ensureIndex} body). */
     public static RecipeIndex build(List<RecipeCollection> allCrafting, TagIndex tagIndex) {
-        Map<Item, List<RecipeDisplayEntry>> index = new LinkedHashMap<>();
+        Map<Item, List<RecipeDisplayEntry>> index = new LinkedHashMap<>(1024);
+        Map<RecipeDisplayId, List<TagKey<Item>>> entryTags = new HashMap<>();
+        int total = 0;
         for (RecipeCollection coll : allCrafting) {
             for (RecipeDisplayEntry entry : coll.getRecipes()) {
+                // Most outputs have a single recipe; size 2 covers the common multi-recipe
+                // outputs (planks, sticks) without the default-10 waste per key.
                 Item out = RecipeDisplays.getOutputItem(entry.display(), tagIndex);
-                if (out != null) index.computeIfAbsent(out, k -> new ArrayList<>()).add(entry);
-                List<SlotDisplay> slots = RecipeDisplays.getSlots(entry.display());
-                if (slots != null) for (SlotDisplay slot : slots) tagIndex.collectTags(slot);
+                if (out != null) {
+                    index.computeIfAbsent(out, k -> new ArrayList<>(2)).add(entry);
+                    total++;
+                }
+                List<SlotDisplay> slots = RecipeDisplays.getSlots(entry);
+                if (slots == null) continue;
+                for (SlotDisplay slot : slots) tagIndex.collectTags(slot);
+                List<TagKey<Item>> tags = null;
+                for (SlotDisplay slot : slots) {
+                    if (tags == null) tags = new ArrayList<>(2);
+                    collectEntryTagsInto(slot, tags);
+                }
+                if (tags != null && !tags.isEmpty()) entryTags.put(entry.id(), tags);
             }
         }
         for (Item item : index.keySet()) tagIndex.tagsOf(item);
-        return new RecipeIndex(index, tagIndex);
+        return new RecipeIndex(index, tagIndex, total, entryTags);
+    }
+
+    /** Tags referenced by one slot tree (deduped), mirroring {@link TagIndex#collectTags}. */
+    private static void collectEntryTagsInto(SlotDisplay slot, List<TagKey<Item>> out) {
+        if (slot instanceof SlotDisplay.TagSlotDisplay) {
+            TagKey<Item> tag = RecipeDisplays.getSlotTag(slot);
+            if (tag != null && !out.contains(tag)) out.add(tag);
+        } else if (slot instanceof SlotDisplay.Composite d) {
+            for (SlotDisplay sub : d.contents()) collectEntryTagsInto(sub, out);
+        } else if (slot instanceof SlotDisplay.WithRemainder d) {
+            collectEntryTagsInto(d.input(), out);
+        }
     }
 }

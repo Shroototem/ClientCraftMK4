@@ -1,5 +1,6 @@
 package com.clientcraftmk4.pipeline;
 
+import com.clientcraftmk4.core.InventorySnapshot;
 import net.minecraft.client.gui.screens.recipebook.RecipeCollection;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.crafting.display.RecipeDisplayId;
@@ -22,14 +23,18 @@ public record ResolveResult(
         Set<RecipeCollection> autoCraftCollections,
         long cacheKey,
         long inventoryGeneration,
-        long modelGeneration
+        long modelGeneration,
+        // The snapshot this result was computed from (immutable): anchors incremental
+        // resolves, which diff it against the new snapshot to find changed items.
+        InventorySnapshot snapshot
 ) {
     public static final ResolveResult EMPTY = new ResolveResult(
-            List.of(), Map.of(), Set.of(), Set.of(), Map.of(), Set.of(), 0, 0, 0);
+            List.of(), Map.of(), Set.of(), Set.of(), Map.of(), Set.of(), 0, 0, 0,
+            InventorySnapshot.EMPTY);
 
     /** Returns a copy with a different collection list (used for the first-open placeholder). */
     public ResolveResult withCollections(List<RecipeCollection> c) {
         return new ResolveResult(c, counts, containerCraftable, containerAvailableItems,
-                ranks, autoCraftCollections, cacheKey, inventoryGeneration, modelGeneration);
+                ranks, autoCraftCollections, cacheKey, inventoryGeneration, modelGeneration, snapshot);
     }
 }

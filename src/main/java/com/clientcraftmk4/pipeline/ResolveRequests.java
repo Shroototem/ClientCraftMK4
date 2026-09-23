@@ -22,6 +22,7 @@ public final class ResolveRequests {
                 .getCollection(SearchRecipeBookCategory.CRAFTING);
         return new ResolveRequest(allCrafting, gridSize,
                 ResolveRequest.cacheKey(snap.generation(), gridSize),
-                model != null ? model.modelGeneration() : 0, snap);
+                model != null ? model.modelGeneration() : 0, snap,
+                ResolvePipeline.current(), InventoryProvider.lastChangedTags());
     }
 }

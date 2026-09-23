@@ -26,17 +26,19 @@ import java.util.*;
 public final class GraphBuilder {
     private GraphBuilder() {}
 
-    public static RecipeGraph build(RecipeIndex index, TagIndex tagIndex) {
-        Map<Item, List<RecipeDisplayEntry>> recipesByOutput = new HashMap<>();
-        for (Item out : index.outputs()) {
-            List<RecipeDisplayEntry> entries = index.get(out);
-            recipesByOutput.computeIfAbsent(out, k -> new ArrayList<>()).addAll(entries);
-        }
+    /** Registry-id comparator shared by the key sorts (comparingInt allocates per call). */
+    private static final Comparator<Item> BY_REGISTRY_ID = Comparator.comparingInt(Item::getId);
 
-        Set<Item> allIngredientItems = new HashSet<>();
-        for (List<RecipeDisplayEntry> entries : recipesByOutput.values()) {
-            for (RecipeDisplayEntry entry : entries) {
-                List<SlotDisplay> slots = RecipeDisplays.getSlots(entry.display());
+    public static RecipeGraph build(RecipeIndex index, TagIndex tagIndex) {
+        // The old code copied the whole index into recipesByOutput first; the index lists
+        // are never mutated downstream, so read them directly.
+        int outputCount = index.outputs().size();
+        int mapCap = (int) (outputCount / 0.75f) + 16;
+
+        Set<Item> allIngredientItems = new HashSet<>(4096);
+        for (Item out : index.outputs()) {
+            for (RecipeDisplayEntry entry : index.get(out)) {
+                List<SlotDisplay> slots = RecipeDisplays.getSlots(entry);
                 if (slots == null) continue;
                 for (SlotDisplay slot : slots) {
                     collectItems(slot, allIngredientItems, tagIndex);
@@ -44,29 +46,27 @@ public final class GraphBuilder {
             }
         }
 
-        Map<Item, RecipeNode> resolved = new HashMap<>();
-        Set<Item> baseResources = new HashSet<>();
+        Map<Item, RecipeNode> resolved = new HashMap<>(mapCap);
+        Set<Item> baseResources = new HashSet<>(mapCap);
 
         for (Item item : allIngredientItems) {
-            if (!recipesByOutput.containsKey(item)) {
+            if (index.get(item) == null) {
                 resolved.put(item, new BaseResource(item));
                 baseResources.add(item);
             }
         }
 
-        Map<Item, Integer> inDegree = new HashMap<>();
-        Map<Item, List<Set<Item>>> edgeDeps = new HashMap<>();
-        Map<Item, boolean[]> edgeResolved = new HashMap<>();
-        Map<Item, Set<Item>> optionToParents = new HashMap<>();
+        Map<Item, Integer> inDegree = new HashMap<>(mapCap);
+        Map<Item, List<Set<Item>>> edgeDeps = new HashMap<>(mapCap);
+        Map<Item, boolean[]> edgeResolved = new HashMap<>(mapCap);
+        Map<Item, Set<Item>> optionToParents = new HashMap<>(mapCap);
 
-        for (Map.Entry<Item, List<RecipeDisplayEntry>> e : recipesByOutput.entrySet()) {
-            Item outputItem = e.getKey();
-
+        for (Item outputItem : index.outputs()) {
             List<Set<Item>> bestEdges = null;
             int bestUnresolved = Integer.MAX_VALUE;
 
-            for (RecipeDisplayEntry entry : e.getValue()) {
-                List<Set<Item>> edges = getConsolidatedEdges(entry.display(), outputItem, tagIndex);
+            for (RecipeDisplayEntry entry : index.get(outputItem)) {
+                List<Set<Item>> edges = getConsolidatedEdges(entry, outputItem, tagIndex);
                 if (edges == null) continue;
 
                 int unresolved = 0;
@@ -108,7 +108,7 @@ public final class GraphBuilder {
             for (int i = 0; i < bestEdges.size(); i++) {
                 if (!flags[i]) {
                     for (Item option : bestEdges.get(i)) {
-                        optionToParents.computeIfAbsent(option, k -> new HashSet<>()).add(outputItem);
+                        optionToParents.computeIfAbsent(option, k -> new HashSet<>(4)).add(outputItem);
                     }
                 }
             }
@@ -132,7 +132,7 @@ public final class GraphBuilder {
             if (resolved.containsKey(item)) continue;
             topologicalOrder.add(item);
 
-            CraftedItem bestNode = buildBestNode(item, recipesByOutput.get(item), resolved, tagIndex);
+            CraftedItem bestNode = buildBestNode(item, index.get(item), resolved, tagIndex);
             if (bestNode != null) {
                 resolved.put(item, bestNode);
             } else {
@@ -161,7 +161,7 @@ public final class GraphBuilder {
             }
         }
 
-        for (Item item : recipesByOutput.keySet()) {
+        for (Item item : index.outputs()) {
             if (!resolved.containsKey(item)) {
                 resolved.put(item, new BaseResource(item));
                 baseResources.add(item);
@@ -169,11 +169,10 @@ public final class GraphBuilder {
             }
         }
 
-        Map<Item, List<CraftedItem>> allRecipesMap = new HashMap<>();
-        for (Map.Entry<Item, List<RecipeDisplayEntry>> e : recipesByOutput.entrySet()) {
-            Item outputItem = e.getKey();
+        Map<Item, List<CraftedItem>> allRecipesMap = new HashMap<>(mapCap);
+        for (Item outputItem : index.outputs()) {
             List<CraftedItem> nodes = new ArrayList<>();
-            for (RecipeDisplayEntry entry : e.getValue()) {
+            for (RecipeDisplayEntry entry : index.get(outputItem)) {
                 CraftedItem node = buildCraftedItem(outputItem, entry, resolved, tagIndex);
                 if (node != null) nodes.add(node);
             }
@@ -182,30 +181,32 @@ public final class GraphBuilder {
             }
         }
 
-        Map<Item, Set<Item>> dependents = new HashMap<>();
-        Map<Item, Set<Item>> reverseDependencyTargets = new HashMap<>();
+        Map<Item, Set<Item>> dependents = new HashMap<>(mapCap);
+        Map<Item, Set<Item>> reverseDependencyTargets = new HashMap<>(mapCap);
         for (Map.Entry<Item, List<CraftedItem>> e : allRecipesMap.entrySet()) {
             Item outputItem = e.getKey();
             for (CraftedItem crafted : e.getValue()) {
                 for (IngredientEdge edge : crafted.ingredients()) {
                     for (IngredientOption option : edge.options()) {
-                        dependents.computeIfAbsent(option.item(), k -> new HashSet<>()).add(crafted.item());
-                        reverseDependencyTargets.computeIfAbsent(option.item(), k -> new HashSet<>()).add(outputItem);
+                        dependents.computeIfAbsent(option.item(), k -> new HashSet<>(4)).add(crafted.item());
+                        reverseDependencyTargets.computeIfAbsent(option.item(), k -> new HashSet<>(4)).add(outputItem);
                     }
                 }
             }
         }
 
-        GraphFlatData flat = buildFlatData(topologicalOrder, resolved, allRecipesMap, reverseDependencyTargets);
+        GraphFlatData flat = buildFlatData(topologicalOrder, resolved, allRecipesMap, reverseDependencyTargets,
+                tagIndex, dependents, index);
         return new RecipeGraph(resolved, allRecipesMap, dependents, topologicalOrder, reverseDependencyTargets, flat);
     }
 
     private static GraphFlatData buildFlatData(
             List<Item> topo, Map<Item, RecipeNode> resolved, Map<Item, List<CraftedItem>> allRecipesMap,
-            Map<Item, Set<Item>> reverseDependencyTargets) {
+            Map<Item, Set<Item>> reverseDependencyTargets, TagIndex tagIndex,
+            Map<Item, Set<Item>> dependents, RecipeIndex index) {
 
         int n = topo.size();
-        IdentityHashMap<Item, Integer> idMap = new IdentityHashMap<>(n * 2);
+        IdentityHashMap<Item, Integer> idMap = new IdentityHashMap<>((int) (n / 0.75f) + 1);
         Item[] idToItem = new Item[n];
         for (int i = 0; i < n; i++) {
             idToItem[i] = topo.get(i);
@@ -224,7 +225,8 @@ public final class GraphBuilder {
         for (int i = 0; i < n; i++) tmpItemRecipes.add(null);
 
         List<CraftedItem> orderedCrafted = new ArrayList<>();
-        List<int[]> recData = new ArrayList<>();
+        // NOTE: the old int[3]-per-recipe recData list is gone — the ri loop below reads
+        // outId/outputCount/gridSize straight off the CraftedItem (same values, no garbage).
 
         int recipeIdx = 0;
         for (int i = 0; i < n; i++) {
@@ -236,8 +238,6 @@ public final class GraphBuilder {
                 if (rIndices.isEmpty()) primaryRecIdx[i] = recipeIdx;
                 rIndices.add(recipeIdx);
 
-                int outId = idMap.getOrDefault(c.item(), -1);
-                recData.add(new int[]{outId, c.outputCount(), c.gridSize()});
                 orderedCrafted.add(c);
                 recipeIdx++;
             }
@@ -272,10 +272,9 @@ public final class GraphBuilder {
         int ei = 0, oi = 0;
         for (int ri = 0; ri < totalRecipes; ri++) {
             CraftedItem c = orderedCrafted.get(ri);
-            int[] rd = recData.get(ri);
-            recOutId[ri] = rd[0];
-            recOutCount[ri] = rd[1];
-            recGridSize[ri] = rd[2];
+            recOutId[ri] = idMap.getOrDefault(c.item(), -1);
+            recOutCount[ri] = c.outputCount();
+            recGridSize[ri] = c.gridSize();
             recDispId[ri] = c.recipeId();
             recEdgeStart[ri] = ei;
             for (IngredientEdge edge : c.ingredients()) {
@@ -310,7 +309,7 @@ public final class GraphBuilder {
             for (int idx : r) itemRecFlat[pos++] = idx;
         }
 
-        Map<RecipeDisplayId, Integer> dispIdToRecIdx = new HashMap<>(totalRecipes * 2);
+        Map<RecipeDisplayId, Integer> dispIdToRecIdx = new HashMap<>((int) (totalRecipes / 0.75f) + 1);
         boolean[] recSelfConsuming = new boolean[totalRecipes];
         for (int ri = 0; ri < totalRecipes; ri++) {
             dispIdToRecIdx.put(recDispId[ri], ri);
@@ -353,11 +352,11 @@ public final class GraphBuilder {
         for (int ri = 0; ri < totalRecipes; ri++) {
             recSharingSuspect[ri] = hasSharingSuspectEdgeFlat(
                     recEdgeStart, recEdgeEnd, edgeOptStart, edgeOptEnd, optItemId, optItemObj, primaryRecIdx, ri);
-        }
-        for (int ri = 0; ri < totalRecipes; ri++) {
             recCrossEdgeShared[ri] = hasCrossEdgeSharedOptionFlat(
                     recEdgeStart, recEdgeEnd, edgeOptStart, edgeOptEnd, optItemObj, ri);
         }
+
+        installFlatTagData(tagIndex, idMap, n);
 
         return new GraphFlatData(
                 n, idToItem, idMap, isBaseNode, primaryRecIdx,
@@ -367,8 +366,95 @@ public final class GraphBuilder {
                 recCycleSuspect, recSharingSuspect, recCrossEdgeShared, recReverseTargets,
                 recEdgeStart, recEdgeEnd,
                 totalEdges, edgeCnt, edgeOptStart, edgeOptEnd,
-                totalOpts, optItemId, optItemObj
+                totalOpts, optItemId, optItemObj,
+                buildDependentItems(dependents, idMap, n),
+                buildTagRecIdx(index, dispIdToRecIdx)
         );
+    }
+
+    /**
+     * Item-level dependents as flat id arrays (for the incremental dirty worklist): parent
+     * output items per flat item id. Order within an array is irrelevant (fixpoint sets).
+     */
+    private static int[][] buildDependentItems(Map<Item, Set<Item>> dependents,
+                                               IdentityHashMap<Item, Integer> idMap, int n) {
+        int[][] out = new int[n][];
+        for (int i = 0; i < n; i++) out[i] = new int[0];
+        for (Map.Entry<Item, Set<Item>> e : dependents.entrySet()) {
+            Integer id = idMap.get(e.getKey());
+            if (id == null) continue;
+            Set<Item> parents = e.getValue();
+            int[] arr = new int[parents.size()];
+            int q = 0;
+            for (Item p : parents) {
+                Integer pid = idMap.get(p);
+                if (pid != null) arr[q++] = pid;
+            }
+            out[id] = q == arr.length ? arr : Arrays.copyOf(arr, q);
+        }
+        return out;
+    }
+
+    /**
+     * Tag → recipe indices using that tag (for tag-propagation of dirtiness): translated from
+     * the per-entry tag lists via the display-id map. Insertion (book) order; union semantics.
+     */
+    private static Map<TagKey<Item>, int[]> buildTagRecIdx(RecipeIndex index,
+                                                           Map<RecipeDisplayId, Integer> dispIdToRecIdx) {
+        Map<TagKey<Item>, List<Integer>> acc = new HashMap<>();
+        for (Map.Entry<RecipeDisplayId, List<TagKey<Item>>> e : index.entryTags().entrySet()) {
+            Integer ri = dispIdToRecIdx.get(e.getKey());
+            if (ri == null) continue;
+            for (TagKey<Item> tag : e.getValue()) {
+                acc.computeIfAbsent(tag, k -> new ArrayList<>()).add(ri);
+            }
+        }
+        Map<TagKey<Item>, int[]> out = new HashMap<>((int) (acc.size() / 0.75f) + 1);
+        for (Map.Entry<TagKey<Item>, List<Integer>> e : acc.entrySet()) {
+            List<Integer> l = e.getValue();
+            int[] a = new int[l.size()];
+            for (int i = 0; i < l.size(); i++) a[i] = l.get(i);
+            out.put(e.getKey(), a);
+        }
+        return out;
+    }
+
+    /**
+     * Builds the id-indexed tag structures (see {@link TagIndex#setFlatTagData}): one
+     * pass over the cached registry members per known tag. Registry
+     * {@code holder.is(tag)} checks never run on hot paths again after this.
+     */
+    @SuppressWarnings("unchecked")
+    private static void installFlatTagData(TagIndex tagIndex,
+                                           IdentityHashMap<Item, Integer> idMap, int n) {
+        Set<TagKey<Item>> known = tagIndex.knownTags();
+        Map<TagKey<Item>, BitSet> bitsByTag = new HashMap<>((int) (known.size() / 0.75f) + 1);
+        List<Set<TagKey<Item>>> fill = new ArrayList<>(n);
+        for (int i = 0; i < n; i++) fill.add(null);
+        for (TagKey<Item> tag : known) {
+            if (tag == null) continue;
+            List<Item> members = tagIndex.members(tag);
+            if (members == null || members.isEmpty()) continue;
+            BitSet bits = new BitSet(n);
+            for (Item m : members) {
+                Integer id = idMap.get(m);
+                if (id == null) continue;
+                bits.set(id);
+                Set<TagKey<Item>> s = fill.get(id);
+                if (s == null) {
+                    s = new HashSet<>(4);
+                    fill.set(id, s);
+                }
+                s.add(tag);
+            }
+            bitsByTag.put(tag, bits);
+        }
+        Set<TagKey<Item>>[] tagsByFlatId = new Set[n];
+        for (int i = 0; i < n; i++) {
+            Set<TagKey<Item>> s = fill.get(i);
+            tagsByFlatId[i] = s != null ? Collections.unmodifiableSet(s) : Set.of();
+        }
+        tagIndex.setFlatTagData(idMap, tagsByFlatId, bitsByTag);
     }
 
     /**
@@ -384,6 +470,9 @@ public final class GraphBuilder {
             int optStart = edgeOptStart[ei], optEnd = edgeOptEnd[ei];
             int optCount = optEnd - optStart;
             if (optCount < 2) continue;
+            // One set per edge instead of an O(opts) inner scan per ingredient probe.
+            Set<Item> edgeSet = new HashSet<>((int) (optCount / 0.75f) + 1);
+            for (int oi = optStart; oi < optEnd; oi++) edgeSet.add(optItemObj[oi]);
             for (int oi = optStart; oi < optEnd; oi++) {
                 int optId = optItemId[oi];
                 if (optId < 0) continue;
@@ -392,10 +481,7 @@ public final class GraphBuilder {
                 for (int pei = recEdgeStart[pri]; pei < recEdgeEnd[pri]; pei++) {
                     for (int poi = edgeOptStart[pei]; poi < edgeOptEnd[pei]; poi++) {
                         Item ingredient = optItemObj[poi];
-                        if (ingredient.equals(optItemObj[oi])) continue;
-                        for (int oi2 = optStart; oi2 < optEnd; oi2++) {
-                            if (oi2 != oi && optItemObj[oi2].equals(ingredient)) return true;
-                        }
+                        if (!ingredient.equals(optItemObj[oi]) && edgeSet.contains(ingredient)) return true;
                     }
                 }
             }
@@ -412,12 +498,20 @@ public final class GraphBuilder {
     private static boolean hasCrossEdgeSharedOptionFlat(
             int[] recEdgeStart, int[] recEdgeEnd, int[] edgeOptStart, int[] edgeOptEnd,
             Item[] optItemObj, int recIdx) {
-        Map<Item, Integer> lastEdgeOfItem = new HashMap<>();
+        // Items from earlier edges only: within-edge repeats must NOT trigger (the old
+        // map distinguished them via prev != ei). No per-recipe HashMap alloc.
+        Set<Item> seenInEarlierEdges = null;
         for (int ei = recEdgeStart[recIdx]; ei < recEdgeEnd[recIdx]; ei++) {
-            for (int oi = edgeOptStart[ei]; oi < edgeOptEnd[ei]; oi++) {
-                Integer prev = lastEdgeOfItem.put(optItemObj[oi], ei);
-                if (prev != null && prev != ei) return true;
+            int optStart = edgeOptStart[ei], optEnd = edgeOptEnd[ei];
+            if (seenInEarlierEdges != null) {
+                for (int oi = optStart; oi < optEnd; oi++) {
+                    if (seenInEarlierEdges.contains(optItemObj[oi])) return true;
+                }
             }
+            if (seenInEarlierEdges == null) {
+                seenInEarlierEdges = new HashSet<>((int) ((optEnd - optStart) / 0.75f) + 1);
+            }
+            for (int oi = optStart; oi < optEnd; oi++) seenInEarlierEdges.add(optItemObj[oi]);
         }
         return false;
     }
@@ -440,7 +534,7 @@ public final class GraphBuilder {
             Item outputItem, RecipeDisplayEntry entry,
             Map<Item, RecipeNode> resolved, TagIndex tagIndex) {
         RecipeDisplay display = entry.display();
-        List<SlotDisplay> slots = RecipeDisplays.getSlots(display);
+        List<SlotDisplay> slots = RecipeDisplays.getSlots(entry);
         if (slots == null) return null;
 
         int outputCount = RecipeDisplays.getOutputCount(display, tagIndex);
@@ -478,6 +572,12 @@ public final class GraphBuilder {
         return new CraftedItem(outputItem, outputCount, edges, entry, entry.id(), gridSize, maxDepth + 1);
     }
 
+    /** getOrDefault with an eager new BaseResource allocated on every hit — use a plain get. */
+    private static RecipeNode nodeFor(Map<Item, RecipeNode> resolved, Item item) {
+        RecipeNode node = resolved.get(item);
+        return node != null ? node : new BaseResource(item);
+    }
+
     private static List<IngredientOption> buildOptions(
             SlotDisplay slot, Map<Item, RecipeNode> resolved, Item excludeItem, TagIndex tagIndex) {
         List<IngredientOption> options = new ArrayList<>();
@@ -485,14 +585,12 @@ public final class GraphBuilder {
         if (slot instanceof SlotDisplay.ItemSlotDisplay d) {
             Item item = d.item().value();
             if (!item.equals(excludeItem)) {
-                RecipeNode node = resolved.getOrDefault(item, new BaseResource(item));
-                options.add(new IngredientOption(item, node));
+                options.add(new IngredientOption(item, nodeFor(resolved, item)));
             }
         } else if (slot instanceof SlotDisplay.ItemStackSlotDisplay d) {
             Item item = d.stack().item().value();
             if (!item.equals(excludeItem)) {
-                RecipeNode node = resolved.getOrDefault(item, new BaseResource(item));
-                options.add(new IngredientOption(item, node));
+                options.add(new IngredientOption(item, nodeFor(resolved, item)));
             }
         } else if (slot instanceof SlotDisplay.TagSlotDisplay d) {
             TagKey<Item> tag = RecipeDisplays.getSlotTag(d);
@@ -500,8 +598,7 @@ public final class GraphBuilder {
             if (members != null) {
                 for (Item item : members) {
                     if (item.equals(excludeItem)) continue;
-                    RecipeNode node = resolved.getOrDefault(item, new BaseResource(item));
-                    options.add(new IngredientOption(item, node));
+                    options.add(new IngredientOption(item, nodeFor(resolved, item)));
                 }
             }
         } else if (slot instanceof SlotDisplay.Composite d) {
@@ -515,18 +612,26 @@ public final class GraphBuilder {
         return options;
     }
 
-    private static List<Set<Item>> getConsolidatedEdges(RecipeDisplay display, Item outputItem, TagIndex tagIndex) {
-        List<SlotDisplay> slots = RecipeDisplays.getSlots(display);
+    private static List<Set<Item>> getConsolidatedEdges(RecipeDisplayEntry entry, Item outputItem, TagIndex tagIndex) {
+        List<SlotDisplay> slots = RecipeDisplays.getSlots(entry);
         if (slots == null) return null;
 
         Map<List<Item>, Set<Item>> consolidated = new LinkedHashMap<>();
         for (SlotDisplay slot : slots) {
             if (slot instanceof SlotDisplay.Empty) continue;
 
-            Set<Item> options = new LinkedHashSet<>();
-            collectItems(slot, options, tagIndex);
-            options.remove(outputItem);
-            if (options.isEmpty()) return null;
+            // Fast path: single-item slots are the common case — no set/sort needed.
+            Item single = singleDirectItem(slot);
+            Set<Item> options;
+            if (single != null) {
+                if (single.equals(outputItem)) return null;
+                options = Set.of(single);
+            } else {
+                options = new LinkedHashSet<>();
+                collectItems(slot, options, tagIndex);
+                options.remove(outputItem);
+                if (options.isEmpty()) return null;
+            }
 
             List<Item> key = itemSetKey(options);
             consolidated.merge(key, options, (a, b) -> a);
@@ -535,18 +640,26 @@ public final class GraphBuilder {
         return new ArrayList<>(consolidated.values());
     }
 
+    /** The directly-addressed item of Item/ItemStack slots (through WithRemainder), else null. */
+    private static Item singleDirectItem(SlotDisplay slot) {
+        if (slot instanceof SlotDisplay.ItemSlotDisplay d) return d.item().value();
+        if (slot instanceof SlotDisplay.ItemStackSlotDisplay d) return d.stack().item().value();
+        if (slot instanceof SlotDisplay.WithRemainder r) return singleDirectItem(r.input());
+        return null;
+    }
+
     private static List<Item> optionsKey(List<IngredientOption> options) {
         if (options.size() == 1) return List.of(options.getFirst().item());
         List<Item> items = new ArrayList<>(options.size());
         for (IngredientOption opt : options) items.add(opt.item());
-        items.sort(Comparator.comparingInt(Item::getId));
+        items.sort(BY_REGISTRY_ID);
         return items;
     }
 
     private static List<Item> itemSetKey(Set<Item> items) {
         if (items.size() == 1) return List.of(items.iterator().next());
         List<Item> sorted = new ArrayList<>(items);
-        sorted.sort(Comparator.comparingInt(Item::getId));
+        sorted.sort(BY_REGISTRY_ID);
         return sorted;
     }
 

@@ -30,7 +30,7 @@ import java.util.List;
  * inventory settles — then a refresh is triggered.
  */
 public class AutoCrafter {
-    private static final Logger LOG = LoggerFactory.getLogger("clientcraftmk4");
+    private static final Logger LOG = LoggerFactory.getLogger(com.clientcraftmk4.core.Constants.MOD_ID);
 
     public enum Mode { ONCE, STACK, ALL }
 
@@ -48,6 +48,10 @@ public class AutoCrafter {
     private static boolean pendingBatchClear = false;
     private static long lastSeenGen = -1;
     private static int stableFrames = 0;
+    private static int pendingBatchTicks = 0;
+    /** Give up waiting for a stable inventory after ~5s so a flickering generation
+     * can't gate the pipeline via submit()'s isRunning() check forever. */
+    private static final int PENDING_BATCH_TIMEOUT_TICKS = 100;
 
     private AutoCrafter() {}
 
@@ -72,6 +76,8 @@ public class AutoCrafter {
         stepIndex = 0;
         tickCounter = 0;
         totalSteps = flat.size();
+        // Once per user click — intentionally unconditional so the completion log is
+        // correct even if debug logging is toggled mid-craft.
         startTimeNs = System.nanoTime();
         // MK4: if (flat.size() > 10) batchMode = true;
         // MK5: the pipeline's submit() gate checks AutoCrafter.isRunning() instead.
@@ -92,6 +98,10 @@ public class AutoCrafter {
                 } else {
                     lastSeenGen = gen;
                     stableFrames = 0;
+                }
+                if (pendingBatchClear && ++pendingBatchTicks >= PENDING_BATCH_TIMEOUT_TICKS) {
+                    pendingBatchClear = false;
+                    ResolvePipeline.refreshNow();
                 }
             }
 
@@ -133,12 +143,13 @@ public class AutoCrafter {
     }
 
     private static void logCompletion() {
-        long elapsedMs = (System.nanoTime() - startTimeNs) / 1_000_000;
         if (ClientCraftConfig.debugLogging)
-            LOG.info("[CC] Auto-craft completed: {} step(s) in {}ms", totalSteps, elapsedMs);
+            LOG.info("[CC] Auto-craft completed: {} step(s) in {}ms",
+                    totalSteps, (System.nanoTime() - startTimeNs) / 1_000_000);
         pendingBatchClear = true;
         lastSeenGen = InventoryProvider.generation();
         stableFrames = 0;
+        pendingBatchTicks = 0;
     }
 
     private static void executeStep(Minecraft client, AbstractCraftingMenu handler, RecipeDisplayId step) {

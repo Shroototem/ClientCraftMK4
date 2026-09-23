@@ -59,6 +59,8 @@ java {
 }
 
 jar {
+    // Stonecutter-chiseled resources can collide across versions; exclude rather than fail.
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
     from("LICENSE") {
         rename { "${it}_${base.archivesName.get()}" }
     }

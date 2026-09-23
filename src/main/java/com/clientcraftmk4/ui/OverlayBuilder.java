@@ -2,6 +2,7 @@ package com.clientcraftmk4.ui;
 
 import com.clientcraftmk4.core.CraftModel;
 import com.clientcraftmk4.core.GameContext;
+import com.clientcraftmk4.core.RecipeGraph;
 import com.clientcraftmk4.core.RecipeGraph.GraphFlatData;
 import com.clientcraftmk4.core.InventoryProvider;
 import com.clientcraftmk4.core.InventorySnapshot;
@@ -82,7 +83,7 @@ public final class OverlayBuilder {
         InventorySnapshot snap = InventoryProvider.current();
 
         RecipeDisplay display = originalEntry.display();
-        List<SlotDisplay> slots = RecipeDisplays.getSlots(display);
+        List<SlotDisplay> slots = RecipeDisplays.getSlots(originalEntry);
         if (slots == null || slots.isEmpty()) return null;
 
         IngredientGrid grid = new IngredientGrid();
@@ -163,12 +164,39 @@ public final class OverlayBuilder {
         ItemStack craftable = findCraftableForSlot(slot, model, gridSize, snap);
         if (craftable != null) return craftable;
 
-        // Fallback: return whatever resolveSlot gives
-        return direct.isEmpty() ? RecipeDisplays.resolveSlot(slot, snap.inventory(), tags, false) : direct;
+        // Fallback: resolveSlot is deterministic, so recomputing an empty result would
+        // just yield empty again — return what we already have.
+        return direct;
+    }
+
+    /**
+     * Per-overlay-build resolve state: the old code rebuilt the graph handle,
+     * resolve context and in-progress set per sub-recipe attempt. Hoisting is
+     * outcome-identical (same model/gridSize throughout one build).
+     */
+    private static final class SubCraftCtx {
+        final CraftModel model;
+        final int gridSize;
+        final RecipeGraph graph;
+        final GraphFlatData flat;
+        final ResolveContext resolveCtx;
+        final Set<Item> inProgress = new HashSet<>();
+
+        SubCraftCtx(CraftModel model, int gridSize) {
+            this.model = model;
+            this.gridSize = gridSize;
+            this.graph = model.graph();
+            this.flat = graph != null ? graph.flat() : null;
+            this.resolveCtx = ResolveContext.of(model, gridSize);
+        }
     }
 
     private static ItemStack findCraftableForSlot(SlotDisplay slot, CraftModel model, int gridSize, InventorySnapshot snap) {
-        TagIndex tags = model.tagIndex();
+        return findCraftableForSlot(slot, new SubCraftCtx(model, gridSize), snap);
+    }
+
+    private static ItemStack findCraftableForSlot(SlotDisplay slot, SubCraftCtx ctx, InventorySnapshot snap) {
+        TagIndex tags = ctx.model.tagIndex();
         if (slot instanceof SlotDisplay.TagSlotDisplay d) {
             TagKey<Item> tag = RecipeDisplays.getSlotTag(d);
             Set<Item> invMatches = tags.inventoryTagMembers(tag);
@@ -178,7 +206,7 @@ public final class OverlayBuilder {
             List<Item> craftable = tags.craftableMembers(tag);
             if (craftable != null) {
                 for (Item item : craftable) {
-                    if (tryConsumeSubCraft(item, new HashMap<>(snap.inventory()), model, gridSize)) return new ItemStack(item);
+                    if (tryConsumeSubCraft(item, sizedCopy(snap.inventory()), ctx)) return new ItemStack(item);
                 }
             }
         } else if (slot instanceof SlotDisplay.Composite d) {
@@ -188,21 +216,29 @@ public final class OverlayBuilder {
                 if (r.isEmpty()) continue;
                 if (fallback.isEmpty()) fallback = r;
                 if (snap.inventory().getOrDefault(r.getItem(), 0) > 0) return r;
-                if (tryConsumeSubCraft(r.getItem(), new HashMap<>(snap.inventory()), model, gridSize)) return r;
+                if (tryConsumeSubCraft(r.getItem(), sizedCopy(snap.inventory()), ctx)) return r;
             }
             if (!fallback.isEmpty()) return fallback;
         } else if (slot instanceof SlotDisplay.WithRemainder d) {
-            return findCraftableForSlot(d.input(), model, gridSize, snap);
+            return findCraftableForSlot(d.input(), ctx, snap);
         }
         return null;
+    }
+
+    /** Sized copy of an inventory map (avoids rehash growth on the overlay path). */
+    private static HashMap<Item, Integer> sizedCopy(Map<Item, Integer> inventory) {
+        HashMap<Item, Integer> copy = new HashMap<>((int) (inventory.size() / 0.75f) + 2);
+        copy.putAll(inventory);
+        return copy;
     }
 
     // --- Craftability / container tints (plan §5.8 G3/G4) ---
 
     private static void computeGridCraftability(IngredientGrid grid, CraftModel model, int gridSize,
                                                 InventorySnapshot snap, Set<Item> containerAvailable) {
-        Map<Item, Integer> remaining = new HashMap<>(snap.inventory());
+        Map<Item, Integer> remaining = sizedCopy(snap.inventory());
         boolean hasContainer = !containerAvailable.isEmpty();
+        SubCraftCtx ctx = new SubCraftCtx(model, gridSize);
 
         for (int i = 0; i < 9; i++) {
             ItemStack stack = grid.items[i];
@@ -221,30 +257,38 @@ public final class OverlayBuilder {
                     grid.inContainer[i] = true;
                     if (found != item) grid.items[i] = new ItemStack(found);
                 } else {
-                    grid.craftable[i] = tryConsumeSubCraft(item, remaining, model, gridSize);
+                    grid.craftable[i] = tryConsumeSubCraft(item, remaining, ctx);
                 }
             } else {
-                grid.craftable[i] = tryConsumeSubCraft(item, remaining, model, gridSize);
+                grid.craftable[i] = tryConsumeSubCraft(item, remaining, ctx);
             }
         }
     }
 
     /** Tests if {@code item} can be sub-crafted from {@code available}; if so, deducts consumed resources. */
-    private static boolean tryConsumeSubCraft(Item item, Map<Item, Integer> available, CraftModel model, int gridSize) {
-        List<RecipeDisplayEntry> subs = model.recipeIndex().get(item);
-        if (subs == null) return false;
+    private static boolean tryConsumeSubCraft(Item item, Map<Item, Integer> available, SubCraftCtx ctx) {
+        List<RecipeDisplayEntry> subs = ctx.model.recipeIndex().get(item);
+        if (subs == null || ctx.graph == null || ctx.flat == null) return false;
         for (RecipeDisplayEntry sub : subs) {
-            if (!RecipeDisplays.fitsInGrid(sub.display(), gridSize)) continue;
-            WorkMap work = WorkMap.from(available, model.graph());
-            if (ResolveContext.of(model, gridSize).resolve(sub, work, null, new HashSet<>(), 0, null)) {
-                // Write the journal-backed changes back into the plain map.
-                GraphFlatData f = model.graph().flat();
-                for (int id = 0; id < f.n(); id++) {
+            if (!RecipeDisplays.fitsInGrid(sub.display(), ctx.gridSize)) continue;
+            WorkMap work = WorkMap.from(available, ctx.graph);
+            ctx.inProgress.clear();
+            if (ctx.resolveCtx.resolve(sub, work, null, ctx.inProgress, 0, null)) {
+                // Write the journal-backed changes back into the plain map. Only ids in
+                // the present list can differ: untouched ids read 0 in the work map only
+                // if they were never filled — but fill covers exactly the map's keys, so
+                // any id outside present has count 0 == map default. Equivalent to the
+                // old full 0..n scan at a fraction of the iterations.
+                GraphFlatData f = ctx.flat;
+                for (int k = 0; k < work.presentSize(); k++) {
+                    int id = work.presentIdAt(k);
                     int c = work.get(id);
                     Item it = f.idToItem()[id];
                     if (c != available.getOrDefault(it, 0)) available.put(it, c);
                 }
-                int outputCount = RecipeDisplays.getOutputCount(sub.display(), model.tagIndex());
+                // Same live-inventory basis as the old getOutputCount(display, tags) call,
+                // via the context memo instead of a fresh slot resolution per success.
+                int outputCount = ctx.resolveCtx.outCount(sub);
                 if (outputCount > 1) available.merge(item, outputCount - 1, Integer::sum);
                 return true;
             }

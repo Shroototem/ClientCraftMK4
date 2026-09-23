@@ -70,6 +70,24 @@ public class OverlayRecipeComponentMixin {
     @Unique private static final int RESULT_PANEL_WIDTH = 28;
     @Unique private static final int RESULT_PANEL_GAP = 3;
 
+    /**
+     * Single-entry tooltip cache: grid/result stacks are stable object refs between
+     * overlay rebuilds and their tooltip content is a pure function of the stack, so
+     * rebuilding the Component list every frame while hovering is pure waste.
+     * Identity-keyed — a rebuilt overlay swaps stack instances and recomputes once.
+     */
+    @Unique private ItemStack clientcraft$tipStack;
+    @Unique private List<net.minecraft.network.chat.Component> clientcraft$tipLines = List.of();
+
+    @Unique
+    private List<net.minecraft.network.chat.Component> clientcraft$tooltipFor(ItemStack stack) {
+        if (stack != clientcraft$tipStack) {
+            clientcraft$tipStack = stack;
+            clientcraft$tipLines = Screen.getTooltipFromItem(Minecraft.getInstance(), stack);
+        }
+        return clientcraft$tipLines;
+    }
+
     @Inject(method = "setVisible", at = @At("HEAD"))
     private void clientcraft$onSetVisible(boolean visible, CallbackInfo ci) {
         if (!visible) {
@@ -318,7 +336,7 @@ public class OverlayRecipeComponentMixin {
                         Minecraft mc = Minecraft.getInstance();
                         context.setComponentTooltipForNextFrame(
                                 mc.font,
-                                Screen.getTooltipFromItem(mc, stack),
+                                clientcraft$tooltipFor(stack),
                                 mouseX, mouseY,
                                 stack.get(DataComponents.TOOLTIP_STYLE));
                     }
@@ -354,7 +372,7 @@ public class OverlayRecipeComponentMixin {
                         Minecraft mc = Minecraft.getInstance();
                         context.setComponentTooltipForNextFrame(
                                 mc.font,
-                                Screen.getTooltipFromItem(mc, result),
+                                clientcraft$tooltipFor(result),
                                 mouseX, mouseY,
                                 result.get(DataComponents.TOOLTIP_STYLE));
                     }

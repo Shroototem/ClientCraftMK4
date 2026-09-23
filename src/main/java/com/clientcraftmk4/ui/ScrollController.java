@@ -29,15 +29,20 @@ public final class ScrollController {
     private ScrollController() {}
 
     public static void setActivePage(RecipeBookPage page, int left, int top) {
-        activeRecipeBookPage = new WeakReference<>(page);
-        activeRecipeBookScreen = new WeakReference<>(GameContext.currentScreen());
+        // setActivePage runs on every updateCollections: skip the WeakReference churn
+        // when the referents haven't actually changed (same page, same screen).
+        Screen currentScreen = GameContext.currentScreen();
+        if (activeRecipeBookPage.get() != page) activeRecipeBookPage = new WeakReference<>(page);
+        if (activeRecipeBookScreen.get() != currentScreen) {
+            activeRecipeBookScreen = new WeakReference<>(currentScreen);
+        }
         bookLeft = left;
         bookTop = top;
     }
 
     public static void clearActivePage() {
-        activeRecipeBookPage = new WeakReference<>(null);
-        activeRecipeBookScreen = new WeakReference<>(null);
+        if (activeRecipeBookPage.get() != null) activeRecipeBookPage = new WeakReference<>(null);
+        if (activeRecipeBookScreen.get() != null) activeRecipeBookScreen = new WeakReference<>(null);
     }
 
     /** The active page, or null if the owning screen is no longer open. */

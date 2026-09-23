@@ -2,8 +2,11 @@ package com.clientcraftmk4.pipeline;
 
 import com.clientcraftmk4.core.InventorySnapshot;
 import net.minecraft.client.gui.screens.recipebook.RecipeCollection;
+import net.minecraft.tags.TagKey;
+import net.minecraft.world.item.Item;
 
 import java.util.List;
+import java.util.Set;
 
 /**
  * Immutable input for one resolve (plan §9.1). Captured on the render thread,
@@ -16,7 +19,13 @@ public record ResolveRequest(
         int gridSize,
         long cacheKey,
         long modelGeneration,
-        InventorySnapshot snapshot
+        InventorySnapshot snapshot,
+        // Incremental-resolve inputs, captured with the request on the render thread:
+        // the previously published result (counts + snapshot to diff against; null on
+        // first run) and the craftable-tag order/content diff from the latest snapshot
+        // read (empty when indices didn't rebuild).
+        ResolveResult previous,
+        Set<TagKey<Item>> changedTags
 ) {
     /**
      * Packs the inventory generation above two grid-size bits. Generations are

@@ -5,13 +5,17 @@ import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.crafting.display.RecipeDisplay;
 import net.minecraft.world.item.crafting.display.RecipeDisplayEntry;
+import net.minecraft.world.item.crafting.display.RecipeDisplayId;
 import net.minecraft.world.item.crafting.display.ShapedCraftingRecipeDisplay;
 import net.minecraft.world.item.crafting.display.ShapelessCraftingRecipeDisplay;
 import net.minecraft.world.item.crafting.display.SlotDisplay;
 
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Pure helpers over vanilla {@link SlotDisplay} / {@link RecipeDisplay} trees.
@@ -21,6 +25,31 @@ import java.util.Set;
  */
 public final class RecipeDisplays {
     private RecipeDisplays() {}
+
+    /**
+     * Normalized slot lists per recipe entry. {@link #normalize} rebuilds Composite/WithRemainder
+     * wrappers on every call (Stream + toList + tree allocs, ~5000x/refresh on 26.3+); the result
+     * depends only on the display structure, so it is cached per {@link RecipeDisplayId} and
+     * cleared on recipe reload via {@link #clearSlotsCache()} (called from
+     * {@code CraftModel.markDirty/reset}).
+     */
+    private static final ConcurrentHashMap<RecipeDisplayId, List<SlotDisplay>> SLOTS_CACHE =
+            new ConcurrentHashMap<>();
+
+    /** Drops all cached normalized slot lists (recipe set changed). */
+    public static void clearSlotsCache() {
+        SLOTS_CACHE.clear();
+        clearTagCache();
+    }
+
+    /** Cached variant for callers that have the entry (hot paths prefer this). */
+    public static List<SlotDisplay> getSlots(RecipeDisplayEntry entry) {
+        List<SlotDisplay> cached = SLOTS_CACHE.get(entry.id());
+        if (cached != null) return cached;
+        List<SlotDisplay> slots = getSlots(entry.display());
+        if (slots != null) SLOTS_CACHE.put(entry.id(), slots);
+        return slots;
+    }
 
     public static List<SlotDisplay> getSlots(RecipeDisplay display) {
         if (display instanceof ShapedCraftingRecipeDisplay s) {
@@ -161,9 +190,118 @@ public final class RecipeDisplays {
         return ItemStack.EMPTY;
     }
 
+    /**
+     * Allocation-free {@link #resolveSlot}: returns the resolved item directly (null = empty)
+     * so hot loops avoid {@code new ItemStack} per slot per branch (100k+/resolve GC).
+     * Single-scan tag logic identical to {@link #resolveSlot}.
+     */
+    public static Item resolveSlotItem(SlotDisplay display, Map<Item, Integer> inventory,
+                                       TagIndex tags, boolean workingCopy) {
+        if (display instanceof SlotDisplay.Empty) return null;
+        if (display instanceof SlotDisplay.ItemSlotDisplay d) return d.item().value();
+        if (display instanceof SlotDisplay.ItemStackSlotDisplay d) return d.stack().item().value();
+        if (display instanceof SlotDisplay.TagSlotDisplay d) {
+            TagKey<Item> tag = getSlotTag(d);
+            Set<Item> matches = tags.inventoryTagMembers(tag);
+            if (matches != null) {
+                for (Item item : matches) {
+                    if (inventory.getOrDefault(item, 0) > 0) return item;
+                }
+            }
+            if (workingCopy) {
+                List<Item> craft = tags.craftableMembers(tag);
+                if (craft != null) {
+                    for (Item item : craft) {
+                        if (inventory.getOrDefault(item, 0) > 0) return item;
+                    }
+                }
+            }
+            List<Item> craftable = tags.craftableMembers(tag);
+            if (craftable != null && !craftable.isEmpty()) return craftable.getFirst();
+            return tags.tagFallbackItem(tag);
+        }
+        if (display instanceof SlotDisplay.WithRemainder d)
+            return resolveSlotItem(d.input(), inventory, tags, workingCopy);
+        if (display instanceof SlotDisplay.Composite d) {
+            Item fallback = null;
+            for (SlotDisplay sub : d.contents()) {
+                Item r = resolveSlotItem(sub, inventory, tags, workingCopy);
+                if (r != null) {
+                    if (inventory.getOrDefault(r, 0) > 0) return r;
+                    if (fallback == null) fallback = r;
+                }
+            }
+            return fallback;
+        }
+        return null;
+    }
+
+    /**
+     * WorkMap-backed {@link #resolveSlotItem} for the resolver hot loops: tag membership is
+     * tested against live working counts instead of a snapshot map.
+     */
+    public static Item resolveSlotItem(SlotDisplay display, WorkMap work, RecipeGraph graph, TagIndex tags) {
+        RecipeGraph.GraphFlatData f = graph.flat();
+        return resolveSlotItem(display, work, graph, f != null ? f.idToItem() : null, tags);
+    }
+
+    private static Item resolveSlotItem(SlotDisplay display, WorkMap work, RecipeGraph graph,
+                                        Item[] idToItem, TagIndex tags) {
+        if (display instanceof SlotDisplay.Empty) return null;
+        if (display instanceof SlotDisplay.ItemSlotDisplay d) return d.item().value();
+        if (display instanceof SlotDisplay.ItemStackSlotDisplay d) return d.stack().item().value();
+        if (display instanceof SlotDisplay.TagSlotDisplay d) {
+            TagKey<Item> tag = getSlotTag(d);
+            // Precomputed member ids in set/list order: same picks as iterating the member
+            // collections, minus per-candidate map hashing. Null pre-graph → legacy path.
+            int[] matchIds = tags.inventoryTagMemberIds(tag);
+            if (matchIds != null && idToItem != null) {
+                for (int mid : matchIds) {
+                    if (work.get(mid) > 0) return idToItem[mid];
+                }
+            } else {
+                Set<Item> matches = tags.inventoryTagMembers(tag);
+                if (matches != null) {
+                    for (Item item : matches) {
+                        if (work.get(graph.id(item)) > 0) return item;
+                    }
+                }
+            }
+            int[] craftIds = tags.craftableTagMemberIds(tag);
+            if (craftIds != null && idToItem != null) {
+                for (int cid : craftIds) {
+                    if (work.get(cid) > 0) return idToItem[cid];
+                }
+            } else {
+                List<Item> craft = tags.craftableMembers(tag);
+                if (craft != null) {
+                    for (Item item : craft) {
+                        if (work.get(graph.id(item)) > 0) return item;
+                    }
+                }
+            }
+            List<Item> craftable = tags.craftableMembers(tag);
+            if (craftable != null && !craftable.isEmpty()) return craftable.getFirst();
+            return tags.tagFallbackItem(tag);
+        }
+        if (display instanceof SlotDisplay.WithRemainder d) return resolveSlotItem(d.input(), work, graph, idToItem, tags);
+        if (display instanceof SlotDisplay.Composite d) {
+            Item fallback = null;
+            for (SlotDisplay sub : d.contents()) {
+                Item r = resolveSlotItem(sub, work, graph, idToItem, tags);
+                if (r != null) {
+                    if (work.get(graph.id(r)) > 0) return r;
+                    if (fallback == null) fallback = r;
+                }
+            }
+            return fallback;
+        }
+        return null;
+    }
+
     /** True if any ingredient slot of the entry's recipe strictly requires {@code target}. */
     public static boolean recipeConsumesItem(RecipeDisplayEntry entry, Item target) {
-        List<SlotDisplay> slots = getSlots(entry.display());
+        List<SlotDisplay> slots = getSlots(entry);
         if (slots == null) return false;
         for (SlotDisplay slot : slots) {
             if (slotRequiresItem(slot, target)) return true;
@@ -187,10 +325,29 @@ public final class RecipeDisplays {
         return false;
     }
 
+    /**
+     * Slot → tag cache. On 26.3+ every call allocates an {@code Optional} plus a HolderSet
+     * dereference, per tag slot per attempt. Slot→tag is static, so memoise it: identity
+     * semantics (records would hash DEEP — structural hash of the whole subtree per lookup,
+     * worse than the Optional). Vanilla slot objects are stable per recipe set; cleared with
+     * the slots cache on reload so nothing leaks across datapack syncs.
+     */
+    private static final Map<SlotDisplay, TagKey<Item>> SLOT_TAG_CACHE =
+            Collections.synchronizedMap(new IdentityHashMap<>());
+
+    /** Drops the slot→tag memo alongside the normalized-slots cache (recipe set changed). */
+    static void clearTagCache() {
+        SLOT_TAG_CACHE.clear();
+    }
+
     public static TagKey<Item> getSlotTag(SlotDisplay slot) {
         if (slot instanceof SlotDisplay.TagSlotDisplay d) {
             //? if >=26.3 {
-            return d.tag().unwrapKey().orElse(null);
+            TagKey<Item> cached = SLOT_TAG_CACHE.get(slot);
+            if (cached != null || SLOT_TAG_CACHE.containsKey(slot)) return cached;
+            TagKey<Item> tag = d.tag().unwrapKey().orElse(null);
+            SLOT_TAG_CACHE.put(slot, tag);
+            return tag;
             //?}
             //? if <26.3 {
             /*return d.tag();

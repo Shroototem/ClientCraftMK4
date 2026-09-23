@@ -32,7 +32,7 @@ import java.util.function.Consumer;
  * behaviour can be diagnosed from the log.
  */
 public final class ResolvePipeline {
-    private static final Logger LOG = LoggerFactory.getLogger("clientcraftmk4");
+    private static final Logger LOG = LoggerFactory.getLogger(com.clientcraftmk4.core.Constants.MOD_ID);
 
     private static final AtomicReference<ResolveRequest> pending = new AtomicReference<>();
     private static volatile ResolveResult latest = ResolveResult.EMPTY;
@@ -66,7 +66,8 @@ public final class ResolvePipeline {
         InventorySnapshot snap = InventoryProvider.current();
         List<RecipeCollection> allCrafting = book.getCollection(SearchRecipeBookCategory.CRAFTING);
         submit(new ResolveRequest(allCrafting, gridSize,
-                ResolveRequest.cacheKey(snap.generation(), gridSize), model.modelGeneration(), snap));
+                ResolveRequest.cacheKey(snap.generation(), gridSize), model.modelGeneration(), snap,
+                latest, InventoryProvider.lastChangedTags()));
 
         ResolveResult cur = latest;
         if (cur.collections().isEmpty()) {
@@ -106,9 +107,22 @@ public final class ResolvePipeline {
     }
 
     private static void compute(ResolveRequest r) {
+        // Tracks whether the render-thread drain was scheduled: the computing flag is
+        // cleared inside drainPending (render thread), not in the finally below. Clearing
+        // it here on the worker opens a window where a new submit sneaks past the CAS
+        // and queues a duplicate compute before the pending drain runs.
+        boolean posted = false;
         try {
-            long t0 = System.nanoTime();
-            var counts = CountEngine.compute(r.allCrafting(), r.gridSize(), r.snapshot(), r.modelGeneration());
+            boolean debug = ClientCraftConfig.debugLogging;
+            long t0 = debug ? System.nanoTime() : 0;
+            CountEngine.Previous prev = null;
+            ResolveResult p = r.previous();
+            if (p != null && p.snapshot() != null) {
+                prev = new CountEngine.Previous(p.counts(), p.containerCraftable(), p.snapshot(),
+                        ResolveRequest.gridSizeOf(p.cacheKey()));
+            }
+            var counts = CountEngine.compute(r.allCrafting(), r.gridSize(), r.snapshot(), r.modelGeneration(),
+                    prev, r.changedTags());
             if (counts.isEmpty()) {
                 // Stale (model advanced / no world) — the newer queued request will follow.
                 if (ClientCraftConfig.debugLogging) {
@@ -121,10 +135,11 @@ public final class ResolvePipeline {
                     if (cb != null) cb.accept(latest);
                     drainPending(-1);
                 });
+                posted = true;
                 return;
             }
             ResolveResult result = CollectionAssembler.assemble(r, counts);
-            if (ClientCraftConfig.debugLogging) {
+            if (debug) {
                 LOG.info("[CC] Resolve: computed {} collections, {} counted entries, {} container entries ({}ms)",
                         result.collections().size(), result.counts().size(),
                         result.containerCraftable().size(), (System.nanoTime() - t0) / 1_000_000);
@@ -149,6 +164,7 @@ public final class ResolvePipeline {
                 if (cb != null) cb.accept(result);
                 drainPending(r.cacheKey());
             });
+            posted = true;
         } catch (Exception e) {
             LOG.error("[CC] Background resolve failed", e);
             // Self-heal: re-run the callback so the tab re-submits instead of staying
@@ -158,8 +174,12 @@ public final class ResolvePipeline {
                 if (cb != null) cb.accept(latest);
                 drainPending(-1);
             });
+            posted = true;
         } finally {
-            computing.set(false);
+            // Fallback for when the render-thread post itself threw (e.g. client
+            // shutting down): without this the pipeline would wedge with computing
+            // stuck true. The normal path clears the flag in drainPending instead.
+            if (!posted) computing.set(false);
         }
     }
 
@@ -171,9 +191,46 @@ public final class ResolvePipeline {
      * would leave, say, 3×3 results rendered in the 2×2 grid.
      */
     private static void drainPending(long justPublishedKey) {
+        // Render thread owns this flag now (all submit() callers are render-thread too,
+        // so no interleaving is possible here — unlike the old worker-side clear).
+        computing.set(false);
         ResolveRequest next = pending.getAndSet(null);
         if (next != null && !shouldDropQueued(next.cacheKey(), justPublishedKey)) {
-            WORKER.submit(() -> compute(next));
+            submit(next);
+        }
+    }
+
+    /** Stops the worker thread (client shutdown). In-flight work is discarded. */
+    public static void shutdown() {
+        pending.set(null);
+        WORKER.shutdownNow();
+    }
+
+    private static final AtomicBoolean warmupPending = new AtomicBoolean();
+
+    /**
+     * Marks that recipe data was (re)synced and the caches are cold. A client tick consumes
+     * the flag and submits a warmup resolve once the world is ready — the worker then pays
+     * the cold cost (graph build, cache fills, JIT) while the tab still shows its placeholder,
+     * instead of on first tab open. Fully deduped by the normal submit path.
+     */
+    public static void requestWarmup() {
+        warmupPending.set(true);
+    }
+
+    public static void clearWarmup() {
+        warmupPending.set(false);
+    }
+
+    /** Runs the pending warmup resolve, if any and if the world is ready. Tick-thread only. */
+    public static void warmupIfRequested() {
+        if (!warmupPending.getAndSet(false)) return;
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.player == null || mc.level == null) return;
+        try {
+            submit(ResolveRequests.fromContext());
+        } catch (Exception e) {
+            LOG.error("[CC] Warmup resolve failed", e);
         }
     }
 

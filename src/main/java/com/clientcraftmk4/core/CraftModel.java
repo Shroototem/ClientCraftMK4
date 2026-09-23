@@ -19,8 +19,10 @@ import java.util.List;
  * version and lets in-flight resolves detect staleness (plan §9.3).
  */
 public final class CraftModel {
-    private static final Logger LOG = LoggerFactory.getLogger("clientcraftmk4");
+    private static final Logger LOG = LoggerFactory.getLogger(Constants.MOD_ID);
     private static final Object LOCK = new Object();
+    /** Guards only the lazy graph build: building under LOCK blocked index readers for ~30ms. */
+    private static final Object GRAPH_LOCK = new Object();
     private static volatile CraftModel cached;
     private static volatile long generation = 0;
     private static volatile boolean dirty = true;
@@ -29,7 +31,7 @@ public final class CraftModel {
     private final RecipeIndex recipeIndex;
     private final TagIndex tagIndex;
     private final long modelGeneration;
-    private RecipeGraph graph;          // lazily built, guarded by LOCK
+    private volatile RecipeGraph graph; // lazily built, guarded by GRAPH_LOCK
 
     private CraftModel(RecipeIndex recipeIndex, TagIndex tagIndex, long modelGeneration) {
         this.recipeIndex = recipeIndex;
@@ -79,17 +81,23 @@ public final class CraftModel {
     public static RecipeGraph graph() {
         CraftModel model = current();
         if (model == null) return null;
-        synchronized (LOCK) {
-            if (model.graph == null) {
+        RecipeGraph g = model.graph;
+        if (g != null) return g;
+        // Built under a dedicated lock so the ~30ms build never blocks index readers
+        // holding LOCK; double-checked so concurrent callers share one build.
+        synchronized (GRAPH_LOCK) {
+            g = model.graph;
+            if (g == null) {
                 long t0 = ClientCraftConfig.debugLogging ? System.nanoTime() : 0;
-                model.graph = GraphBuilder.build(model.recipeIndex(), model.tagIndex());
+                g = GraphBuilder.build(model.recipeIndex(), model.tagIndex());
+                model.graph = g;
                 if (ClientCraftConfig.debugLogging) {
                     LOG.info("[CC] Graph build: {} items, {} recipes ({}ms)",
-                            model.graph.flat().n(), model.graph.flat().totalRecipes(),
+                            g.flat().n(), g.flat().totalRecipes(),
                             (System.nanoTime() - t0) / 1_000_000);
                 }
             }
-            return model.graph;
+            return g;
         }
     }
 
@@ -110,6 +118,7 @@ public final class CraftModel {
             dirty = true;
             generation++;
             lastRecipeCount = -1;
+            RecipeDisplays.clearSlotsCache();
         }
     }
 
@@ -119,6 +128,7 @@ public final class CraftModel {
             dirty = true;
             generation++;
             lastRecipeCount = -1;
+            RecipeDisplays.clearSlotsCache();
         }
     }
 }

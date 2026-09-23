@@ -51,11 +51,15 @@ public abstract class RecipeButtonMixin {
 
     @Inject(method = "extractWidgetRenderState", at = @At("TAIL"))
     private void clientcraft$renderCraftCount(GuiGraphicsExtractor context, int mouseX, int mouseY, float deltaTicks, CallbackInfo ci) {
-        if (!ResultButtonRenderer.isAutoCraftCollection(getCollection())) return;
+        // One pipeline snapshot per button per frame: previously 3 volatile reads plus
+        // 3 getCurrentRecipe() evaluations; now 1 read and 1 evaluation.
+        com.clientcraftmk4.pipeline.ResolveResult snapshot = ResultButtonRenderer.snapshot();
+        if (!ResultButtonRenderer.isAutoCraftCollection(snapshot, getCollection())) return;
 
         RecipeButton self = (RecipeButton) (Object) this;
-        int count = ResultButtonRenderer.getCraftCount(getCurrentRecipe());
-        boolean container = ResultButtonRenderer.isContainerCraftable(getCurrentRecipe());
+        RecipeDisplayId currentRecipe = getCurrentRecipe();
+        int count = ResultButtonRenderer.getCraftCount(snapshot, currentRecipe);
+        boolean container = ResultButtonRenderer.isContainerCraftable(snapshot, currentRecipe);
         int x = self.getX(), y = self.getY(), w = self.getWidth(), h = self.getHeight();
 
         if (container) {

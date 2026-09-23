@@ -72,11 +72,14 @@ public class RecipeBookPageMixin implements RecipeBookPageCycleAccessor {
             if (!button.isMouseOver(event.x(), event.y())) continue;
 
             RecipeCollection collection = button.getCollection();
-            if (!ResultButtonRenderer.isAutoCraftCollection(collection)) return;
+            // One pipeline snapshot per click (was a volatile read per entry below).
+            com.clientcraftmk4.pipeline.ResolveResult snapshot = ResultButtonRenderer.snapshot();
+            if (!ResultButtonRenderer.isAutoCraftCollection(snapshot, collection)) return;
 
-            List<RecipeDisplayEntry> variants = new ArrayList<>();
-            for (RecipeDisplayEntry entry : collection.getRecipes()) {
-                if (collection.isCraftable(entry.id()) || ResultButtonRenderer.isContainerCraftable(entry.id())) {
+            List<RecipeDisplayEntry> recipes = collection.getRecipes();
+            List<RecipeDisplayEntry> variants = new ArrayList<>(recipes.size());
+            for (RecipeDisplayEntry entry : recipes) {
+                if (collection.isCraftable(entry.id()) || ResultButtonRenderer.isContainerCraftable(snapshot, entry.id())) {
                     variants.add(entry);
                 }
             }

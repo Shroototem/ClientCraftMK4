@@ -5,6 +5,7 @@ import com.clientcraftmk4.core.RecipeIndex;
 import com.clientcraftmk4.craft.AutoCrafter;
 import com.clientcraftmk4.mixin.accessor.RecipeBookComponentAccessor;
 import com.clientcraftmk4.pipeline.ResolvePipeline;
+import com.clientcraftmk4.pipeline.ResolveResult;
 import com.clientcraftmk4.ui.ClientCraftTab;
 import com.clientcraftmk4.ui.ResultButtonRenderer;
 import com.clientcraftmk4.ui.ScrollController;
@@ -23,6 +24,7 @@ import net.minecraft.world.item.crafting.display.RecipeDisplayId;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
@@ -148,10 +150,40 @@ public class RecipeBookComponentMixin {
         ci.cancel();
     }
 
+    @Unique private ResolveResult clientcraft$lastResult;
+    @Unique private String clientcraft$lastQuery = "";
+    @Unique private boolean clientcraft$lastFiltering;
+    @Unique private List<RecipeCollection> clientcraft$lastFiltered;
+
     private void applyFilteredResults(boolean resetCurrentPage, boolean filteringCraftable) {
         Minecraft client = Minecraft.getInstance();
         if (client.player == null) return;
 
+        // One pipeline snapshot per refresh (was a volatile read per rank comparison
+        // plus one per container check); the memoized list below skips the whole
+        // filter+sort when nothing it depends on changed.
+        ResolveResult rr = ResolvePipeline.current();
+        String query = searchBox != null ? searchBox.getValue().toLowerCase(Locale.ROOT) : "";
+
+        List<RecipeCollection> filtered;
+        if (rr == clientcraft$lastResult && query.equals(clientcraft$lastQuery)
+                && filteringCraftable == clientcraft$lastFiltering && clientcraft$lastFiltered != null) {
+            filtered = new ArrayList<>(clientcraft$lastFiltered);
+        } else {
+            filtered = computeFilteredResults(client, rr, query, filteringCraftable);
+            clientcraft$lastResult = rr;
+            clientcraft$lastQuery = query;
+            clientcraft$lastFiltering = filteringCraftable;
+            clientcraft$lastFiltered = filtered;
+            // Defensive copy on the way out so vanilla can never mutate the cached list.
+            filtered = new ArrayList<>(filtered);
+        }
+
+        recipeBookPage.updateCollections(filtered, resetCurrentPage, filteringCraftable);
+    }
+
+    private List<RecipeCollection> computeFilteredResults(Minecraft client, ResolveResult rr,
+                                                          String query, boolean filteringCraftable) {
         List<RecipeCollection> list = client.player.getRecipeBook()
                 .getCollection(selectedTab.getCategory());
         List<RecipeCollection> filtered = new ArrayList<>(list);
@@ -159,7 +191,6 @@ public class RecipeBookComponentMixin {
 
         CraftModel model = CraftModel.current();
         if (model != null) {
-            String query = searchBox != null ? searchBox.getValue().toLowerCase(Locale.ROOT) : "";
             if (!query.isEmpty()) {
                 RecipeIndex index = model.recipeIndex();
                 filtered.removeIf(coll -> {
@@ -176,14 +207,13 @@ public class RecipeBookComponentMixin {
             filtered.removeIf(coll -> {
                 if (coll.hasCraftable()) return false;
                 for (RecipeDisplayEntry entry : coll.getRecipes()) {
-                    if (ResultButtonRenderer.isContainerCraftable(entry.id())) return false;
+                    if (ResultButtonRenderer.isContainerCraftable(rr, entry.id())) return false;
                 }
                 return true;
             });
         }
 
-        filtered.sort(Comparator.comparingInt(ResultButtonRenderer::getCollectionRank));
-
-        recipeBookPage.updateCollections(filtered, resetCurrentPage, filteringCraftable);
+        filtered.sort(Comparator.comparingInt(coll -> ResultButtonRenderer.getCollectionRank(rr, coll)));
+        return filtered;
     }
 }
