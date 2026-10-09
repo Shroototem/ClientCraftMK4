@@ -17,10 +17,9 @@ stonecutter {
     kotlinController = false
     centralScript = "build.gradle"
     create(rootProject) {
-        // '26.4-snapshot-1' parked until Fabric ships a +26.4 build (poisons all
-        // Gradle invocations while unresolvable). Prep stub lives in
-        // versions/26.4-snapshot-1/gradle.properties — just uncomment below.
-        versions /* '26.4-snapshot-1', */ '26.3', '26.2', '26.1.2'
+        // '26.4-snapshot-3' is live now that Fabric ships 0.162.2+26.4 (the +26.4 builds
+        // map onto snapshots 1:1). Versions live in versions/<ver>/gradle.properties.
+        versions '26.4-snapshot-3', '26.3', '26.2', '26.1.2'
         vcsVersion = '26.3'
     }
 }

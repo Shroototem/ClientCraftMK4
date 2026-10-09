@@ -68,7 +68,13 @@ public class RecipeBookPageMixin implements RecipeBookPageCycleAccessor {
         if (overlay.isVisible()) return;
 
         for (RecipeButton button : buttons) {
+            // 26.4 made AbstractWidget.visible protected; isVisible() is the public accessor.
+            //? if >=26.4-snapshot-3 {
+            /*if (!button.isVisible()) continue;
+            *///?}
+            //? if <26.4-snapshot-3 {
             if (!button.visible) continue;
+            //?}
             if (!button.isMouseOver(event.x(), event.y())) continue;
 
             RecipeCollection collection = button.getCollection();
