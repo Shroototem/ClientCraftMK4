@@ -133,7 +133,24 @@ public final class OverlayBuilder {
                 && cached.result() == result) {
             return;
         }
-        computeGridCraftability(grid, model, gridSize, snap, result.containerAvailableItems());
+        // Container-visible items for the purple tint: items physically inside
+        // containers (the snapshot's container map) ∪ outputs of container-craftable
+        // recipes (items obtainable only by crafting from container contents).
+        // The recipe-output set alone never contains raw materials without a
+        // crafting recipe (cobblestone, diamonds in a shulker) — those sat in a
+        // container yet tinted gray instead of purple (issue #9).
+        Set<Item> containerAvailable = result.containerAvailableItems();
+        if (!snap.container().isEmpty()) {
+            if (containerAvailable.isEmpty()) {
+                containerAvailable = snap.container().keySet();
+            } else {
+                Set<Item> merged = new HashSet<>(containerAvailable.size() + snap.container().size());
+                merged.addAll(containerAvailable);
+                merged.addAll(snap.container().keySet());
+                containerAvailable = merged;
+            }
+        }
+        computeGridCraftability(grid, model, gridSize, snap, containerAvailable);
         craftabilityCache = new CraftabilityCache(
                 grid, snap.generation(), model.modelGeneration(), gridSize, result);
     }
@@ -278,16 +295,26 @@ public final class OverlayBuilder {
             if (have >= 1) {
                 remaining.put(item, have - 1);
                 grid.craftable[i] = true;
-            } else if (hasContainer) {
+                continue;
+            }
+            // Sub-craft before the container probe: a tile producible from the
+            // physical inventory is craftable even when a copy of the same item
+            // also sits in a container — the craft never touches container
+            // contents, so it must not read as container-only (a false purple
+            // would also block the result click via isFullyCraftable).
+            if (tryConsumeSubCraft(item, remaining, ctx)) {
+                grid.craftable[i] = true;
+                continue;
+            }
+            // Container-only → purple: the item (or a tag sibling) is physically
+            // inside a container, or craftable exclusively from container
+            // contents (a containerCraftable recipe's output).
+            if (hasContainer) {
                 Item found = findInSet(grid.slots[i], item, containerAvailable, model.tagIndex());
                 if (found != null) {
                     grid.inContainer[i] = true;
                     if (found != item) grid.items[i] = new ItemStack(found);
-                } else {
-                    grid.craftable[i] = tryConsumeSubCraft(item, remaining, ctx);
                 }
-            } else {
-                grid.craftable[i] = tryConsumeSubCraft(item, remaining, ctx);
             }
         }
     }
