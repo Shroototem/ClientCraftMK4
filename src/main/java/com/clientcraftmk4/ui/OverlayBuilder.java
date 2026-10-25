@@ -47,10 +47,26 @@ public final class OverlayBuilder {
         private final SlotDisplay[] slots = new SlotDisplay[9];
         private final boolean[] craftable = new boolean[9];
         private final boolean[] inContainer = new boolean[9];
+        /** Output of the recipe this grid is showing; sub-crafts must not loop back to it. */
+        private Item recipeOutput;
 
         public ItemStack get(int index) { return items[index]; }
         public boolean hasCraftable(int index) { return craftable[index]; }
         public boolean isInContainer(int index) { return inContainer[index]; }
+        public Item recipeOutput() { return recipeOutput; }
+
+        /**
+         * True only when every displayed ingredient is available from the physical
+         * inventory (no gray "missing" and no purple "container-only" tiles). A
+         * container item can't be moved into the crafting grid, so such a recipe
+         * must never be executed.
+         */
+        public boolean isFullyCraftable() {
+            for (int i = 0; i < 9; i++) {
+                if (!craftable[i] || inContainer[i]) return false;
+            }
+            return true;
+        }
     }
 
     private static IngredientGrid activeGrid;
@@ -87,6 +103,7 @@ public final class OverlayBuilder {
         if (slots == null || slots.isEmpty()) return null;
 
         IngredientGrid grid = new IngredientGrid();
+        grid.recipeOutput = RecipeDisplays.getOutputItem(display, snap.inventory(), model.tagIndex());
         Arrays.fill(grid.items, ItemStack.EMPTY);
         fillGrid(grid, display, slots, model, gridSize, snap);
 
@@ -132,7 +149,7 @@ public final class OverlayBuilder {
                 if (srcIdx >= slots.size()) continue;
                 SlotDisplay slot = slots.get(srcIdx);
                 if (slot instanceof SlotDisplay.Empty) continue;
-                ItemStack resolved = resolveGridSlot(slot, model, gridSize, snap);
+                ItemStack resolved = resolveGridSlot(slot, model, gridSize, snap, grid.recipeOutput());
                 if (!resolved.isEmpty()) {
                     int gridIdx = row * 3 + col;
                     grid.items[gridIdx] = resolved;
@@ -144,7 +161,7 @@ public final class OverlayBuilder {
             for (int i = 0, len = slots.size(); i < len && idx < 9; i++) {
                 SlotDisplay slot = slots.get(i);
                 if (slot instanceof SlotDisplay.Empty) continue;
-                ItemStack resolved = resolveGridSlot(slot, model, gridSize, snap);
+                ItemStack resolved = resolveGridSlot(slot, model, gridSize, snap, grid.recipeOutput());
                 if (!resolved.isEmpty()) {
                     grid.items[idx] = resolved;
                     grid.slots[idx] = slot;
@@ -154,14 +171,15 @@ public final class OverlayBuilder {
         }
     }
 
-    private static ItemStack resolveGridSlot(SlotDisplay slot, CraftModel model, int gridSize, InventorySnapshot snap) {
+    private static ItemStack resolveGridSlot(SlotDisplay slot, CraftModel model, int gridSize,
+                                              InventorySnapshot snap, Item rootOutput) {
         TagIndex tags = model.tagIndex();
         // First try: item already in inventory
         ItemStack direct = RecipeDisplays.resolveSlot(slot, snap.inventory(), tags, false);
         if (!direct.isEmpty() && snap.inventory().getOrDefault(direct.getItem(), 0) > 0) return direct;
 
         // Second try: find an item we can sub-craft that satisfies this slot
-        ItemStack craftable = findCraftableForSlot(slot, model, gridSize, snap);
+        ItemStack craftable = findCraftableForSlot(slot, model, gridSize, rootOutput, snap);
         if (craftable != null) return craftable;
 
         // Fallback: resolveSlot is deterministic, so recomputing an empty result would
@@ -172,7 +190,9 @@ public final class OverlayBuilder {
     /**
      * Per-overlay-build resolve state: the old code rebuilt the graph handle,
      * resolve context and in-progress set per sub-recipe attempt. Hoisting is
-     * outcome-identical (same model/gridSize throughout one build).
+     * outcome-identical (same model/gridSize throughout one build), except
+     * {@code rootOutput} — the viewed recipe's output, passed through to the
+     * resolver so looped sub-crafts are rejected like everywhere else.
      */
     private static final class SubCraftCtx {
         final CraftModel model;
@@ -180,19 +200,22 @@ public final class OverlayBuilder {
         final RecipeGraph graph;
         final GraphFlatData flat;
         final ResolveContext resolveCtx;
+        final Item rootOutput;
         final Set<Item> inProgress = new HashSet<>();
 
-        SubCraftCtx(CraftModel model, int gridSize) {
+        SubCraftCtx(CraftModel model, int gridSize, Item rootOutput) {
             this.model = model;
             this.gridSize = gridSize;
             this.graph = model.graph();
             this.flat = graph != null ? graph.flat() : null;
             this.resolveCtx = ResolveContext.of(model, gridSize);
+            this.rootOutput = rootOutput;
         }
     }
 
-    private static ItemStack findCraftableForSlot(SlotDisplay slot, CraftModel model, int gridSize, InventorySnapshot snap) {
-        return findCraftableForSlot(slot, new SubCraftCtx(model, gridSize), snap);
+    private static ItemStack findCraftableForSlot(SlotDisplay slot, CraftModel model, int gridSize,
+                                                  Item rootOutput, InventorySnapshot snap) {
+        return findCraftableForSlot(slot, new SubCraftCtx(model, gridSize, rootOutput), snap);
     }
 
     private static ItemStack findCraftableForSlot(SlotDisplay slot, SubCraftCtx ctx, InventorySnapshot snap) {
@@ -238,10 +261,14 @@ public final class OverlayBuilder {
                                                 InventorySnapshot snap, Set<Item> containerAvailable) {
         Map<Item, Integer> remaining = sizedCopy(snap.inventory());
         boolean hasContainer = !containerAvailable.isEmpty();
-        SubCraftCtx ctx = new SubCraftCtx(model, gridSize);
+        SubCraftCtx ctx = new SubCraftCtx(model, gridSize, grid.recipeOutput());
 
         for (int i = 0; i < 9; i++) {
             ItemStack stack = grid.items[i];
+            // Reset both tints per pass: a previous refresh may have set either flag
+            // (see the craftable/inContainer branch structure below).
+            grid.craftable[i] = false;
+            grid.inContainer[i] = false;
             if (stack.isEmpty()) {
                 grid.craftable[i] = true;
                 continue;
@@ -265,15 +292,27 @@ public final class OverlayBuilder {
         }
     }
 
-    /** Tests if {@code item} can be sub-crafted from {@code available}; if so, deducts consumed resources. */
+    /**
+     * Tests if {@code item} can be sub-crafted from {@code available}; if so, deducts consumed
+     * resources. {@code ctx.rootOutput} (the viewed recipe's output) is passed as the resolver's
+     * root output, so sub-chains that loop back to the recipe's own output are rejected — the
+     * same guard the planner applies. Without it, an iron-block recipe whose ingredient grid
+     * resolves ingots via the iron-block uncrafting recipe shows every tile as craftable.
+     */
     private static boolean tryConsumeSubCraft(Item item, Map<Item, Integer> available, SubCraftCtx ctx) {
         List<RecipeDisplayEntry> subs = ctx.model.recipeIndex().get(item);
         if (subs == null || ctx.graph == null || ctx.flat == null) return false;
         for (RecipeDisplayEntry sub : subs) {
             if (!RecipeDisplays.fitsInGrid(sub.display(), ctx.gridSize)) continue;
+            // Mirror of the resolver's trySubCraft guard, applied to the candidate itself:
+            // a recipe that strictly requires the viewed recipe's output would loop
+            // (iron ingot <- iron block while crafting an iron block), and the main
+            // craft view already rejects it — the variant grid must agree.
+            if (ctx.rootOutput != null
+                    && ctx.model.recipeIndex().requiredItems(sub).contains(ctx.rootOutput)) continue;
             WorkMap work = WorkMap.from(available, ctx.graph);
             ctx.inProgress.clear();
-            if (ctx.resolveCtx.resolve(sub, work, null, ctx.inProgress, 0, null)) {
+            if (ctx.resolveCtx.resolve(sub, work, null, ctx.inProgress, 0, ctx.rootOutput)) {
                 // Write the journal-backed changes back into the plain map. Only ids in
                 // the present list can differ: untouched ids read 0 in the work map only
                 // if they were never filled — but fill covers exactly the map's keys, so

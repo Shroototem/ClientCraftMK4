@@ -103,6 +103,12 @@ public final class CraftPlanner {
         int gridSize = GameContext.gridSize();
         InventorySnapshot snap = InventoryProvider.current();
 
+        // A recipe larger than the open grid cannot be placed. Vanilla's
+        // ServerPlaceRecipe does not reject it either: it fills the top-left
+        // subset of the pattern into the smaller grid, which can match a
+        // different recipe (e.g. a 2x3 door leaves 2x2 planks -> crafting table).
+        if (!RecipeDisplays.fitsInGrid(target.display(), gridSize)) return null;
+
         PlanKey key = new PlanKey(target.id(), mode, snap.generation(), model.modelGeneration(), gridSize);
         synchronized (planCache) {
             AutoCrafter.CraftPlan cached = planCache.get(key);

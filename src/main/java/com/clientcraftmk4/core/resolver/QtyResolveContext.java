@@ -104,6 +104,8 @@ public final class QtyResolveContext {
                               List<RecipeDisplayId> stepsOut, Set<Item> inProgress,
                               int depth, Item rootOutput) {
         if (depth > Constants.MAX_DEPTH || qty <= 0) return false;
+        // Root recipes must fit the open grid (sub-recipes are filtered in trySubCraftQty).
+        if (depth == 0 && !RecipeDisplays.fitsInGrid(entry.display(), gridSize)) return false;
 
         List<SlotDisplay> slots = RecipeDisplays.getSlots(entry);
         if (slots == null || slots.isEmpty()) return false;

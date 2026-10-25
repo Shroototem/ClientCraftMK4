@@ -1,6 +1,7 @@
 package com.clientcraftmk4.mixin;
 
 import com.clientcraftmk4.core.CraftModel;
+import com.clientcraftmk4.core.GameContext;
 import com.clientcraftmk4.core.RecipeDisplays;
 import com.clientcraftmk4.mixin.accessor.RecipeCollectionAccessor;
 import com.clientcraftmk4.pipeline.ResolvePipeline;
@@ -120,6 +121,11 @@ public class OverlayRecipeComponentMixin {
             return;
         }
 
+        // Every click starts by clearing the previous action. Otherwise a right-click
+        // that consumes without acting (e.g. on the output panel) leaves the last
+        // crafted recipe in this field, and RecipeBookPage replays it as a craft.
+        this.lastRecipeClicked = null;
+
         // Right-click on an ingredient tile → navigate to that item's recipe
         //? if >=26.3 {
         if (event.button() == 3) {
@@ -191,7 +197,14 @@ public class OverlayRecipeComponentMixin {
         if (inResult) {
             RecipeDisplayEntry target = VariantState.getActiveVariant();
             RecipeCollection activeColl = VariantState.getActiveCollection();
-            if (target != null && activeColl != null) {
+            // Only act on a recipe that can actually be placed in the open grid and
+            // whose ingredient grid is fully craftable (no gray/purple tiles). A 3x3
+            // recipe viewed from the 2x2 inventory would otherwise be placed as its
+            // top-left 2x2 subset and could craft a different item.
+            OverlayBuilder.refreshActiveGridCraftability();
+            if (target != null && activeColl != null
+                    && RecipeDisplays.fitsInGrid(target.display(), GameContext.gridSize())
+                    && grid.isFullyCraftable()) {
                 // Setting these makes vanilla's subsequent tryPlaceRecipe fire —
                 // no extra AutoCrafter call here, that would double-craft (§14.4).
                 this.lastRecipeClicked = target.id();
@@ -313,13 +326,23 @@ public class OverlayRecipeComponentMixin {
         context.fill(uiX, uiY + gridPixelSize + 2 * BORDER,
                 uiX + overlayW, uiY + gridPixelSize + 2 * BORDER + 1, lineColor);
 
+        // The overlay always draws a 3x3 reference grid, but the inventory only exposes
+        // a 2x2 crafting grid. When the viewed recipe needs more than that, mark only the
+        // top-left gridSize x gridSize cells as usable: dim the rest and outline the area
+        // the player can actually fill, so an uncraftable recipe is visually obvious.
+        int gridSize = GameContext.gridSize();
+        RecipeDisplayEntry active = VariantState.getActiveVariant();
+        boolean tooLargeForGrid = active != null && !RecipeDisplays.fitsInGrid(active.display(), gridSize);
+
         for (int row = 0; row < 3; row++) {
             for (int col = 0; col < 3; col++) {
                 int idx = row * 3 + col;
                 int tileX = uiX + BORDER + col * TILE_SIZE;
                 int tileY = uiY + BORDER + row * TILE_SIZE;
+                boolean outsideGrid = tooLargeForGrid && (row >= gridSize || col >= gridSize);
 
-                int color = grid.hasCraftable(idx) ? 0xFF8B8B8B
+                int color = outsideGrid ? 0xFF2B2B2B
+                          : grid.hasCraftable(idx) ? 0xFF8B8B8B
                           : grid.isInContainer(idx) ? 0xFF7B2FBE : 0xFF555555;
                 context.fill(tileX, tileY, tileX + TILE_SIZE, tileY + TILE_SIZE, color);
 
@@ -341,7 +364,26 @@ public class OverlayRecipeComponentMixin {
                                 stack.get(DataComponents.TOOLTIP_STYLE));
                     }
                 }
+
+                // Dim ingredients that fall outside the usable grid after the item is
+                // drawn, so the whole out-of-bounds region reads as disabled.
+                if (outsideGrid) {
+                    context.fill(tileX, tileY, tileX + TILE_SIZE, tileY + TILE_SIZE, 0x99000000);
+                }
             }
+        }
+
+        if (tooLargeForGrid) {
+            int usableW = gridSize * TILE_SIZE;
+            int usableH = gridSize * TILE_SIZE;
+            int bx = uiX + BORDER;
+            int by = uiY + BORDER;
+            int warning = 0xFFFF5555;
+            // Inset outline marking the cells that fit the open crafting grid.
+            context.fill(bx, by, bx + usableW, by + 1, warning);
+            context.fill(bx, by + usableH - 1, bx + usableW, by + usableH, warning);
+            context.fill(bx, by, bx + 1, by + usableH, warning);
+            context.fill(bx + usableW - 1, by, bx + usableW, by + usableH, warning);
         }
 
         int count = VariantState.getActiveVariantCount();
@@ -349,7 +391,6 @@ public class OverlayRecipeComponentMixin {
         // Result panel: the current variant's output item + count, to the right
         // of the ingredient grid, so recipes with different output amounts are
         // distinguishable while cycling variants.
-        RecipeDisplayEntry active = VariantState.getActiveVariant();
         if (active != null) {
             CraftModel model = CraftModel.current();
             if (model != null) {

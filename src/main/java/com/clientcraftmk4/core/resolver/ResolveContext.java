@@ -106,6 +106,10 @@ public final class ResolveContext {
     public boolean resolve(RecipeDisplayEntry entry, WorkMap work, List<RecipeDisplayId> stepsOut,
                            Set<Item> inProgress, int depth, Item rootOutput) {
         if (depth > Constants.MAX_DEPTH) return false;
+        // The root recipe must fit the open grid; sub-recipes are already filtered
+        // in trySubCraft. Without this, a 3x3 recipe viewed from the 2x2 inventory
+        // resolves successfully and gets placed as a partial (wrong) pattern.
+        if (depth == 0 && !RecipeDisplays.fitsInGrid(entry.display(), gridSize)) return false;
 
         List<SlotDisplay> slots = RecipeDisplays.getSlots(entry);
         if (slots == null || slots.isEmpty()) return false;
