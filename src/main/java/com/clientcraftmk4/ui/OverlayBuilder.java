@@ -4,6 +4,7 @@ import com.clientcraftmk4.core.CraftModel;
 import com.clientcraftmk4.core.GameContext;
 import com.clientcraftmk4.core.RecipeGraph;
 import com.clientcraftmk4.core.RecipeGraph.GraphFlatData;
+import com.clientcraftmk4.core.RecipeIndex;
 import com.clientcraftmk4.core.InventoryProvider;
 import com.clientcraftmk4.core.InventorySnapshot;
 import com.clientcraftmk4.core.RecipeDisplays;
@@ -14,6 +15,7 @@ import com.clientcraftmk4.mixin.accessor.RecipeCollectionAccessor;
 import com.clientcraftmk4.pipeline.ResolvePipeline;
 import com.clientcraftmk4.pipeline.ResolveResult;
 import net.minecraft.client.gui.screens.recipebook.RecipeCollection;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.tags.TagKey;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
@@ -241,7 +243,21 @@ public final class OverlayBuilder {
             TagKey<Item> tag = RecipeDisplays.getSlotTag(d);
             Set<Item> invMatches = tags.inventoryTagMembers(tag);
             if (invMatches != null && !invMatches.isEmpty()) {
-                return new ItemStack(invMatches.iterator().next());
+                // Show the member the craft would actually draw first: the most
+                // abundant pool member (issue #8), not an arbitrary set-order pick.
+                Item best = null;
+                int bestCount = 0, bestId = Integer.MAX_VALUE;
+                for (Item item : invMatches) {
+                    int count = snap.inventory().getOrDefault(item, 0);
+                    if (count <= 0) continue;
+                    int id = BuiltInRegistries.ITEM.getId(item);
+                    if (count > bestCount || (count == bestCount && id < bestId)) {
+                        best = item;
+                        bestCount = count;
+                        bestId = id;
+                    }
+                }
+                if (best != null) return new ItemStack(best);
             }
             List<Item> craftable = tags.craftableMembers(tag);
             if (craftable != null) {
@@ -279,17 +295,43 @@ public final class OverlayBuilder {
         Map<Item, Integer> remaining = sizedCopy(snap.inventory());
         boolean hasContainer = !containerAvailable.isEmpty();
         SubCraftCtx ctx = new SubCraftCtx(model, gridSize, grid.recipeOutput());
+        RecipeIndex index = model.recipeIndex();
 
+        // Reset both tints per pass: a previous refresh may have set either flag
+        // (see the craftable/inContainer branch structure below).
         for (int i = 0; i < 9; i++) {
-            ItemStack stack = grid.items[i];
-            // Reset both tints per pass: a previous refresh may have set either flag
-            // (see the craftable/inContainer branch structure below).
             grid.craftable[i] = false;
             grid.inContainer[i] = false;
-            if (stack.isEmpty()) {
-                grid.craftable[i] = true;
-                continue;
+            if (grid.items[i].isEmpty()) grid.craftable[i] = true;
+        }
+
+        // Issue #8: evaluate tiles in the planner's resolve order — least-flexible
+        // (type-specific) ingredients first, tag-flexible ones last. Grid display order
+        // is unchanged; only the consumption order moves, so the tints and the click
+        // gate agree with the plan the crafter will actually execute (a flexible tile
+        // must not report green by eating planks the specific tile still needs, nor
+        // red because the old order already spent them elsewhere).
+        int[] rank = new int[9];
+        int[] order = new int[9];
+        int n = 0;
+        for (int i = 0; i < 9; i++) {
+            if (grid.items[i].isEmpty()) continue;
+            rank[i] = grid.slots[i] != null ? index.slotRank(grid.slots[i]) : 0;
+            order[n++] = i;
+        }
+        for (int k = 1; k < n; k++) {          // stable insertion sort by rank
+            int idx = order[k], r = rank[idx];
+            int j = k - 1;
+            while (j >= 0 && rank[order[j]] > r) {
+                order[j + 1] = order[j];
+                j--;
             }
+            order[j + 1] = idx;
+        }
+
+        for (int k = 0; k < n; k++) {
+            int i = order[k];
+            ItemStack stack = grid.items[i];
             Item item = stack.getItem();
             int have = remaining.getOrDefault(item, 0);
             if (have >= 1) {

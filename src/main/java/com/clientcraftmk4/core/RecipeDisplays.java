@@ -1,5 +1,6 @@
 package com.clientcraftmk4.core;
 
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.tags.TagKey;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
@@ -10,6 +11,7 @@ import net.minecraft.world.item.crafting.display.ShapedCraftingRecipeDisplay;
 import net.minecraft.world.item.crafting.display.ShapelessCraftingRecipeDisplay;
 import net.minecraft.world.item.crafting.display.SlotDisplay;
 
+import java.util.Collection;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.List;
@@ -146,6 +148,12 @@ public final class RecipeDisplays {
      * 3. the first sub-craftable member, so {@code trySubCraft} can handle it;
      * 4. any registry member, as a display fallback.
      *
+     * <p>Issue #8: pool draws (1) and (2) prefer the member with the largest count
+     * instead of iteration order — a chest drawing from {@code #planks} consumes the
+     * most abundant plank first (200 oak logs before 2 birch logs) and leaves scarce
+     * types for type-specific recipes that may still need them. Ties fall back to
+     * registry id so picks stay deterministic across runs.
+     *
      * @param workingCopy true when {@code inventory} is a simulation working copy
      *                    rather than the live cached snapshot (MK4 compared map identity).
      */
@@ -159,16 +167,14 @@ public final class RecipeDisplays {
             TagKey<Item> tag = getSlotTag(d);
             Set<Item> matches = tags.inventoryTagMembers(tag);
             if (matches != null) {
-                for (Item item : matches) {
-                    if (inventory.getOrDefault(item, 0) > 0) return new ItemStack(item);
-                }
+                ItemStack best = mostAbundant(matches, inventory);
+                if (!best.isEmpty()) return best;
             }
             if (workingCopy) {
                 List<Item> craft = tags.craftableMembers(tag);
                 if (craft != null) {
-                    for (Item item : craft) {
-                        if (inventory.getOrDefault(item, 0) > 0) return new ItemStack(item);
-                    }
+                    ItemStack best = mostAbundant(craft, inventory);
+                    if (!best.isEmpty()) return best;
                 }
             }
             List<Item> craftable = tags.craftableMembers(tag);
@@ -178,22 +184,45 @@ public final class RecipeDisplays {
         if (display instanceof SlotDisplay.WithRemainder d) return resolveSlot(d.input(), inventory, tags, workingCopy);
         if (display instanceof SlotDisplay.Composite d) {
             ItemStack fallback = ItemStack.EMPTY;
+            ItemStack best = ItemStack.EMPTY;
+            int bestCount = 0;
             for (SlotDisplay sub : d.contents()) {
                 ItemStack r = resolveSlot(sub, inventory, tags, workingCopy);
-                if (!r.isEmpty()) {
-                    if (inventory.getOrDefault(r.getItem(), 0) > 0) return r;
-                    if (fallback.isEmpty()) fallback = r;
+                if (r.isEmpty()) continue;
+                int count = inventory.getOrDefault(r.getItem(), 0);
+                if (count > bestCount) {
+                    best = r;
+                    bestCount = count;      // ties keep the earlier content (list order)
                 }
+                if (bestCount == 0 && fallback.isEmpty()) fallback = r;
             }
-            return fallback;
+            return bestCount > 0 ? best : fallback;
         }
         return ItemStack.EMPTY;
+    }
+
+    /** The member of {@code candidates} with the largest count in {@code inventory} (ties: registry id). */
+    private static ItemStack mostAbundant(Collection<Item> candidates, Map<Item, Integer> inventory) {
+        Item best = null;
+        int bestCount = 0, bestId = Integer.MAX_VALUE;
+        for (Item item : candidates) {
+            int count = inventory.getOrDefault(item, 0);
+            if (count <= 0) continue;
+            int id = BuiltInRegistries.ITEM.getId(item);
+            if (count > bestCount || (count == bestCount && id < bestId)) {
+                best = item;
+                bestCount = count;
+                bestId = id;
+            }
+        }
+        return best != null ? new ItemStack(best) : ItemStack.EMPTY;
     }
 
     /**
      * Allocation-free {@link #resolveSlot}: returns the resolved item directly (null = empty)
      * so hot loops avoid {@code new ItemStack} per slot per branch (100k+/resolve GC).
-     * Single-scan tag logic identical to {@link #resolveSlot}.
+     * Tag logic identical to {@link #resolveSlot} — pool draws prefer the most abundant
+     * member (issue #8), ties by registry id.
      */
     public static Item resolveSlotItem(SlotDisplay display, Map<Item, Integer> inventory,
                                        TagIndex tags, boolean workingCopy) {
@@ -204,16 +233,14 @@ public final class RecipeDisplays {
             TagKey<Item> tag = getSlotTag(d);
             Set<Item> matches = tags.inventoryTagMembers(tag);
             if (matches != null) {
-                for (Item item : matches) {
-                    if (inventory.getOrDefault(item, 0) > 0) return item;
-                }
+                Item best = mostAbundantItem(matches, inventory);
+                if (best != null) return best;
             }
             if (workingCopy) {
                 List<Item> craft = tags.craftableMembers(tag);
                 if (craft != null) {
-                    for (Item item : craft) {
-                        if (inventory.getOrDefault(item, 0) > 0) return item;
-                    }
+                    Item best = mostAbundantItem(craft, inventory);
+                    if (best != null) return best;
                 }
             }
             List<Item> craftable = tags.craftableMembers(tag);
@@ -224,16 +251,38 @@ public final class RecipeDisplays {
             return resolveSlotItem(d.input(), inventory, tags, workingCopy);
         if (display instanceof SlotDisplay.Composite d) {
             Item fallback = null;
+            Item best = null;
+            int bestCount = 0;
             for (SlotDisplay sub : d.contents()) {
                 Item r = resolveSlotItem(sub, inventory, tags, workingCopy);
-                if (r != null) {
-                    if (inventory.getOrDefault(r, 0) > 0) return r;
-                    if (fallback == null) fallback = r;
+                if (r == null) continue;
+                int count = inventory.getOrDefault(r, 0);
+                if (count > bestCount) {
+                    best = r;
+                    bestCount = count;      // ties keep the earlier content (list order)
                 }
+                if (bestCount == 0 && fallback == null) fallback = r;
             }
-            return fallback;
+            return bestCount > 0 ? best : fallback;
         }
         return null;
+    }
+
+    /** The candidate with the largest count in {@code inventory} (ties: registry id); null if none present. */
+    private static Item mostAbundantItem(Collection<Item> candidates, Map<Item, Integer> inventory) {
+        Item best = null;
+        int bestCount = 0, bestId = Integer.MAX_VALUE;
+        for (Item item : candidates) {
+            int count = inventory.getOrDefault(item, 0);
+            if (count <= 0) continue;
+            int id = BuiltInRegistries.ITEM.getId(item);
+            if (count > bestCount || (count == bestCount && id < bestId)) {
+                best = item;
+                bestCount = count;
+                bestId = id;
+            }
+        }
+        return best;
     }
 
     /**
@@ -252,32 +301,69 @@ public final class RecipeDisplays {
         if (display instanceof SlotDisplay.ItemStackSlotDisplay d) return d.stack().item().value();
         if (display instanceof SlotDisplay.TagSlotDisplay d) {
             TagKey<Item> tag = getSlotTag(d);
-            // Precomputed member ids in set/list order: same picks as iterating the member
+            // Precomputed member ids: same candidates as iterating the member
             // collections, minus per-candidate map hashing. Null pre-graph → legacy path.
+            // Issue #8: pool draws prefer the most abundant member (ties by smaller flat
+            // id, so picks are deterministic) — scarce types stay available for the
+            // type-specific recipes resolved before this flexible slot.
             int[] matchIds = tags.inventoryTagMemberIds(tag);
             if (matchIds != null && idToItem != null) {
+                int best = -1, bestCount = 0;
                 for (int mid : matchIds) {
-                    if (work.get(mid) > 0) return idToItem[mid];
+                    int c = work.get(mid);
+                    if (c <= 0) continue;
+                    if (c > bestCount || (c == bestCount && mid < best)) {
+                        best = mid;
+                        bestCount = c;
+                    }
                 }
+                if (best >= 0) return idToItem[best];
             } else {
                 Set<Item> matches = tags.inventoryTagMembers(tag);
                 if (matches != null) {
+                    Item best = null;
+                    int bestCount = 0, bestId = Integer.MAX_VALUE;
                     for (Item item : matches) {
-                        if (work.get(graph.id(item)) > 0) return item;
+                        int c = work.get(graph.id(item));
+                        if (c <= 0) continue;
+                        int id = BuiltInRegistries.ITEM.getId(item);
+                        if (c > bestCount || (c == bestCount && id < bestId)) {
+                            best = item;
+                            bestCount = c;
+                            bestId = id;
+                        }
                     }
+                    if (best != null) return best;
                 }
             }
             int[] craftIds = tags.craftableTagMemberIds(tag);
             if (craftIds != null && idToItem != null) {
+                int best = -1, bestCount = 0;
                 for (int cid : craftIds) {
-                    if (work.get(cid) > 0) return idToItem[cid];
+                    int c = work.get(cid);
+                    if (c <= 0) continue;
+                    if (c > bestCount || (c == bestCount && cid < best)) {
+                        best = cid;
+                        bestCount = c;
+                    }
                 }
+                if (best >= 0) return idToItem[best];
             } else {
                 List<Item> craft = tags.craftableMembers(tag);
                 if (craft != null) {
+                    Item best = null;
+                    int bestCount = 0, bestId = Integer.MAX_VALUE;
                     for (Item item : craft) {
-                        if (work.get(graph.id(item)) > 0) return item;
+                        int c = work.get(graph.id(item));
+                        if (c <= 0) continue;
+                        int id = BuiltInRegistries.ITEM.getId(item);
+                        if (c > bestCount || (c == bestCount && id < bestId)) {
+                            best = item;
+                            bestCount = c;
+                            bestId = id;
+                        }
                     }
+                    if (best != null) return best;
                 }
             }
             List<Item> craftable = tags.craftableMembers(tag);
@@ -287,14 +373,19 @@ public final class RecipeDisplays {
         if (display instanceof SlotDisplay.WithRemainder d) return resolveSlotItem(d.input(), work, graph, idToItem, tags);
         if (display instanceof SlotDisplay.Composite d) {
             Item fallback = null;
+            Item best = null;
+            int bestCount = 0;
             for (SlotDisplay sub : d.contents()) {
                 Item r = resolveSlotItem(sub, work, graph, idToItem, tags);
-                if (r != null) {
-                    if (work.get(graph.id(r)) > 0) return r;
-                    if (fallback == null) fallback = r;
+                if (r == null) continue;
+                int count = work.get(graph.id(r));
+                if (count > bestCount) {
+                    best = r;
+                    bestCount = count;      // ties keep the earlier content (list order)
                 }
+                if (bestCount == 0 && fallback == null) fallback = r;
             }
-            return fallback;
+            return bestCount > 0 ? best : fallback;
         }
         return null;
     }

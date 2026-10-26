@@ -32,6 +32,13 @@ import java.util.Set;
  * sub-craft surplus retention ({@code produce(outputCount - 1)}); sub-recipe
  * order = recipe-book order; tag fallback scan is deterministic (insertion
  * order instead of MK4's undefined HashMap order — plan §7.3).
+ *
+ * <p>Slot order (issue #8): ingredient slots are resolved least-flexible-first
+ * ({@link RecipeIndex#resolveSlots}) — type-specific ingredients reserve their
+ * items before any tag-flexible pool draw, and pool draws prefer the most
+ * abundant member (see {@code tryTagFallback}), so a flexible sub-craft like a
+ * chest (any {@code #planks}) can no longer consume the specific planks a
+ * sibling slot like a birch boat needs.
  */
 public final class ResolveContext {
     private final RecipeIndex index;
@@ -122,7 +129,9 @@ public final class ResolveContext {
         int stepsStart = stepsOut != null ? stepsOut.size() : 0;
 
         boolean success = true;
-        for (SlotDisplay slot : slots) {
+        // Least-flexible-first slot order (issue #8): the type-specific ingredients
+        // are satisfied (and their items reserved) before any tag-flexible pool draw.
+        for (SlotDisplay slot : index.resolveSlots(entry)) {
             if (slot instanceof SlotDisplay.Empty) continue;
 
             // Item fast path: no ItemStack alloc per slot (see RecipeDisplays.resolveSlotItem).
@@ -185,22 +194,30 @@ public final class ResolveContext {
 
         if (slot instanceof SlotDisplay.TagSlotDisplay d) {
             TagKey<Item> tag = RecipeDisplays.getSlotTag(d);
-            // Scan the working map directly for items matching this tag (deterministic
-            // id order; the global tag indices miss sub-crafted leftovers). Membership
-            // is a BitSet read — the old registry holder.is(tag) walk per present item
-            // was the hottest registry call in modpacks.
+            // Scan the working map directly for items matching this tag (the global tag
+            // indices miss sub-crafted leftovers). Membership is a BitSet read — the old
+            // registry holder.is(tag) walk per present item was the hottest registry
+            // call in modpacks. Issue #8: draw from the most abundant member first so
+            // pool consumers leave scarce types (the ones a specific recipe may still
+            // need) untouched; ties keep the deterministic id order.
             GraphFlatData f = graph.flat();
             BitSet bits = tags.flatTagBits(tag);
+            int best = -1, bestCount = 0;
             for (int i = 0; i < work.presentSize(); i++) {
                 int pid = work.presentIdAt(i);
-                if (work.get(pid) < 1) continue;
+                int count = work.get(pid);
+                if (count <= bestCount) continue;
                 Item it = f.idToItem()[pid];
                 if (it.equals(alreadyTried)) continue;
                 boolean matches = bits != null ? bits.get(pid) : it.builtInRegistryHolder().is(tag);
                 if (matches) {
-                    work.consume(pid, 1);
-                    return true;
+                    best = pid;
+                    bestCount = count;
                 }
+            }
+            if (best >= 0) {
+                work.consume(best, 1);
+                return true;
             }
             List<Item> craftable = tags.craftableMembers(tag);
             if (craftable != null) {

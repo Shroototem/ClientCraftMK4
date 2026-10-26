@@ -12,6 +12,7 @@ import com.clientcraftmk4.core.WorkMap;
 import com.clientcraftmk4.core.resolver.ResolveContext;
 import com.clientcraftmk4.craft.AutoCrafter;
 import net.minecraft.client.Minecraft;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.tags.TagKey;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
@@ -22,6 +23,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -250,7 +252,14 @@ public final class CraftPlanner {
                 TagKey<Item> tagKey = (TagKey<Item>) e.getKey();
                 Set<Item> members = tags.inventoryTagMembers(tagKey);
                 if (members != null) {
-                    for (Item m : members) {
+                    // Issue #8: drain the most abundant member first (ties by registry id),
+                    // so scarce types stay available for type-specific sub-crafts the
+                    // remaining ALL-mode cycles may still need.
+                    List<Item> byAbundance = new ArrayList<>(members);
+                    byAbundance.sort(Comparator
+                            .<Item>comparingInt(m -> -sim.getOrDefault(m, 0))
+                            .thenComparingInt(m -> BuiltInRegistries.ITEM.getId(m)));
+                    for (Item m : byAbundance) {
                         int have = sim.getOrDefault(m, 0);
                         if (have <= 0) continue;
                         int take = Math.min(have, toConsume);
@@ -274,8 +283,13 @@ public final class CraftPlanner {
                 TagKey<Item> tagKey = (TagKey<Item>) e.getKey();
                 Set<Item> members = model.tagIndex().inventoryTagMembers(tagKey);
                 if (members != null) {
+                    // Same abundance-first order as computeDirectCrafts (issue #8).
                     int toConsume = e.getValue();
-                    for (Item m : members) {
+                    List<Item> byAbundance = new ArrayList<>(members);
+                    byAbundance.sort(Comparator
+                            .<Item>comparingInt(m -> -work.get(model.graph().id(m)))
+                            .thenComparingInt(m -> BuiltInRegistries.ITEM.getId(m)));
+                    for (Item m : byAbundance) {
                         int id = model.graph().id(m);
                         int have = work.get(id);
                         if (have <= 0) continue;

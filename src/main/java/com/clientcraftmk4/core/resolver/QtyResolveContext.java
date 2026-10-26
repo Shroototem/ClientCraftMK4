@@ -30,6 +30,11 @@ import java.util.Set;
  * deficits are sub-crafted in bulk ({@code ceil(deficit/subOutput)} crafts,
  * leftovers retained), with the same cycle guards and depth-≤-1 tag fallback as
  * {@link ResolveContext}.
+ *
+ * <p>Slot order (issue #8): ingredient slots are processed least-flexible-first
+ * ({@link RecipeIndex#resolveSlots}), matching {@link ResolveContext}, so the
+ * exact counts agree with the plan the crafter will execute; tag pool draws
+ * prefer the most abundant member (see {@code tryTagFallbackQty}).
  */
 public final class QtyResolveContext {
     private final RecipeIndex index;
@@ -117,7 +122,9 @@ public final class QtyResolveContext {
         int mark = work.mark();
         int stepsStart = stepsOut != null ? stepsOut.size() : 0;
 
-        for (SlotDisplay slot : slots) {
+        // Least-flexible-first slot order (issue #8), same as ResolveContext.resolve:
+        // type-specific ingredients reserve their items before tag-flexible pool draws.
+        for (SlotDisplay slot : index.resolveSlots(entry)) {
             if (slot instanceof SlotDisplay.Empty) continue;
 
             // Item fast path: no ItemStack alloc per slot (see RecipeDisplays.resolveSlotItem).
@@ -186,20 +193,30 @@ public final class QtyResolveContext {
 
         if (slot instanceof SlotDisplay.TagSlotDisplay d) {
             TagKey<Item> tag = RecipeDisplays.getSlotTag(d);
-            int need = deficit;
             GraphFlatData f = graph.flat();
             BitSet bits = tags.flatTagBits(tag);
-            for (int i = 0; i < work.presentSize() && need > 0; i++) {
-                int pid = work.presentIdAt(i);
-                if (work.get(pid) < 1) continue;
-                Item it = f.idToItem()[pid];
-                if (it.equals(alreadyTried)) continue;
-                boolean matches = bits != null ? bits.get(pid) : it.builtInRegistryHolder().is(tag);
-                if (matches) {
-                    int take = Math.min(need, work.get(pid));
-                    work.consume(pid, take);
-                    need -= take;
+            // Issue #8: drain the most abundant matching member first, so pool draws
+            // leave scarce types for specific recipes that may still need them. Ties
+            // keep the deterministic id order (present is sorted by id).
+            int need = deficit;
+            while (need > 0) {
+                int best = -1, bestCount = 0;
+                for (int i = 0; i < work.presentSize(); i++) {
+                    int pid = work.presentIdAt(i);
+                    int count = work.get(pid);
+                    if (count <= bestCount) continue;
+                    Item it = f.idToItem()[pid];
+                    if (it.equals(alreadyTried)) continue;
+                    boolean matches = bits != null ? bits.get(pid) : it.builtInRegistryHolder().is(tag);
+                    if (matches) {
+                        best = pid;
+                        bestCount = count;
+                    }
                 }
+                if (best < 0) break;
+                int take = Math.min(need, bestCount);
+                work.consume(best, take);
+                need -= take;
             }
             if (need <= 0) return true;
             List<Item> craftable = tags.craftableMembers(tag);

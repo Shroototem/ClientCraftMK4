@@ -31,6 +31,19 @@ public final class RecipeIndex {
     private final ConcurrentHashMap<RecipeDisplayId, Set<Item>> requiredCache = new ConcurrentHashMap<>();
 
     /**
+     * Cached least-flexible-first slot order per entry (issue #8). Pure per-model data
+     * (recipe set + tag membership only — never the inventory), so it is shared across
+     * threads like {@link #requiredCache}.
+     */
+    private final ConcurrentHashMap<RecipeDisplayId, List<SlotDisplay>> resolveOrderCache = new ConcurrentHashMap<>();
+
+    /** Rank cap: keeps the per-recipe slot-rank sum far from overflow for any real recipe. */
+    private static final int RANK_CAP = 1 << 20;
+
+    /** How deep the rank recursion follows "item → its recipe → that recipe's slots". */
+    private static final int RANK_DEPTH = 2;
+
+    /**
      * Tags referenced per entry (pre-expansion — unlike the graph edges, this retains which
      * tags each recipe's slots use). Built once per model; feeds the incremental-resolve
      * tag→recipes index. Only entries with tag slots allocate.
@@ -129,6 +142,123 @@ public final class RecipeIndex {
             return acc == null ? Set.of() : acc;
         }
         return Set.of();
+    }
+
+    /**
+     * This entry's ingredient slots in resolve order: least-flexible (type-specific)
+     * slots first, tag-flexible slots last; ties keep recipe order (stable).
+     *
+     * <p>Issue #8: a shapeless target like birch_chest_boat lists its chest slot
+     * before its boat slot. The chest's recipe draws from the {@code #planks} pool —
+     * which contains the very birch planks the boat's type-specific recipe needs —
+     * so crafting the chest first can strand the boat (all it has left is an oak
+     * plank it cannot use). Resolving the boat first reserves the birch planks;
+     * the chest then takes any 8 planks from what remains — an allocation the
+     * server's own ingredient picker can no longer break (it chooses freely among
+     * tag members, but every specific ingredient is already crafted).
+     *
+     * <p>Used by both resolve contexts and the overlay's craftability pass so the
+     * count badge, the overlay tints and the executed plan always agree.
+     */
+    public List<SlotDisplay> resolveSlots(RecipeDisplayEntry entry) {
+        List<SlotDisplay> slots = RecipeDisplays.getSlots(entry);
+        if (slots == null || slots.size() < 2) return slots;
+        return resolveOrderCache.computeIfAbsent(entry.id(), id -> orderSlots(slots));
+    }
+
+    private List<SlotDisplay> orderSlots(List<SlotDisplay> slots) {
+        int n = slots.size();
+        long[] ranks = new long[n];
+        long prev = Long.MIN_VALUE;
+        boolean sorted = true;
+        for (int i = 0; i < n; i++) {
+            SlotDisplay slot = slots.get(i);
+            ranks[i] = slot instanceof SlotDisplay.Empty ? 0 : slotRank(slot, RANK_DEPTH);
+            if (ranks[i] < prev) sorted = false;
+            prev = ranks[i];
+        }
+        if (sorted) return slots;
+
+        // Stable insertion sort by rank (n ≤ 9 crafting slots; equal ranks keep
+        // recipe order so nothing reshuffles when ranks tie).
+        int[] order = new int[n];
+        for (int i = 0; i < n; i++) order[i] = i;
+        for (int k = 1; k < n; k++) {
+            int idx = order[k];
+            long rank = ranks[idx];
+            int j = k - 1;
+            while (j >= 0 && ranks[order[j]] > rank) {
+                order[j + 1] = order[j];
+                j--;
+            }
+            order[j + 1] = idx;
+        }
+        List<SlotDisplay> ordered = new ArrayList<>(n);
+        for (int i : order) ordered.add(slots.get(i));
+        return List.copyOf(ordered);
+    }
+
+    /**
+     * Resolve-order rank of one slot (0 = fully type-specific, higher = more flexible).
+     * Exposed for the overlay, which must evaluate grid tiles in the same order the
+     * planner will craft them.
+     */
+    public int slotRank(SlotDisplay slot) {
+        return slot instanceof SlotDisplay.Empty ? 0 : slotRank(slot, RANK_DEPTH);
+    }
+
+    /**
+     * How flexible satisfying this slot is. Item slots inherit the flexibility of the
+     * item's cheapest recipe (a chest is as flexible as its {@code #planks} ingredient;
+     * a birch boat is as specific as its birch planks); tag slots are flexible by
+     * definition, scaled by how many members the tag offers.
+     */
+    private int slotRank(SlotDisplay slot, int depth) {
+        if (slot instanceof SlotDisplay.ItemSlotDisplay d) return itemRank(d.item().value(), depth);
+        if (slot instanceof SlotDisplay.ItemStackSlotDisplay d) return itemRank(d.stack().item().value(), depth);
+        if (slot instanceof SlotDisplay.TagSlotDisplay d) {
+            TagKey<Item> tag = RecipeDisplays.getSlotTag(d);
+            List<Item> members = tag != null ? tagIndex.members(tag) : null;
+            // A tag is flexible by definition; breadth scales the rank so narrow tags
+            // (e.g. #birch_logs) still sort before broad ones (e.g. #planks).
+            return Math.max(2, members != null ? members.size() : 2);
+        }
+        if (slot instanceof SlotDisplay.WithRemainder d) return slotRank(d.input(), depth);
+        if (slot instanceof SlotDisplay.Composite d) {
+            List<SlotDisplay> contents = d.contents();
+            if (contents.size() == 1) return slotRank(contents.getFirst(), depth);
+            int max = 0;
+            for (SlotDisplay sub : contents) max = Math.max(max, slotRank(sub, depth));
+            return Math.max(1 + contents.size(), max);
+        }
+        return 0;
+    }
+
+    /**
+     * Flexibility of crafting {@code item}: the cheapest (least flexible) of its
+     * recipes. Raw resources with no recipe are fully specific (0). Depth-capped so
+     * craft cycles (planks → wood → planks) terminate.
+     */
+    private int itemRank(Item item, int depth) {
+        if (depth <= 0) return 0;
+        List<RecipeDisplayEntry> recipes = byOutput.get(item);
+        if (recipes == null || recipes.isEmpty()) return 0;
+        int min = Integer.MAX_VALUE;
+        for (RecipeDisplayEntry entry : recipes) min = Math.min(min, recipeRank(entry, depth));
+        return min == Integer.MAX_VALUE ? 0 : min;
+    }
+
+    /** Sum of the recipe's slot ranks — more tag slots (or broader tags) rank higher. */
+    private int recipeRank(RecipeDisplayEntry entry, int depth) {
+        List<SlotDisplay> slots = RecipeDisplays.getSlots(entry);
+        if (slots == null || slots.isEmpty()) return 0;
+        long sum = 0;
+        for (SlotDisplay slot : slots) {
+            if (slot instanceof SlotDisplay.Empty) continue;
+            sum += slotRank(slot, depth - 1);
+            if (sum >= RANK_CAP) return RANK_CAP;
+        }
+        return (int) sum;
     }
 
     /** Builds the index and collects the known tag set (MK4's {@code ensureIndex} body). */
