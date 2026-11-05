@@ -40,11 +40,12 @@ public final class CountEngine {
     public record Previous(Map<RecipeDisplayId, Integer> counts,
                            Set<RecipeDisplayId> containerCraftable,
                            InventorySnapshot snapshot,
-                           long gridSize) {}
+                           long gridSize,
+                           TagIndex.InventoryTags tagState) {}
 
     public static CraftCounts compute(List<RecipeCollection> allCrafting, int gridSize,
                                       InventorySnapshot snapshot, long modelGeneration,
-                                      Previous previous, Set<TagKey<Item>> changedTags) {
+                                      Previous previous) {
         // All timing is gated: nanoTime calls are not free (~20-100ns each) and block JIT
         // elision of the surrounding code when left unconditional on this hot worker path.
         boolean debug = ClientCraftConfig.debugLogging;
@@ -61,6 +62,12 @@ public final class CountEngine {
         }
         long modelNs = debug ? System.nanoTime() - t0 : 0;
 
+        // Tag data derives from the inventory, so it is refreshed here on the worker,
+        // against the snapshot this compute counts from.
+        TagIndex tagIndex = model.tagIndex();
+        tagIndex.ensureFresh(snapshot, model.recipeIndex());
+        TagIndex.InventoryTags tagState = tagIndex.currentTags();
+
         Map<Item, Integer> invSnapshot = snapshot.inventory();
         Map<Item, Integer> contSnapshot = snapshot.container();
         boolean checkContainers = ClientCraftConfig.searchContainers && !contSnapshot.isEmpty();
@@ -73,12 +80,13 @@ public final class CountEngine {
         int dpExactCount = 0, simulatedCount = 0, reused = 0;
         // dpExact gate rejection breakdown (debug only): tells which exactness condition
         // forces most sim fallbacks, so future gate tuning is data-driven, not guessed.
-        int gateCycle = 0, gateSharing = 0, gateCross = 0, gateDirect = 0;
+        int gateCycle = 0, gateSharing = 0, gateCross = 0, gateAdditive = 0, gateDirect = 0;
         long treeComputeNs = 0, verifyNs = 0;
 
         RecipeGraph graph = model.graph();
         GraphFlatData flat = graph != null ? graph.flat() : null;
         int totalFlatRecipes = flat != null ? flat.totalRecipes() : 0;
+        boolean quick = ClientCraftConfig.quickCountMode;
 
         // --- Incremental resolve: reuse published counts for recipes whose inputs cannot
         // have changed. Valid only with a non-empty previous base from the same model and
@@ -91,10 +99,11 @@ public final class CountEngine {
         boolean incremental = false;
         if (previous != null && flat != null && totalFlatRecipes > 0
                 && previous.snapshot() != null && previous.gridSize() == gridSize
+                && previous.tagState() != null
                 && model.modelGeneration() == modelGeneration
                 && (!previous.counts().isEmpty() || !previous.containerCraftable().isEmpty())) {
-            dirty = computeDirty(flat, model.tagIndex(), previous.snapshot(), snapshot,
-                    checkContainers, changedTags);
+            dirty = computeDirty(flat, tagIndex, previous.snapshot(), snapshot,
+                    tagIndex.craftableChangedSince(previous.tagState()));
             incremental = dirty.cardinality() <= totalFlatRecipes / 2;
         }
         int dirtyCount = incremental ? dirty.cardinality() : totalFlatRecipes;
@@ -136,16 +145,19 @@ public final class CountEngine {
         }
 
         // DP counts arrive indexed by recIdx straight from the estimator — no boxed map,
-        // no conversion pass (see DpEstimator).
+        // no conversion pass (see DpEstimator). Quick mode never reads them, so it skips the DP.
         int[] treeCountByRec = new int[totalFlatRecipes];
         int[] treeCombinedCountByRec = new int[totalFlatRecipes];
-        if (graph != null) {
+        boolean[] additiveItems = null;
+        if (graph != null && !quick) {
             long tTreeCompute = debug ? System.nanoTime() : 0;
-            treeCountByRec = DpEstimator.calculatePerRecipeCounts(
+            DpEstimator.Estimate estimate = DpEstimator.estimate(
                     graph, invSnapshot, Map.of(), gridSize, Constants.MAX_REPEATS);
+            treeCountByRec = estimate.counts();
+            additiveItems = estimate.additiveItems();
             if (checkContainers) {
-                treeCombinedCountByRec = DpEstimator.calculatePerRecipeCounts(
-                        graph, invSnapshot, contSnapshot, gridSize, Constants.MAX_REPEATS);
+                treeCombinedCountByRec = DpEstimator.estimate(
+                        graph, invSnapshot, contSnapshot, gridSize, Constants.MAX_REPEATS).counts();
             }
             if (debug) treeComputeNs = System.nanoTime() - tTreeCompute;
         }
@@ -174,7 +186,7 @@ public final class CountEngine {
         // Scratch resolver state for the quickCountMode slot-display path, reused
         // across entries instead of a fresh WorkMap (full inventory re-sort) and
         // ResolveContext per recipe.
-        ResolveContext quickCtx = ClientCraftConfig.quickCountMode ? ResolveContext.of(model, gridSize) : null;
+        ResolveContext quickCtx = quick ? ResolveContext.of(model, gridSize) : null;
         WorkMap quickWork = quickCtx != null ? WorkMap.from(invSnapshot, graph) : null;
         Set<Item> quickInProgress = quickCtx != null ? new HashSet<>() : null;
 
@@ -184,10 +196,9 @@ public final class CountEngine {
             for (RecipeDisplayEntry entry : coll.getRecipes()) {
                 int recIdx = flat != null ? flat.dispIdToRecIdx().getOrDefault(entry.id(), -1) : -1;
 
-                if (!ClientCraftConfig.quickCountMode && recIdx >= 0) {
+                if (!quick && recIdx >= 0) {
                     // === FLAT ARRAY PATH: zero SlotDisplay processing ===
                     if (flat.recGridSize()[recIdx] > gridSize) continue;
-                    if (flat.recSelfConsuming()[recIdx]) continue;
 
                     // Incremental clean-skip: inputs provably unchanged, published value stands.
                     if (incremental && !dirty.get(recIdx)) {
@@ -219,18 +230,21 @@ public final class CountEngine {
                         // nuggets→ingot→block chains). Perf gate: when the DP is provably
                         // exact — not cycle-flagged, no sharing-suspect edge, no item
                         // shared across distinct edges (both DP and directCountFlat would
-                        // double-count it), and the physical inventory alone already
-                        // satisfies the DP count — trust it; otherwise the exact
-                        // simulator is the ground truth.
+                        // double-count it), no ingredient with additive sources (the DP
+                        // takes only the best of several stocked recipes), and the physical
+                        // inventory alone already satisfies the DP count — trust it;
+                        // otherwise the exact simulator is the ground truth.
                         // NOTE: no separate allDirectlyAvailableFlat pass — directCountFlat
                         // returns 0 unless every edge has stock, so a single fused scan
                         // covers both checks (directCount > 0 implies all-direct, and
                         // directCount == 0 fails the >= count gate for count > 0 anyway).
                         // The direct value is reused below as the simulator's lo seed.
                         int direct = directCountFlat(flat, recIdx, invCounts, invOverflow);
+                        boolean additive = DpEstimator.dependsOnAdditive(flat, recIdx, additiveItems);
                         boolean dpExact = !cycleSuspect
                                 && !flat.recSharingSuspect()[recIdx]
                                 && !flat.recCrossEdgeShared()[recIdx]
+                                && !additive
                                 && direct >= count;
                         // First-false attribution matches the && short-circuit order above.
                         // Debug-only: a predictable-false branch + increments, ~1ns/recipe off.
@@ -239,6 +253,7 @@ public final class CountEngine {
                                 if (cycleSuspect) gateCycle++;
                                 else if (flat.recSharingSuspect()[recIdx]) gateSharing++;
                                 else if (flat.recCrossEdgeShared()[recIdx]) gateCross++;
+                                else if (additive) gateAdditive++;
                                 else gateDirect++;
                             }
                         }
@@ -252,10 +267,12 @@ public final class CountEngine {
                             // ~10-attempt binary search is skipped, not just shortened.
                             int exact = 0;
                             if (Reachability.allEdgesReachableFlat(flat, recIdx, reachableFlat, reachableItems)) {
-                                int hi = simulateUpperBound(flat, recIdx, outputCount, count, cycleSuspect);
+                                int hi = additive
+                                        ? Constants.MAX_REPEATS
+                                        : simulateUpperBound(flat, recIdx, outputCount, count, cycleSuspect);
                                 exact = ExactSimulator.simulateCraftCount(
                                                 model, gridSize, entry, invSnapshot, hi,
-                                                direct / Math.max(1, outputCount))
+                                                direct / Math.max(1, outputCount), additive)
                                         * outputCount;
                                 simulatedCount++;
                             }
@@ -269,6 +286,8 @@ public final class CountEngine {
                             }
                         }
                     } else {
+                        // Additive sources can cover a deficit no single recipe covers: let the simulator split it.
+                        boolean additive = DpEstimator.dependsOnAdditive(flat, recIdx, additiveItems);
                         // DP under-counted (cycle-avoidance hid a sub-craft path, e.g.
                         // 9 gold nuggets + 8 ingots can craft a gold block, or the
                         // straw -> tall dry grass -> short dry grass -> torch chain).
@@ -278,7 +297,7 @@ public final class CountEngine {
                         boolean edgesReachable = Reachability.allEdgesReachableFlat(flat, recIdx, reachableFlat, reachableItems);
                         if (edgesReachable) {
                             int exact = ExactSimulator.simulateCraftCount(
-                                    model, gridSize, entry, invSnapshot, Constants.MAX_REPEATS) * outputCount;
+                                    model, gridSize, entry, invSnapshot, Constants.MAX_REPEATS, 0, additive) * outputCount;
                             if (exact > 0) {
                                 resolvedCounts.put(entry.id(), Math.min(exact, Constants.MAX_REPEATS));
                                 treeCounted++;
@@ -295,7 +314,7 @@ public final class CountEngine {
                                 // first: a recipe craftable from the inventory is counted
                                 // as craftable, never mislabeled as container-craftable.
                                 int exact = ExactSimulator.simulateCraftCount(
-                                        model, gridSize, entry, invSnapshot, Constants.MAX_REPEATS) * outputCount;
+                                        model, gridSize, entry, invSnapshot, Constants.MAX_REPEATS, 0, additive) * outputCount;
                                 if (exact > 0) {
                                     resolvedCounts.put(entry.id(), Math.min(exact, Constants.MAX_REPEATS));
                                     treeCounted++;
@@ -310,10 +329,27 @@ public final class CountEngine {
                     // === SLOTDISPLAY PATH: quickCountMode or recipe not in the tree ===
                     if (!RecipeDisplays.fitsInGrid(entry.display(), gridSize)) continue;
 
-                    if (!ClientCraftConfig.quickCountMode) {
+                    if (!quick) {
                         allEntries.add(entry);
                         totalRecipes++;
-                        treeSkipped++;
+                        if (RecipeDisplays.getOutputItem(entry.display(), invSnapshot, model.tagIndex()) == null) {
+                            // Result-less displays (armor dyeing) are never sub-crafts, so they're not in the
+                            // graph or the dirty set: recount them every resolve.
+                            resolvedCounts.remove(entry.id());
+                            containerSet.remove(entry.id());
+                            if (Reachability.allSlotsReachable(entry, reachableItems, model.tagIndex())) {
+                                int exact = ExactSimulator.simulateCraftCount(model, gridSize, entry, invSnapshot, Constants.MAX_REPEATS);
+                                if (exact > 0) {
+                                    resolvedCounts.put(entry.id(), Math.min(exact, Constants.MAX_REPEATS));
+                                    treeCounted++;
+                                } else if (checkContainers && ExactSimulator.tryResolveOnce(model, gridSize, entry, combined)) {
+                                    containerSet.add(entry.id());
+                                    containerChecked++;
+                                }
+                            }
+                        } else {
+                            treeSkipped++;
+                        }
                         continue;
                     }
 
@@ -322,6 +358,12 @@ public final class CountEngine {
                     if (out != null && RecipeDisplays.recipeConsumesItem(entry, out)) continue;
                     allEntries.add(entry);
                     totalRecipes++;
+                    if (incremental && recIdx >= 0 && !dirty.get(recIdx)) {
+                        reused++;
+                        continue;
+                    }
+                    // Entries outside the graph aren't evicted by the dirty pass above.
+                    resolvedCounts.remove(entry.id());
 
                     int outputCount = Math.max(1, outputStack.getCount());
 
@@ -329,7 +371,7 @@ public final class CountEngine {
                         preCheckSkipped++;
                         continue;
                     }
-                    quickWork.resetTo(invSnapshot, graph);
+                    quickWork.restoreBase();
                     quickInProgress.clear();
                     if (quickCtx.resolve(entry, quickWork, null, quickInProgress, 0, null)) {
                         resolvedCounts.put(entry.id(), outputCount);
@@ -357,17 +399,17 @@ public final class CountEngine {
         long totalNs = 0;
         if (debug) {
             totalNs = System.nanoTime() - t0;
-            LOG.info("[CC] Resolve: {}us | {} recipes | reachable: {}us ({} items) | model: {}us tree: {}us verify: {}us | counted:{} preSkip:{} treeSkip:{} cont:{} | dpExact:{} sim:{} | gate:cyc{} shr{} crs{} dir{} | {} dirty:{} reused:{}",
+            LOG.info("[CC] Resolve: {}us | {} recipes | reachable: {}us ({} items) | model: {}us tree: {}us verify: {}us | counted:{} preSkip:{} treeSkip:{} cont:{} | dpExact:{} sim:{} | gate:cyc{} shr{} crs{} add{} dir{} | {} dirty:{} reused:{}",
                     totalNs / 1_000, totalRecipes,
                     reachableNs / 1_000, reachableItems.size(),
                     modelNs / 1_000, treeComputeNs / 1_000, verifyNs / 1_000,
                     treeCounted, preCheckSkipped, treeSkipped, containerChecked,
-                    dpExactCount, simulatedCount, gateCycle, gateSharing, gateCross, gateDirect,
+                    dpExactCount, simulatedCount, gateCycle, gateSharing, gateCross, gateAdditive, gateDirect,
                     incremental ? "incr" : "full", dirtyCount, reused);
         }
 
         return new CraftCounts(
-                resolvedCounts, containerSet, containerItemSet, collAllEntries,
+                resolvedCounts, containerSet, containerItemSet, collAllEntries, tagState,
                 new CraftCounts.Stats(totalNs, treeCounted, preCheckSkipped, treeSkipped, containerChecked));
     }
 
@@ -375,11 +417,12 @@ public final class CountEngine {
      * Value-diffed dirty recipe set between two snapshots (see the incremental block in
      * {@link #compute}): changed items (both directions, values compared) seed the item
      * dependents fixpoint; their tags plus the craftable-order diff tags union in.
-     * Container diffs apply only when containers participate in counting.
+     * Container changes seed like inventory changes, so a container that empties also
+     * dirties its recipes.
      */
-    private static BitSet computeDirty(GraphFlatData f, TagIndex tags,
-                                       InventorySnapshot prevSnap, InventorySnapshot snap,
-                                       boolean checkContainers, Set<TagKey<Item>> changedTags) {
+    static BitSet computeDirty(GraphFlatData f, TagIndex tags,
+                               InventorySnapshot prevSnap, InventorySnapshot snap,
+                               Set<TagKey<Item>> changedTags) {
         Map<Item, Integer> prevInv = prevSnap.inventory();
         Map<Item, Integer> inv = snap.inventory();
         List<Item> changedItems = new ArrayList<>();
@@ -389,15 +432,13 @@ public final class CountEngine {
         for (Item k : prevInv.keySet()) {
             if (!inv.containsKey(k)) changedItems.add(k);
         }
-        if (checkContainers) {
-            Map<Item, Integer> prevCont = prevSnap.container();
-            Map<Item, Integer> cont = snap.container();
-            for (Map.Entry<Item, Integer> e : cont.entrySet()) {
-                if (!Objects.equals(e.getValue(), prevCont.get(e.getKey()))) changedItems.add(e.getKey());
-            }
-            for (Item k : prevCont.keySet()) {
-                if (!cont.containsKey(k)) changedItems.add(k);
-            }
+        Map<Item, Integer> prevCont = prevSnap.container();
+        Map<Item, Integer> cont = snap.container();
+        for (Map.Entry<Item, Integer> e : cont.entrySet()) {
+            if (!Objects.equals(e.getValue(), prevCont.get(e.getKey()))) changedItems.add(e.getKey());
+        }
+        for (Item k : prevCont.keySet()) {
+            if (!cont.containsKey(k)) changedItems.add(k);
         }
         int[] seeds = new int[changedItems.size()];
         List<int[]> extras = new ArrayList<>();
@@ -454,11 +495,12 @@ public final class CountEngine {
     /**
      * A safe upper bound (in crafts) for the exact simulator's binary search.
      *
-     * <p>For non-cycle-suspect recipes the tree DP never under-counts (its only
-     * under-count source is cycle-avoidance, which is exactly what
-     * {@code recCycleSuspect} flags), so the DP item count is an upper bound on
-     * the true count. Multi-recipe outputs share the DP estimate (a per-recipe
-     * under-count), and base-with-recipes options fall back to physical-only
+     * <p>For non-cycle-suspect recipes the tree DP does not under-count through
+     * cycle-avoidance (what {@code recCycleSuspect} flags), so the DP item count is an
+     * upper bound on the true count. Additive sources are the other under-count: the
+     * caller excludes those recipes (see {@link DpEstimator#dependsOnAdditive}) and
+     * gives them the full bound instead. Multi-recipe outputs share the DP estimate (a
+     * per-recipe under-count), and base-with-recipes options fall back to physical-only
      * memoisation — both must keep the full 999 bound. The search result is
      * unchanged: feasibility is monotonic and the truth always lies ≤ hi.
      */
@@ -487,10 +529,11 @@ public final class CountEngine {
             Set<RecipeDisplayId> containerCraftable,
             Set<Item> containerAvailableItems,
             List<List<RecipeDisplayEntry>> collAllEntries,
+            TagIndex.InventoryTags tagState,
             Stats stats
     ) {
         public static final CraftCounts EMPTY = new CraftCounts(
-                Map.of(), Set.of(), Set.of(), List.of(),
+                Map.of(), Set.of(), Set.of(), List.of(), null,
                 new Stats(0, 0, 0, 0, 0));
 
         public boolean isEmpty() {

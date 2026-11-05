@@ -10,10 +10,9 @@ Legend: **[done]** implemented and in the build · **[open]** tracked, not done 
 
 ## Data-structure / algorithm / low-level review
 Findings from the deep review (all landed items behavior-identical; ruled-out items with proof):
-- [done] Slot→tag identity cache (`RecipeDisplays`): 26.3+ paid an `Optional` + HolderSet deref
-  per tag slot per attempt. Memoised with identity semantics (records would hash DEEP — worse
-  than the `Optional`); cleared with the slots cache on reload. All tag callers benefit.
-- [done] dpExact gate-rejection telemetry (`gate:cyc/shr/crs/dir` in the debug line, zero hot-path
+- [removed] Slot→tag identity cache (`RecipeDisplays`): it took a global lock per tag slot per
+  attempt, shared with the render thread. Replaced by a direct `unwrapKey()` read; not profiled.
+- [done] dpExact gate-rejection telemetry (`gate:cyc/shr/crs/add/dir` in the debug line, zero hot-path
   cost when off): the next gate-tuning step must be data-driven — which condition rejects most.
 - [killed with proof] `failedExact` memo: each entry is simulated at most once per compute (the
   count>0 / count==0 / container branches are exclusive), so a cross-entry failure memo would
@@ -38,17 +37,18 @@ Findings from the deep review (all landed items behavior-identical; ruled-out it
   snapshots gives changed items directly.
   - New structures: per-entry tag lists (`RecipeIndex`, pre-expansion) → tag→recIdx index +
     int[][] item dependents (flat fields, once per model); craftable-order diff in
-    `TagIndex.refreshInventory` (order-sensitive list compare, empty on no-rebuild);
-    `DirtySet` pure-int fixpoint core (unit-tested headless: chains, diamonds, tag unions,
-    invalid seeds); previous snapshot/counts ride the request (`ResolveResult.snapshot`,
-    `ResolveRequest.previous/changedTags`).
+    `TagIndex.craftableChangedSince` (order-sensitive list compare against the tag data stored
+    on the previous result); `DirtySet` pure-int fixpoint core (unit-tested headless: chains,
+    diamonds, tag unions, invalid seeds); previous snapshot/counts/tag data ride the request
+    (`ResolveResult.snapshot/tagState`, `ResolveRequest.previous`).
   - Merge: pre-populate from previous, evict dirty keys (absent means zero — identical to a
     fresh map); `collAllEntries` still assembles fully; container-available items derived
     post-loop from the final container set (proven identical to per-hit accumulation).
   - Soundness: outcome = pure function of closure counts (dependents fixpoint) + tag picks
     (tag propagation + order diffs) + recomputed inputs (full DP/reachability/snapshot) +
     static per-model data. Non-graph changed items propagate tags only (in no edge — nothing
-    concrete to propagate). Container diffs gated on `searchContainers`. Grid/model/first-run
+    concrete to propagate). Container diffs always run (both maps are empty with search off), so
+    a container that empties also dirties its recipes. Grid/model/first-run
     mismatches and >50% dirty fall back to the untouched full path. Log gains `incr/full`,
     `dirty:N`, `reused:N` (additive fields).
 - [done] Sync-triggered warmup prefetch (from the research round): `requestWarmup` on recipe
@@ -114,9 +114,10 @@ a non-graph item could theoretically appear:
   `setCycleFlags` skipped when `recReverseTargets[ri]` is empty.
 - [done] Data-type round: `comb/inv/memoCount/dOpsCount long[] → int[]` (halved widths,
   saturate-on-store — exact below 2^31, downstream caps at 999 regardless);
-  `calculatePerRecipeCounts` returns `int[]` by `recIdx` (no boxed map, no conversion pass).
-- [open] split no-cycle/cycle variants; fuse `isRecipeContainerOnly`; iterative topo order
-  instead of `computeMemo` recursion.
+  `DpEstimator.estimate` returns counts as `int[]` by `recIdx` (no boxed map, no conversion pass).
+- [done] Removed the container-only bookkeeping (`isRecipeContainerOnly`, `calculateDirectOps`,
+  `memoContOnly`, `inv`, `dOps*`): nothing outside the estimator ever read it.
+- [open] split no-cycle/cycle variants; iterative topo order instead of `computeMemo` recursion.
 - [skipped] `ThreadLocal<Ctx>` buffer pooling: saves GC pressure only (short-lived arrays are
   scavenged cheaply), not CPU — and stale memo-flag bugs would corrupt counts. Revisit only
   if modpack profiles show GC stalls.
@@ -129,7 +130,8 @@ a non-graph item could theoretically appear:
 
 ### 10. `ExactSimulator` repeated full sorts [done via #2]
 - Scratch `WorkMap`/contexts already cached per thread; each step is now hash-free.
-- [open] cache `sortedEntries` per inventory generation.
+- [done] `WorkMap.restoreBase`: attempts against the same inventory map roll back the journal
+  and truncate `present` instead of refilling, with identical state (`WorkMapTest`).
 
 ### 11. `RecipeDisplays` per-call tree allocs (`RecipeDisplays.java`) [done, partial]
 - `ConcurrentHashMap<RecipeDisplayId, List<SlotDisplay>>` normalized-slots cache; cleared on
@@ -156,9 +158,9 @@ a non-graph item could theoretically appear:
 ### 13. `CraftPlanner` per-iteration garbage (`CraftPlanner.java`) [done, partial]
 - One shared `ResolveContext` per `buildPlan`; `cycles` pre-sized; single-loop totals;
   `computeDirectCrafts` uses cached slots + `resolveSlotItem`.
-- [skipped] `computeDirectCrafts` deducts `maxCrafts*value` from `simMap` but `deductDirect`
-  deducts only `value` once (under-deduct) + `HashSet` iteration nondeterminism (§7.3). Behavior
-  decision + test required before touching.
+- [done] Direct crafts: the under-deducting `deductDirect` is gone; the work map is reset from
+  `simMap`, clicks are sized from ingredient stack limits (`directClicks`), and `craftAll` is per
+  cycle. 1000 planks to sticks plans 8 clicks instead of 530.
 
 ---
 
@@ -166,10 +168,12 @@ a non-graph item could theoretically appear:
 
 14. `CraftModel.current()` lock hold [done] — graph builds under a dedicated `GRAPH_LOCK` with
     double-checked `volatile`; index readers never block on the ~30ms build. The `recipeCount`
-    walk stays (it is the change detector — removing it changes outcomes).
+    walk stays (it is the change detector — removing it changes outcomes). `graph()` is now an
+    instance method: it was static, so every `model.graph()` re-ran `current()`.
 15. `InventoryProvider.current()` per-frame copies [done] — compare-before-snapshot (no `Map.copyOf`
     ×2 on the unchanged path; visible generations still bump only on change) + sized maps.
-    `combined()` left as-is (once per worker compute, not per frame).
+    `combined()` left as-is (once per worker compute, not per frame). The overlay's render path
+    now reads at most once per client tick; tag data refreshes on the worker (`ensureFresh`).
 16. Solver on the render thread (`OverlayBuilder`) [skipped async redesign — outcome risk];
     narrow wins [done]: cached `getSlots(entry)`; dropped the double `resolveSlot` on the empty
     fallback path (pure function — recompute returned empty again); sized inventory copies;
@@ -194,7 +198,9 @@ a non-graph item could theoretically appear:
     `drainPending` (all `submit()` callers are render-thread, so no interleave); worker `finally`
     only clears as a fallback when the render post itself threw; drain routes through `submit()`.
 23. `RenderSync.run` lambda allocs [skipped] — one small lambda per ~8ms compute; negligible.
-24. Coarse `reset()/resetLatest()` [skipped] — per-collection diffs risk stale/mixed tab states.
+24. Coarse `reset()` [skipped] — per-collection diffs risk stale/mixed tab states. `resetLatest()`
+    is gone: the last result stays on screen until the re-resolve publishes, and unchanged
+    collections are reused across resolves (`CollectionAssembler.Assembly`).
 25. `CraftPlanner.planCache` races + thrash [done] — synchronized access, cap 8 → 32.
 26. Linear 999-deep planner loop [skipped] — binary search changes plan structure, not just speed.
 27. `WORKER` never shut down [done] — `CLIENT_STOPPING` → `ResolvePipeline.shutdown()`.

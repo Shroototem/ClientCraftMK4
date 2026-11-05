@@ -25,6 +25,9 @@ import java.util.Set;
  */
 public final class ExactSimulator {
     private static final ThreadLocal<WorkMap> SCRATCH = new ThreadLocal<>();
+    // The inventory and graph the scratch map was last filled from (identity, not content).
+    private static final ThreadLocal<Map<Item, Integer>> SCRATCH_INV = new ThreadLocal<>();
+    private static final ThreadLocal<RecipeGraph> SCRATCH_GRAPH = new ThreadLocal<>();
     private static final ThreadLocal<Set<Item>> IN_PROGRESS = ThreadLocal.withInitial(HashSet::new);
     private static final ThreadLocal<QtyResolveContext> QTY_CTX = new ThreadLocal<>();
     private static final ThreadLocal<ResolveContext> CTX = new ThreadLocal<>();
@@ -48,20 +51,27 @@ public final class ExactSimulator {
     public static int simulateCraftCount(CraftModel model, int gridSize,
                                          RecipeDisplayEntry entry, Map<Item, Integer> inventory,
                                          int maxCrafts, int loHint) {
+        return simulateCraftCount(model, gridSize, entry, inventory, maxCrafts, loHint, false);
+    }
+
+    /** The search above, with {@code splitDeficits} passed to {@link QtyResolveContext#setSplitDeficits}. */
+    public static int simulateCraftCount(CraftModel model, int gridSize,
+                                         RecipeDisplayEntry entry, Map<Item, Integer> inventory,
+                                         int maxCrafts, int loHint, boolean splitDeficits) {
         if (maxCrafts <= 0 || inventory == null || inventory.isEmpty()) return 0;
         int hi = maxCrafts;
         int lo = 0;
         int hint = Math.min(loHint, hi - 1);
-        if (hint > 0 && tryResolveQty(model, gridSize, entry, inventory, hint)) {
+        if (hint > 0 && tryResolveQty(model, gridSize, entry, inventory, hint, splitDeficits)) {
             lo = hint;
         }
         if (lo == 0) {
-            if (!tryResolveQty(model, gridSize, entry, inventory, 1)) return 0;
+            if (!tryResolveQty(model, gridSize, entry, inventory, 1, splitDeficits)) return 0;
             lo = 1;
         }
         while (lo < hi) {
             int mid = lo + (hi - lo + 1) / 2;
-            if (tryResolveQty(model, gridSize, entry, inventory, mid)) {
+            if (tryResolveQty(model, gridSize, entry, inventory, mid, splitDeficits)) {
                 lo = mid;
             } else {
                 hi = mid - 1;
@@ -81,21 +91,23 @@ public final class ExactSimulator {
     public static boolean tryResolveOnce(CraftModel model, int gridSize,
                                          RecipeDisplayEntry entry, Map<Item, Integer> inventory) {
         if (inventory == null || inventory.isEmpty()) return false;
-        WorkMap work = scratch(model.graph());
-        work.resetTo(inventory, model.graph());
+        WorkMap work = prepared(model.graph(), inventory);
         Set<Item> inProgress = IN_PROGRESS.get();
         inProgress.clear();
         return resolveCtx(model, gridSize).resolve(entry, work, null, inProgress, 0, null);
     }
 
     private static boolean tryResolveQty(CraftModel model, int gridSize,
-                                         RecipeDisplayEntry entry, Map<Item, Integer> inventory, int k) {
+                                         RecipeDisplayEntry entry, Map<Item, Integer> inventory, int k,
+                                         boolean splitDeficits) {
         if (k <= 0) return true;
-        WorkMap work = scratch(model.graph());
-        work.resetTo(inventory, model.graph());
+        WorkMap work = prepared(model.graph(), inventory);
         Set<Item> inProgress = IN_PROGRESS.get();
         inProgress.clear();
-        return qtyCtx(model, gridSize).resolveQty(entry, work, k, null, inProgress, 0, null);
+        // The cached context keeps the flag from the last attempt, so set it on every attempt.
+        QtyResolveContext ctx = qtyCtx(model, gridSize);
+        ctx.setSplitDeficits(splitDeficits);
+        return ctx.resolveQty(entry, work, k, null, inProgress, 0, null);
     }
 
     /**
@@ -122,12 +134,25 @@ public final class ExactSimulator {
         return ctx;
     }
 
-    private static WorkMap scratch(RecipeGraph graph) {
+    /**
+     * The per-thread scratch map, reset to the given inventory. The published inventory map
+     * and graph are immutable, so when they are the same objects as last time the map is only
+     * rolled back to its fill state (O(changes)) instead of being refilled.
+     */
+    private static WorkMap prepared(RecipeGraph graph, Map<Item, Integer> inventory) {
         WorkMap w = SCRATCH.get();
         int needed = graph.flat() != null ? Math.max(16, graph.flat().n()) : 16;
         if (w == null || w.capacity() < needed) {
             w = new WorkMap(needed);
             SCRATCH.set(w);
+            SCRATCH_INV.remove();
+        }
+        if (SCRATCH_INV.get() == inventory && SCRATCH_GRAPH.get() == graph) {
+            w.restoreBase();
+        } else {
+            w.resetTo(inventory, graph);
+            SCRATCH_INV.set(inventory);
+            SCRATCH_GRAPH.set(graph);
         }
         return w;
     }

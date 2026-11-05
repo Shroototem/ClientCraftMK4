@@ -15,46 +15,96 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * All tag caches for one recipe set (plan §8.4):
  * <ul>
- *   <li>{@code knownTags} / {@code itemToTags} — recipe-set determined, built at model time;</li>
- *   <li>{@code inventoryTagIndex} / {@code containerTagIndex} / {@code craftableTagIndex} —
- *       inventory determined, refreshed by {@link #refreshInventory}.</li>
+ *   <li>{@code knownTags} / {@code itemToTags} / flat tag data — recipe-set determined, built at
+ *       model time;</li>
+ *   <li>{@link InventoryTags} — inventory determined, built off-model by {@link #ensureFresh} and
+ *       published as one immutable object.</li>
  * </ul>
  *
  * A fresh instance is created per {@link CraftModel} rebuild, so the inventory-dependent
- * indices are automatically rebuilt against the new recipe set on the next snapshot read.
+ * data is automatically rebuilt against the new recipe set on the next {@link #ensureFresh}.
  */
 public final class TagIndex {
     private final Set<TagKey<Item>> knownTags = new HashSet<>();
-    private final Map<Item, Set<TagKey<Item>>> itemToTags = new HashMap<>();
-    private final Map<TagKey<Item>, Set<Item>> inventoryTagIndex = new HashMap<>();
-    private final Map<TagKey<Item>, Set<Item>> containerTagIndex = new HashMap<>();
-    private final Map<TagKey<Item>, List<Item>> craftableTagIndex = new HashMap<>();
+    private final Map<Item, Set<TagKey<Item>>> itemToTags = new ConcurrentHashMap<>();
     private final Map<TagKey<Item>, List<Item>> tagMembersCache = new ConcurrentHashMap<>();
     private final Map<TagKey<Item>, Item> tagFallbackItem = new ConcurrentHashMap<>();
-    private Set<Item> lastInventoryKeys = Set.of();
-    private Set<Item> lastContainerKeys = Set.of();
 
     // Flat tag data, built once per model by GraphBuilder (which owns the id map).
     // Registry holder.is(tag) checks are expensive — worse in modpacks with deep tag
     // hierarchies — and the resolver fallback scans did one per present item per slot.
     // These structures answer the same questions with array reads. Memory scales in
     // BITS per tag (BitSet), not objects, so hundreds of tags stay cheap.
-    // Published via the volatile flag (written last); safe for render+worker readers.
-    private volatile boolean flatTagsReady = false;
-    private IdentityHashMap<Item, Integer> flatIdMap = null;
-    @SuppressWarnings("unchecked")
-    private Set<TagKey<Item>>[] tagsByFlatId = new Set[0];
-    private Map<TagKey<Item>, BitSet> tagBits = Map.of();
+    // Published as one volatile record; safe for render+worker readers.
+    private record FlatTags(IdentityHashMap<Item, Integer> idMap, Set<TagKey<Item>>[] tagsById,
+                            Map<TagKey<Item>, BitSet> bits) {}
+    private volatile FlatTags flat;
 
-    // Flat member-id arrays for the resolver hot loop: same iteration order as the member
-    // sets (snapshot once per indices version), so picks are identical to iterating the
-    // sets — minus per-candidate map hashing. Bumped wherever the indices rebuild; the
-    // single-entry versions below invalidate the caches on change.
-    private volatile long tagIdsVersion = 0;
-    private long invIdsVersion = -1;
-    private final Map<TagKey<Item>, int[]> invMemberIds = new ConcurrentHashMap<>();
-    private long craftIdsVersion = -1;
-    private final Map<TagKey<Item>, int[]> craftMemberIds = new ConcurrentHashMap<>();
+    /**
+     * Immutable inventory-derived tag data, published whole by {@link #ensureFresh}. The member-id
+     * caches fill lazily; they are idempotent, so racing readers at worst compute the same array twice.
+     */
+    public static final class InventoryTags {
+        private static final InventoryTags EMPTY = new InventoryTags(-1, Set.of(), Set.of(),
+                Collections.emptyMap(), Collections.emptyMap(), Collections.emptyMap());
+        final long generation;
+        final Set<Item> inventoryKeys, containerKeys;
+        final Map<TagKey<Item>, Set<Item>> inventory, container;
+        final Map<TagKey<Item>, List<Item>> craftable;
+        final Map<TagKey<Item>, int[]> inventoryIds = new ConcurrentHashMap<>();
+        final Map<TagKey<Item>, int[]> craftableIds = new ConcurrentHashMap<>();
+
+        private InventoryTags(long generation, Set<Item> inventoryKeys, Set<Item> containerKeys,
+                              Map<TagKey<Item>, Set<Item>> inventory,
+                              Map<TagKey<Item>, Set<Item>> container,
+                              Map<TagKey<Item>, List<Item>> craftable) {
+            this.generation = generation;
+            this.inventoryKeys = inventoryKeys;
+            this.containerKeys = containerKeys;
+            this.inventory = inventory;
+            this.container = container;
+            this.craftable = craftable;
+        }
+    }
+
+    private volatile InventoryTags tags = InventoryTags.EMPTY;
+
+    /**
+     * Brings the inventory-derived tag data up to date with {@code snapshot}. Only key sets
+     * matter: counts are used as "> 0", which key presence already implies.
+     */
+    public void ensureFresh(InventorySnapshot snapshot, RecipeIndex recipeIndex) {
+        InventoryTags cur = tags;
+        Set<Item> invKeys = snapshot.inventory().keySet();
+        Set<Item> contKeys = snapshot.container().keySet();
+        if (cur.inventoryKeys.equals(invKeys) && cur.containerKeys.equals(contKeys)) return;
+        if (snapshot.generation() < cur.generation) return;   // a newer snapshot already published its data
+        InventoryTags next = build(snapshot.generation(), invKeys, contKeys, snapshot.inventory(), recipeIndex);
+        synchronized (this) {
+            if (tags.generation <= next.generation) tags = next;
+        }
+    }
+
+    /** The currently published inventory-derived tag data (never null). */
+    public InventoryTags currentTags() {
+        return tags;
+    }
+
+    /**
+     * Tags whose craftable-member list differs between {@code previous} and the current data
+     * (order-sensitive: resolver picks depend on it).
+     */
+    public Set<TagKey<Item>> craftableChangedSince(InventoryTags previous) {
+        InventoryTags current = tags;
+        if (previous == null || previous == current) return Set.of();
+        Set<TagKey<Item>> all = new HashSet<>(previous.craftable.keySet());
+        all.addAll(current.craftable.keySet());
+        Set<TagKey<Item>> changed = new HashSet<>();
+        for (TagKey<Item> tag : all) {
+            if (!Objects.equals(previous.craftable.get(tag), current.craftable.get(tag))) changed.add(tag);
+        }
+        return changed.isEmpty() ? Set.of() : Set.copyOf(changed);
+    }
 
     /** Recursively collects the tags referenced by a slot tree. */
     public void collectTags(SlotDisplay slot) {
@@ -81,11 +131,8 @@ public final class TagIndex {
     public void setFlatTagData(IdentityHashMap<Item, Integer> idMap,
                                Set<TagKey<Item>>[] tagsById,
                                Map<TagKey<Item>, BitSet> bitsByTag) {
-        this.flatIdMap = idMap;
-        this.tagsByFlatId = tagsById;
-        this.tagBits = bitsByTag;
+        flat = new FlatTags(idMap, tagsById, bitsByTag);
         this.itemToTags.clear();
-        this.flatTagsReady = true;
     }
 
     /**
@@ -94,8 +141,8 @@ public final class TagIndex {
      * (pre-graph) — callers fall back to the registry check.
      */
     public BitSet flatTagBits(TagKey<Item> tag) {
-        if (!flatTagsReady) return null;
-        return tagBits.get(tag);
+        FlatTags f = flat;
+        return f == null ? null : f.bits().get(tag);
     }
 
     /** Lazily memoised set of known tags an item belongs to. */
@@ -108,21 +155,24 @@ public final class TagIndex {
     }
 
     private Set<TagKey<Item>> computeTagsOf(Item item) {
-        if (flatTagsReady) {
-            Integer id = flatIdMap.get(item);
-            if (id != null && id >= 0 && id < tagsByFlatId.length) {
-                Set<TagKey<Item>> flat = tagsByFlatId[id];
-                return flat != null ? flat : Set.of();
+        FlatTags f = flat;
+        if (f != null) {
+            Integer id = f.idMap().get(item);
+            if (id != null && id >= 0 && id < f.tagsById().length) {
+                Set<TagKey<Item>> flatTags = f.tagsById()[id];
+                return flatTags != null ? flatTags : Set.of();
             }
             // Item outside the graph (e.g. a pure inventory item): fall through to registry.
         }
+        // Headless tests have no tag bindings, so tags() can throw; with no known tags there is
+        // nothing to match anyway.
+        if (knownTags.isEmpty()) return Set.of();
         // Items carry few tags; don't pay default-16 for each.
-        Set<TagKey<Item>> tags = new HashSet<>(4);
-        var holder = item.builtInRegistryHolder();
-        for (TagKey<Item> tag : knownTags) {
-            if (tag != null && holder.is(tag)) tags.add(tag);
-        }
-        return tags.isEmpty() ? Set.of() : tags;
+        Set<TagKey<Item>> found = new HashSet<>(4);
+        item.builtInRegistryHolder().tags().forEach(tag -> {
+            if (knownTags.contains(tag)) found.add(tag);
+        });
+        return found.isEmpty() ? Set.of() : found;
     }
 
     /** Registry members of a tag, cached; null if the lookup fails. */
@@ -170,69 +220,53 @@ public final class TagIndex {
     }
 
     public Set<Item> inventoryTagMembers(TagKey<Item> tag) {
-        return inventoryTagIndex.get(tag);
+        return tags.inventory.get(tag);
     }
 
     /**
      * Flat ids of {@link #inventoryTagMembers} in set order (null pre-graph, when there is
      * no id map yet — callers use the set path). Non-graph members are dropped (their work
-     * count reads 0 anyway). Cached per indices version: same sets ⟹ same order ⟹ identical
-     * picks to the uncached path.
+     * count reads 0 anyway). Cached per published {@link InventoryTags}: same sets ⟹ same
+     * order ⟹ identical picks to the uncached path.
      */
     public int[] inventoryTagMemberIds(TagKey<Item> tag) {
-        if (flatIdMap == null || tag == null) return null;
-        if (invIdsVersion != tagIdsVersion) {
-            invMemberIds.clear();
-            craftMemberIds.clear();
-            invIdsVersion = craftIdsVersion = tagIdsVersion;
-        }
-        int[] ids = invMemberIds.get(tag);
-        if (ids == null) {
-            ids = toFlatIds(inventoryTagIndex.get(tag));
-            invMemberIds.put(tag, ids);
-        }
-        return ids;
+        FlatTags f = flat;
+        if (f == null || tag == null) return null;
+        InventoryTags t = tags;
+        return t.inventoryIds.computeIfAbsent(tag, k -> toFlatIds(f, t.inventory.get(k)));
     }
 
     /** Flat ids of {@link #craftableMembers} in list order (null pre-graph, see above). */
     public int[] craftableTagMemberIds(TagKey<Item> tag) {
-        if (flatIdMap == null || tag == null) return null;
-        if (craftIdsVersion != tagIdsVersion) {
-            invMemberIds.clear();
-            craftMemberIds.clear();
-            invIdsVersion = craftIdsVersion = tagIdsVersion;
-        }
-        int[] ids = craftMemberIds.get(tag);
-        if (ids == null) {
-            ids = toFlatIds(craftableTagIndex.get(tag));
-            craftMemberIds.put(tag, ids);
-        }
-        return ids;
+        FlatTags f = flat;
+        if (f == null || tag == null) return null;
+        InventoryTags t = tags;
+        return t.craftableIds.computeIfAbsent(tag, k -> toFlatIds(f, t.craftable.get(k)));
     }
 
-    private int[] toFlatIds(Collection<Item> items) {
+    private static int[] toFlatIds(FlatTags f, Collection<Item> items) {
         if (items == null || items.isEmpty()) return new int[0];
         int[] ids = new int[items.size()];
         int n = 0;
         for (Item item : items) {
-            Integer id = flatIdMap.get(item);
+            Integer id = f.idMap().get(item);
             if (id != null) ids[n++] = id;
         }
         return n == ids.length ? ids : Arrays.copyOf(ids, n);
     }
 
     public Set<Item> containerTagMembers(TagKey<Item> tag) {
-        return containerTagIndex.get(tag);
+        return tags.container.get(tag);
     }
 
     /** Recipe outputs carrying the tag, direct-input items first. */
     public List<Item> craftableMembers(TagKey<Item> tag) {
-        return craftableTagIndex.get(tag);
+        return tags.craftable.get(tag);
     }
 
     public int sumTagInventory(TagKey<Item> tag, Map<Item, Integer> inventory) {
         int total = 0;
-        Set<Item> matches = inventoryTagIndex.get(tag);
+        Set<Item> matches = tags.inventory.get(tag);
         if (matches != null) {
             for (Item item : matches) {
                 total += inventory.getOrDefault(item, 0);
@@ -242,50 +276,37 @@ public final class TagIndex {
     }
 
     /**
-     * Rebuilds the inventory/container/craftable indices (key-set guarded, like MK4).
-     * Called on every snapshot read; internally cheap when nothing changed.
-     *
-     * @return tags whose craftable-member list changed (order-sensitive: resolver picks
-     *         depend on it). Empty when nothing rebuilt. Feeds incremental dirtiness.
+     * Derives all inventory-dependent tag data into local maps, so the caller publishes a
+     * complete object and no reader can observe a partial rebuild.
      */
-    public Set<TagKey<Item>> refreshInventory(Map<Item, Integer> inventory, Map<Item, Integer> container, RecipeIndex recipeIndex) {
-        Set<Item> invKeys = inventory.keySet();
-        Set<Item> contKeys = container.keySet();
-        if (invKeys.equals(lastInventoryKeys) && contKeys.equals(lastContainerKeys)) return Set.of();
-        // Indices rebuild below: invalidate the cached member-id arrays (version-checked).
-        tagIdsVersion++;
-        // Snapshot the old craftable lists (replaced, never mutated, during the rebuild).
-        Map<TagKey<Item>, List<Item>> prevCraftable = new HashMap<>(craftableTagIndex);
-
-        inventoryTagIndex.clear();
+    private InventoryTags build(long generation, Set<Item> invKeys, Set<Item> contKeys,
+                                Map<Item, Integer> inventory, RecipeIndex recipeIndex) {
+        Map<TagKey<Item>, Set<Item>> invTags = new HashMap<>();
         for (Item item : invKeys) {
             for (TagKey<Item> tag : tagsOf(item)) {
-                inventoryTagIndex.computeIfAbsent(tag, k -> new HashSet<>(4)).add(item);
+                invTags.computeIfAbsent(tag, k -> new HashSet<>(4)).add(item);
             }
         }
 
-        containerTagIndex.clear();
+        Map<TagKey<Item>, Set<Item>> contTags = new HashMap<>();
         for (Item item : contKeys) {
             for (TagKey<Item> tag : tagsOf(item)) {
-                containerTagIndex.computeIfAbsent(tag, k -> new HashSet<>(4)).add(item);
+                contTags.computeIfAbsent(tag, k -> new HashSet<>(4)).add(item);
             }
         }
 
-        lastInventoryKeys = new HashSet<>(invKeys);
-        lastContainerKeys = new HashSet<>(contKeys);
-
-        craftableTagIndex.clear();
         Map<TagKey<Item>, List<Item>> hasInputsMap = new HashMap<>();
         Map<TagKey<Item>, List<Item>> noInputsMap = new HashMap<>();
         for (Item item : recipeIndex.outputs()) {
-            Set<TagKey<Item>> tags = tagsOf(item);
-            if (tags.isEmpty()) continue;
-            boolean directInputs = hasDirectInputs(item, inventory, recipeIndex);
+            Set<TagKey<Item>> itemTags = tagsOf(item);
+            if (itemTags.isEmpty()) continue;
+            boolean directInputs = hasDirectInputs(item, inventory, invTags, recipeIndex);
             Map<TagKey<Item>, List<Item>> target = directInputs ? hasInputsMap : noInputsMap;
-            for (TagKey<Item> tag : tags) {
+            for (TagKey<Item> tag : itemTags) {
                 target.computeIfAbsent(tag, k -> new ArrayList<>()).add(item);
             }
         }
+        Map<TagKey<Item>, List<Item>> craftable = new HashMap<>();
         for (TagKey<Item> tag : knownTags) {
             List<Item> has = hasInputsMap.get(tag);
             List<Item> no = noInputsMap.get(tag);
@@ -293,57 +314,44 @@ public final class TagIndex {
                 List<Item> combined = new ArrayList<>();
                 if (has != null) combined.addAll(has);
                 if (no != null) combined.addAll(no);
-                craftableTagIndex.put(tag, combined);
+                craftable.put(tag, combined);
             }
         }
-
-        // Order-sensitive diff against the pre-rebuild lists: any content or order change
-        // can alter resolver picks for that tag's slots.
-        Set<TagKey<Item>> changed = null;
-        Set<TagKey<Item>> all = new HashSet<>(prevCraftable.keySet());
-        all.addAll(craftableTagIndex.keySet());
-        for (TagKey<Item> tag : all) {
-            if (!Objects.equals(prevCraftable.get(tag), craftableTagIndex.get(tag))) {
-                if (changed == null) changed = new HashSet<>(4);
-                changed.add(tag);
-            }
-        }
-        return changed == null ? Set.of() : Set.copyOf(changed);
+        return new InventoryTags(generation, invKeys, contKeys, invTags, contTags, craftable);
     }
 
-    private boolean hasDirectInputs(Item item, Map<Item, Integer> inventory, RecipeIndex recipeIndex) {
+    /** True when some recipe for {@code item} has every ingredient slot satisfied by the inventory. */
+    private static boolean hasDirectInputs(Item item, Map<Item, Integer> inventory,
+                                           Map<TagKey<Item>, Set<Item>> invTags, RecipeIndex recipeIndex) {
         List<RecipeDisplayEntry> recipes = recipeIndex.get(item);
         if (recipes == null) return false;
         outer: for (RecipeDisplayEntry entry : recipes) {
             List<SlotDisplay> slots = RecipeDisplays.getSlots(entry);
             if (slots == null) continue;
             for (SlotDisplay slot : slots) {
-                if (slot instanceof SlotDisplay.Empty) continue;
-                if (slot instanceof SlotDisplay.TagSlotDisplay t) {
-                    if (inventoryTagIndex.containsKey(RecipeDisplays.getSlotTag(t))) continue;
-                    continue outer;
-                }
-                if (slot instanceof SlotDisplay.Composite d) {
-                    boolean found = false;
-                    for (SlotDisplay sub : d.contents()) {
-                        Item r = RecipeDisplays.resolveSlotItem(sub, inventory, this, false);
-                        if (r != null && inventory.getOrDefault(r, 0) > 0) { found = true; break; }
-                    }
-                    if (found) continue;
-                    continue outer;
-                }
-                if (slot instanceof SlotDisplay.WithRemainder d) {
-                    SlotDisplay inner = d.input();
-                    if (inner instanceof SlotDisplay.TagSlotDisplay t) {
-                        if (inventoryTagIndex.containsKey(RecipeDisplays.getSlotTag(t))) continue;
-                        continue outer;
-                    }
-                }
-                Item r = RecipeDisplays.resolveSlotItem(slot, inventory, this, false);
-                if (r != null && inventory.getOrDefault(r, 0) > 0) continue;
-                continue outer;
+                if (!slotHasDirect(slot, inventory, invTags)) continue outer;
             }
             return true;
+        }
+        return false;
+    }
+
+    private static boolean slotHasDirect(SlotDisplay slot, Map<Item, Integer> inventory,
+                                         Map<TagKey<Item>, Set<Item>> invTags) {
+        if (slot instanceof SlotDisplay.Empty) return true;
+        if (slot instanceof SlotDisplay.TagSlotDisplay t) {
+            return invTags.containsKey(RecipeDisplays.getSlotTag(t));
+        }
+        if (slot instanceof SlotDisplay.Composite d) {
+            for (SlotDisplay sub : d.contents()) {
+                if (slotHasDirect(sub, inventory, invTags)) return true;
+            }
+            return false;
+        }
+        if (slot instanceof SlotDisplay.WithRemainder d) return slotHasDirect(d.input(), inventory, invTags);
+        if (slot instanceof SlotDisplay.ItemSlotDisplay d) return inventory.getOrDefault(d.item().value(), 0) > 0;
+        if (slot instanceof SlotDisplay.ItemStackSlotDisplay d) {
+            return inventory.getOrDefault(d.stack().item().value(), 0) > 0;
         }
         return false;
     }

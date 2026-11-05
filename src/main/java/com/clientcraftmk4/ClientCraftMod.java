@@ -1,6 +1,7 @@
 package com.clientcraftmk4;
 
 import com.clientcraftmk4.config.ClientCraftConfig;
+import com.clientcraftmk4.core.GameContext;
 import com.clientcraftmk4.craft.AutoCrafter;
 import com.clientcraftmk4.pipeline.ResolveCache;
 import com.clientcraftmk4.pipeline.ResolvePipeline;
@@ -18,7 +19,9 @@ public class ClientCraftMod implements ClientModInitializer {
             ResolvePipeline.clearWarmup();
         });
         ClientLifecycleEvents.CLIENT_STOPPING.register(client -> ResolvePipeline.shutdown());
+        ClientTickEvents.END_CLIENT_TICK.register(client -> GameContext.onClientTick());
         ClientTickEvents.END_CLIENT_TICK.register(client -> ResolvePipeline.warmupIfRequested());
+        ClientTickEvents.END_CLIENT_TICK.register(client -> ResolvePipeline.dropCallbackIfScreenClosed());
         AutoCrafter.registerTickHandler();
     }
 }

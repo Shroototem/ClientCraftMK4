@@ -1,6 +1,7 @@
 package com.clientcraftmk4.pipeline;
 
 import com.clientcraftmk4.core.InventorySnapshot;
+import com.clientcraftmk4.core.TagIndex;
 import net.minecraft.client.gui.screens.recipebook.RecipeCollection;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.crafting.display.RecipeDisplayId;
@@ -26,15 +27,21 @@ public record ResolveResult(
         long modelGeneration,
         // The snapshot this result was computed from (immutable): anchors incremental
         // resolves, which diff it against the new snapshot to find changed items.
-        InventorySnapshot snapshot
+        InventorySnapshot snapshot,
+        // The tag data this result was computed with: incremental resolves diff it against
+        // the current data to find tags whose craftable-member order changed. Null if unknown.
+        TagIndex.InventoryTags tagState,
+        // How this result split each source collection, so the next resolve can reuse them.
+        CollectionAssembler.Assembly assembly
 ) {
     public static final ResolveResult EMPTY = new ResolveResult(
             List.of(), Map.of(), Set.of(), Set.of(), Map.of(), Set.of(), 0, 0, 0,
-            InventorySnapshot.EMPTY);
+            InventorySnapshot.EMPTY, null, null);
 
     /** Returns a copy with a different collection list (used for the first-open placeholder). */
     public ResolveResult withCollections(List<RecipeCollection> c) {
         return new ResolveResult(c, counts, containerCraftable, containerAvailableItems,
-                ranks, autoCraftCollections, cacheKey, inventoryGeneration, modelGeneration, snapshot);
+                ranks, autoCraftCollections, cacheKey, inventoryGeneration, modelGeneration, snapshot, tagState,
+                assembly);
     }
 }

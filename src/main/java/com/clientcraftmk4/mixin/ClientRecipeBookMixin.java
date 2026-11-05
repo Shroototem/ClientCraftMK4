@@ -14,7 +14,10 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 import java.util.List;
 
-/** Routes the ClientCraft category to the pipeline and invalidates on recipe reload. */
+/**
+ * Routes the ClientCraft category to the pipeline and invalidates the model on recipe reload.
+ * The last result stays on screen until the re-resolve publishes.
+ */
 @Mixin(ClientRecipeBook.class)
 public class ClientRecipeBookMixin {
 
@@ -28,7 +31,6 @@ public class ClientRecipeBookMixin {
     @Inject(method = "rebuildCollections", at = @At("TAIL"))
     private void clientcraft$onRecipesRefreshed(CallbackInfo ci) {
         CraftModel.markDirty();
-        ResolvePipeline.resetLatest();
         // Caches are cold after a sync: warm them on the worker as soon as the world is
         // ready (tick), instead of paying the cold resolve on first tab open.
         ResolvePipeline.requestWarmup();

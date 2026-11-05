@@ -12,8 +12,6 @@ import net.minecraft.world.item.crafting.display.ShapelessCraftingRecipeDisplay;
 import net.minecraft.world.item.crafting.display.SlotDisplay;
 
 import java.util.Collection;
-import java.util.Collections;
-import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -30,71 +28,65 @@ public final class RecipeDisplays {
 
     /**
      * Normalized slot lists per recipe entry. {@link #normalize} rebuilds Composite/WithRemainder
-     * wrappers on every call (Stream + toList + tree allocs, ~5000x/refresh on 26.3+); the result
+     * wrappers on every call (Stream + toList + tree allocs, ~5000x/refresh); the result
      * depends only on the display structure, so it is cached per {@link RecipeDisplayId} and
      * cleared on recipe reload via {@link #clearSlotsCache()} (called from
      * {@code CraftModel.markDirty/reset}).
      */
-    private static final ConcurrentHashMap<RecipeDisplayId, List<SlotDisplay>> SLOTS_CACHE =
+    private record CachedSlots(RecipeDisplay display, List<SlotDisplay> slots) {}
+
+    /** A server change can reuse an id for another recipe, so a hit must also match the display object. */
+    private static final ConcurrentHashMap<RecipeDisplayId, CachedSlots> SLOTS_CACHE =
             new ConcurrentHashMap<>();
 
     /** Drops all cached normalized slot lists (recipe set changed). */
     public static void clearSlotsCache() {
         SLOTS_CACHE.clear();
-        clearTagCache();
     }
 
     /** Cached variant for callers that have the entry (hot paths prefer this). */
     public static List<SlotDisplay> getSlots(RecipeDisplayEntry entry) {
-        List<SlotDisplay> cached = SLOTS_CACHE.get(entry.id());
-        if (cached != null) return cached;
-        List<SlotDisplay> slots = getSlots(entry.display());
-        if (slots != null) SLOTS_CACHE.put(entry.id(), slots);
+        RecipeDisplay display = entry.display();
+        CachedSlots cached = SLOTS_CACHE.get(entry.id());
+        if (cached != null && cached.display() == display) return cached.slots();
+        List<SlotDisplay> slots = getSlots(display);
+        if (slots != null) SLOTS_CACHE.put(entry.id(), new CachedSlots(display, slots));
         return slots;
     }
 
     public static List<SlotDisplay> getSlots(RecipeDisplay display) {
         if (display instanceof ShapedCraftingRecipeDisplay s) {
-            //? if >=26.3 {
             return s.ingredients().stream().map(RecipeDisplays::normalize).toList();
-            //?}
-            //? if <26.3 {
-            /*return s.ingredients();*/
-            //?}
         }
         if (display instanceof ShapelessCraftingRecipeDisplay s) {
-            //? if >=26.3 {
             return s.ingredients().stream().map(RecipeDisplays::normalize).toList();
-            //?}
-            //? if <26.3 {
-            /*return s.ingredients();*/
-            //?}
         }
         return null;
     }
 
     /**
-     * 26.3 tag slots may hold a direct item list (no tag key); unwrap those into
-     * item slots so tag-only logic never sees them (26.2 built them as Composites).
+     * Unwraps the slot wrappers the walkers don't handle: WithAnyPotion and OnlyWithComponent
+     * become their inner slot, and on 26.3+ a tag slot holding a direct item list becomes item
+     * slots (26.2 built them as Composites). Composite and WithRemainder inputs are unwrapped
+     * recursively.
      */
     public static SlotDisplay normalize(SlotDisplay slot) {
-        //? if >=26.3 {
-        if (slot instanceof SlotDisplay.TagSlotDisplay d && d.tag().unwrapKey().isEmpty()) {
-            return new SlotDisplay.Composite(d.tag().stream()
-                    .map(h -> (SlotDisplay) new SlotDisplay.ItemSlotDisplay(h))
-                    .toList());
-        }
+        if (slot instanceof SlotDisplay.WithAnyPotion p) return normalize(p.display());
+        if (slot instanceof SlotDisplay.OnlyWithComponent c) return normalize(c.source());
         if (slot instanceof SlotDisplay.Composite c) {
             return new SlotDisplay.Composite(c.contents().stream().map(RecipeDisplays::normalize).toList());
         }
         if (slot instanceof SlotDisplay.WithRemainder r) {
             return new SlotDisplay.WithRemainder(normalize(r.input()), r.remainder());
         }
+        //? if >=26.3 {
+        if (slot instanceof SlotDisplay.TagSlotDisplay d && d.tag().unwrapKey().isEmpty()) {
+            return new SlotDisplay.Composite(d.tag().stream()
+                    .map(h -> (SlotDisplay) new SlotDisplay.ItemSlotDisplay(h))
+                    .toList());
+        }
+        //?}
         return slot;
-        //?}
-        //? if <26.3 {
-        /*return slot;*/
-        //?}
     }
 
     public static boolean fitsInGrid(RecipeDisplay display, int gridSize) {
@@ -181,6 +173,7 @@ public final class RecipeDisplays {
             if (craftable != null && !craftable.isEmpty()) return new ItemStack(craftable.getFirst());
             return tags.anyTagMember(tag);
         }
+        if (display instanceof SlotDisplay.WithAnyPotion d) return resolveSlot(d.display(), inventory, tags, workingCopy);
         if (display instanceof SlotDisplay.WithRemainder d) return resolveSlot(d.input(), inventory, tags, workingCopy);
         if (display instanceof SlotDisplay.Composite d) {
             ItemStack fallback = ItemStack.EMPTY;
@@ -198,6 +191,7 @@ public final class RecipeDisplays {
             }
             return bestCount > 0 ? best : fallback;
         }
+        // DyedSlotDemo stays empty: resolving it would let a dyed chestplate stand in for a helmet.
         return ItemStack.EMPTY;
     }
 
@@ -285,6 +279,11 @@ public final class RecipeDisplays {
         return best;
     }
 
+    /** Registry id for equal-count tie breaks, so every resolver path picks the same item. */
+    private static int registryId(Item item) {
+        return BuiltInRegistries.ITEM.getId(item);
+    }
+
     /**
      * WorkMap-backed {@link #resolveSlotItem} for the resolver hot loops: tag membership is
      * tested against live working counts instead of a snapshot map.
@@ -303,8 +302,8 @@ public final class RecipeDisplays {
             TagKey<Item> tag = getSlotTag(d);
             // Precomputed member ids: same candidates as iterating the member
             // collections, minus per-candidate map hashing. Null pre-graph → legacy path.
-            // Issue #8: pool draws prefer the most abundant member (ties by smaller flat
-            // id, so picks are deterministic) — scarce types stay available for the
+            // Issue #8: pool draws prefer the most abundant member (ties by registry id,
+            // so picks are deterministic) — scarce types stay available for the
             // type-specific recipes resolved before this flexible slot.
             int[] matchIds = tags.inventoryTagMemberIds(tag);
             if (matchIds != null && idToItem != null) {
@@ -312,7 +311,7 @@ public final class RecipeDisplays {
                 for (int mid : matchIds) {
                     int c = work.get(mid);
                     if (c <= 0) continue;
-                    if (c > bestCount || (c == bestCount && mid < best)) {
+                    if (c > bestCount || (c == bestCount && registryId(idToItem[mid]) < registryId(idToItem[best]))) {
                         best = mid;
                         bestCount = c;
                     }
@@ -342,7 +341,7 @@ public final class RecipeDisplays {
                 for (int cid : craftIds) {
                     int c = work.get(cid);
                     if (c <= 0) continue;
-                    if (c > bestCount || (c == bestCount && cid < best)) {
+                    if (c > bestCount || (c == bestCount && registryId(idToItem[cid]) < registryId(idToItem[best]))) {
                         best = cid;
                         bestCount = c;
                     }
@@ -416,29 +415,10 @@ public final class RecipeDisplays {
         return false;
     }
 
-    /**
-     * Slot → tag cache. On 26.3+ every call allocates an {@code Optional} plus a HolderSet
-     * dereference, per tag slot per attempt. Slot→tag is static, so memoise it: identity
-     * semantics (records would hash DEEP — structural hash of the whole subtree per lookup,
-     * worse than the Optional). Vanilla slot objects are stable per recipe set; cleared with
-     * the slots cache on reload so nothing leaks across datapack syncs.
-     */
-    private static final Map<SlotDisplay, TagKey<Item>> SLOT_TAG_CACHE =
-            Collections.synchronizedMap(new IdentityHashMap<>());
-
-    /** Drops the slot→tag memo alongside the normalized-slots cache (recipe set changed). */
-    static void clearTagCache() {
-        SLOT_TAG_CACHE.clear();
-    }
-
     public static TagKey<Item> getSlotTag(SlotDisplay slot) {
         if (slot instanceof SlotDisplay.TagSlotDisplay d) {
             //? if >=26.3 {
-            TagKey<Item> cached = SLOT_TAG_CACHE.get(slot);
-            if (cached != null || SLOT_TAG_CACHE.containsKey(slot)) return cached;
-            TagKey<Item> tag = d.tag().unwrapKey().orElse(null);
-            SLOT_TAG_CACHE.put(slot, tag);
-            return tag;
+            return d.tag().unwrapKey().orElse(null);
             //?}
             //? if <26.3 {
             /*return d.tag();

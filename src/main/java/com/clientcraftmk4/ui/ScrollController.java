@@ -45,12 +45,14 @@ public final class ScrollController {
         if (activeRecipeBookScreen.get() != null) activeRecipeBookScreen = new WeakReference<>(null);
     }
 
-    /** The active page, or null if the owning screen is no longer open. */
+    /** The active page, or null if the owning screen is no longer open or the book is hidden. */
     public static RecipeBookPage activePage() {
         Screen current = GameContext.currentScreen();
         Screen owner = activeRecipeBookScreen.get();
         if (current == null || current != owner) return null;
-        return activeRecipeBookPage.get();
+        RecipeBookPage page = activeRecipeBookPage.get();
+        if (page == null || !((RecipeBookPageAccessor) page).getParent().isVisible()) return null;
+        return page;
     }
 
     public static boolean isMouseOverBook(double mouseX, double mouseY) {
@@ -66,6 +68,7 @@ public final class ScrollController {
     public static boolean handleScroll(RecipeBookPage page, int totalPages,
                                        double mouseX, double mouseY, double yoffset) {
         if (page == null) return false;
+        if (yoffset == 0) return false;
 
         RecipeBookPageAccessor acc = (RecipeBookPageAccessor) page;
         OverlayRecipeComponent overlay = acc.getOverlay();
@@ -97,7 +100,6 @@ public final class ScrollController {
         if (overlay != null && overlay.isVisible()) return false;
 
         // Priority 2: page cycling — only when hovering over the recipe book area
-        if (yoffset == 0) return false;
         if (totalPages <= 1) return false;
         if (!isMouseOverBook(mouseX, mouseY)) return false;
 

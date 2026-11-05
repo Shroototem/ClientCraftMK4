@@ -19,7 +19,8 @@ public record RecipeGraph(
         Map<Item, Set<Item>> dependents,
         List<Item> topologicalOrder,
         Map<Item, Set<Item>> reverseDependencyTargets,
-        GraphFlatData flat
+        GraphFlatData flat,
+        List<CraftedItem> zeroIngredientRecipes
 ) {
     public RecipeNode node(Item item) {
         return primaryNodes.get(item);
@@ -64,7 +65,6 @@ public record RecipeGraph(
             int[] recOutId, int[] recOutCount, int[] recGridSize,
             RecipeDisplayId[] recDispId,
             Map<RecipeDisplayId, Integer> dispIdToRecIdx,
-            boolean[] recSelfConsuming,
             boolean[] recCycleSuspect,
             boolean[] recSharingSuspect,
             boolean[] recCrossEdgeShared,

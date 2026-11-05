@@ -1,6 +1,7 @@
 package com.clientcraftmk4.mixin;
 
 import com.clientcraftmk4.core.CraftModel;
+import com.clientcraftmk4.core.GameContext;
 import com.clientcraftmk4.core.RecipeIndex;
 import com.clientcraftmk4.craft.AutoCrafter;
 import com.clientcraftmk4.mixin.accessor.RecipeBookComponentAccessor;
@@ -144,7 +145,7 @@ public class RecipeBookComponentMixin {
 
         // Register callback so the background thread can refresh the UI when done
         final boolean fc = filteringCraftable;
-        ResolvePipeline.setOnPublished(r -> applyFilteredResults(false, fc));
+        ResolvePipeline.setOnPublished(GameContext.currentScreen(), r -> applyFilteredResults(false, fc));
 
         applyFilteredResults(resetCurrentPage, filteringCraftable);
         ci.cancel();
@@ -156,6 +157,8 @@ public class RecipeBookComponentMixin {
     @Unique private List<RecipeCollection> clientcraft$lastFiltered;
 
     private void applyFilteredResults(boolean resetCurrentPage, boolean filteringCraftable) {
+        // A published result must not overwrite a vanilla tab's list.
+        if (selectedTab == null || !(selectedTab.getCategory() instanceof ClientCraftTab)) return;
         Minecraft client = Minecraft.getInstance();
         if (client.player == null) return;
 

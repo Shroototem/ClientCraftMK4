@@ -32,12 +32,12 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * Builds {@link AutoCrafter.CraftPlan}s on click (plan §7). Byte-equivalent to
- * MK4's {@code buildCraftCyclesForMode}: ONCE returns a single resolve; STACK
- * repeats until the output stack fills; ALL with a direct recipe uses the
- * fast LCM path ({@link #computeDirectCrafts}) with {@code craftAll} clicks,
- * then falls back to per-iteration resolves. The resolver runs on
- * {@link WorkMap} and the plan is memoised per
+ * Builds {@link AutoCrafter.CraftPlan}s on click (plan §7). Ported from MK4's
+ * {@code buildCraftCyclesForMode}: ONCE returns a single resolve; STACK
+ * repeats until the output stack fills; ALL with a direct recipe crafts from
+ * stock with {@code craftAll} clicks ({@link #computeDirectCrafts},
+ * {@link #directClicks}), then falls back to per-iteration resolves. The
+ * resolver runs on {@link WorkMap} and the plan is memoised per
  * {@code (recipeId, mode, inventoryGeneration, modelGeneration, gridSize)}.
  */
 public final class CraftPlanner {
@@ -104,6 +104,7 @@ public final class CraftPlanner {
 
         int gridSize = GameContext.gridSize();
         InventorySnapshot snap = InventoryProvider.current();
+        model.tagIndex().ensureFresh(snap, model.recipeIndex());
 
         // A recipe larger than the open grid cannot be placed. Vanilla's
         // ServerPlaceRecipe does not reject it either: it fills the top-left
@@ -146,7 +147,8 @@ public final class CraftPlanner {
         ItemStack output = RecipeDisplays.resolveResult(target.display(), snap.inventory(), model.tagIndex());
         int outputCount = Math.max(1, output.getCount());
 
-        int maxRepeats = switch (mode) {
+        // No concrete result to stack (e.g. armor dyeing), so it crafts once.
+        int maxRepeats = output.isEmpty() ? 1 : switch (mode) {
             case ONCE -> 1;
             case STACK -> (output.getMaxStackSize() + outputCount - 1) / outputCount;
             case ALL -> Constants.MAX_REPEATS;
@@ -155,68 +157,65 @@ public final class CraftPlanner {
 
         // Fast path: ONCE mode needs only the first resolve.
         if (maxRepeats == 1) {
-            return new AutoCrafter.CraftPlan(List.of(firstSteps), false);
+            return new AutoCrafter.CraftPlan(List.of(new AutoCrafter.Cycle(firstSteps, false)));
         }
 
-        List<List<RecipeDisplayId>> cycles = new ArrayList<>(Math.min(maxRepeats, 64));
-        cycles.add(firstSteps);
-
+        List<AutoCrafter.Cycle> cycles = new ArrayList<>(Math.min(maxRepeats, 64));
+        // Repeats covered by direct clicks; 0 when none ran.
+        int covered = 0;
         if (directCraft) {
-            // Count how many crafts can be done with direct items only.
-            Map<Object, Integer> needed = new HashMap<>();
-            Map<Object, Integer> avail = new HashMap<>();
             Map<Item, Integer> simMap = new HashMap<>(snap.inventory());
-            int directCount = computeDirectCrafts(target, simMap, maxRepeats, needed, avail, model, gridSize);
-            int craftsPerClick = output.getMaxStackSize() / outputCount;
-            int directClicks = Math.max(1, (directCount + craftsPerClick - 1) / craftsPerClick);
-
-            for (int r = 1; r < directClicks; r++) {
-                cycles.add(List.of(firstSteps.getFirst()));
-            }
-
-            // Deduct direct items from the working map, then continue with sub-crafting.
-            deductDirect(needed, available, model);
-            for (int r = directCount; r < maxRepeats; r++) {
-                List<RecipeDisplayId> steps = new ArrayList<>();
-                if (!ctx.resolve(target, available, steps, new HashSet<>(), 0, null)) break;
-                cycles.add(steps);
-            }
-        } else {
-            for (int r = 1; r < maxRepeats; r++) {
-                List<RecipeDisplayId> steps = new ArrayList<>();
-                if (!ctx.resolve(target, available, steps, new HashSet<>(), 0, null)) break;
-                cycles.add(steps);
+            DirectCrafts direct = computeDirectCrafts(target, simMap, maxRepeats, model);
+            if (direct.crafts() > 0) {
+                AutoCrafter.Cycle click = new AutoCrafter.Cycle(firstSteps, true);
+                int clicks = directClicks(direct.crafts(), direct.perClick(), direct.extraClicks());
+                for (int i = 0; i < clicks; i++) cycles.add(click);
+                // The simulation now holds exactly what the direct clicks leave behind.
+                simMap.values().removeIf(v -> v <= 0);
+                available.resetTo(simMap, model.graph());
+                covered = direct.crafts();
             }
         }
+        if (covered == 0) {
+            cycles.add(new AutoCrafter.Cycle(firstSteps, false));
+            covered = 1;
+        }
 
-        // Direct craft flag only applies if ALL cycles are single-step direct.
-        // Single loop (was 2 stream passes with spliterator+lambda allocs).
-        boolean allDirect = directCraft;
-        int totalSteps = 0;
-        for (List<RecipeDisplayId> c : cycles) {
-            totalSteps += c.size();
-            if (c.size() != 1) allDirect = false;
+        // Sub-crafting for the repeats the direct clicks did not cover.
+        for (int r = covered; r < maxRepeats; r++) {
+            List<RecipeDisplayId> steps = new ArrayList<>();
+            if (!ctx.resolve(target, available, steps, new HashSet<>(), 0, null)) break;
+            cycles.add(new AutoCrafter.Cycle(steps, false));
         }
 
         if (ClientCraftConfig.debugLogging) {
             long elapsed = System.nanoTime() - t0;
-            LOG.info("[CC] BuildCraft({}): {}ms | {} cycles, {} steps, direct={}",
-                    mode, elapsed / 1_000_000, cycles.size(), totalSteps, allDirect);
+            int totalSteps = 0;
+            int craftAllCycles = 0;
+            for (AutoCrafter.Cycle c : cycles) {
+                totalSteps += c.steps().size();
+                if (c.craftAll()) craftAllCycles++;
+            }
+            LOG.info("[CC] BuildCraft({}): {}ms | {} cycles, {} steps, {} craft-all",
+                    mode, elapsed / 1_000_000, cycles.size(), totalSteps, craftAllCycles);
         }
-        return new AutoCrafter.CraftPlan(cycles, allDirect);
+        return new AutoCrafter.CraftPlan(cycles);
     }
 
-    /**
-     * Core implementation: counts (and deducts from {@code sim}) direct-only crafts.
-     * Port of MK4's {@code computeDirectCrafts} — byte-equivalent, kept Map-based.
-     */
-    private static int computeDirectCrafts(RecipeDisplayEntry target, Map<Item, Integer> sim, int maxRepeats,
-            Map<Object, Integer> needed, Map<Object, Integer> avail, CraftModel model, int gridSize) {
-        List<SlotDisplay> slots = RecipeDisplays.getSlots(target);
-        if (slots == null || maxRepeats <= 0) return 0;
+    /** Direct-only craft count, plus the click sizing {@link #directClicks} needs. */
+    private record DirectCrafts(int crafts, int perClick, int extraClicks) {}
 
-        needed.clear();
-        avail.clear();
+    /**
+     * Counts (and deducts from {@code sim}) direct-only crafts. Port of MK4's
+     * {@code computeDirectCrafts}; the click sizing is read before {@code sim} is consumed.
+     */
+    private static DirectCrafts computeDirectCrafts(RecipeDisplayEntry target, Map<Item, Integer> sim,
+            int maxRepeats, CraftModel model) {
+        List<SlotDisplay> slots = RecipeDisplays.getSlots(target);
+        if (slots == null || maxRepeats <= 0) return new DirectCrafts(0, 1, 0);
+
+        Map<Object, Integer> needed = new HashMap<>();
+        Map<Object, Integer> avail = new HashMap<>();
         TagIndex tags = model.tagIndex();
 
         for (SlotDisplay slot : slots) {
@@ -226,11 +225,11 @@ public final class CraftPlanner {
                 needed.merge(tag, 1, Integer::sum);
                 if (!avail.containsKey(tag)) avail.put(tag, tags.sumTagInventory(tag, sim));
             } else if (slot instanceof SlotDisplay.Composite) {
-                return 0;
+                return new DirectCrafts(0, 1, 0);
             } else {
                 Item item = RecipeDisplays.resolveSlotItem(slot, sim, tags, true);
-                if (item == null) return 0;
-                if (sim.getOrDefault(item, 0) <= 0) return 0;
+                if (item == null) return new DirectCrafts(0, 1, 0);
+                if (sim.getOrDefault(item, 0) <= 0) return new DirectCrafts(0, 1, 0);
                 needed.merge(item, 1, Integer::sum);
                 avail.putIfAbsent(item, sim.getOrDefault(item, 0));
             }
@@ -241,7 +240,29 @@ public final class CraftPlanner {
             int crafts = avail.getOrDefault(e.getKey(), 0) / e.getValue();
             if (crafts < maxCrafts) maxCrafts = crafts;
         }
-        if (maxCrafts <= 0) return 0;
+        if (maxCrafts <= 0) return new DirectCrafts(0, 1, 0);
+
+        // A craft-all click places up to the smallest ingredient stack per grid slot. A tag
+        // slot draws one item type per click, so mixed stock can take a few extra clicks.
+        int perClick = 99;
+        int extraClicks = 0;
+        for (var e : needed.entrySet()) {
+            if (e.getKey() instanceof Item item) {
+                perClick = Math.min(perClick, item.getDefaultMaxStackSize());
+            } else if (e.getKey() instanceof TagKey<?>) {
+                @SuppressWarnings("unchecked")
+                TagKey<Item> tagKey = (TagKey<Item>) e.getKey();
+                Set<Item> members = tags.inventoryTagMembers(tagKey);
+                if (members == null) continue;
+                int inStock = 0;
+                for (Item m : members) {
+                    if (sim.getOrDefault(m, 0) <= 0) continue;
+                    perClick = Math.min(perClick, m.getDefaultMaxStackSize());
+                    inStock++;
+                }
+                if (inStock >= 2) extraClicks += inStock;
+            }
+        }
 
         for (var e : needed.entrySet()) {
             int toConsume = maxCrafts * e.getValue();
@@ -270,36 +291,16 @@ public final class CraftPlanner {
                 }
             }
         }
-        return maxCrafts;
+        return new DirectCrafts(maxCrafts, perClick, extraClicks);
     }
 
-    /** Applies the per-ingredient deductions to the journal-backed working map. */
-    private static void deductDirect(Map<Object, Integer> needed, WorkMap work, CraftModel model) {
-        for (var e : needed.entrySet()) {
-            if (e.getKey() instanceof Item item) {
-                work.consume(model.graph().id(item), e.getValue());
-            } else if (e.getKey() instanceof TagKey<?>) {
-                @SuppressWarnings("unchecked")
-                TagKey<Item> tagKey = (TagKey<Item>) e.getKey();
-                Set<Item> members = model.tagIndex().inventoryTagMembers(tagKey);
-                if (members != null) {
-                    // Same abundance-first order as computeDirectCrafts (issue #8).
-                    int toConsume = e.getValue();
-                    List<Item> byAbundance = new ArrayList<>(members);
-                    byAbundance.sort(Comparator
-                            .<Item>comparingInt(m -> -work.get(model.graph().id(m)))
-                            .thenComparingInt(m -> BuiltInRegistries.ITEM.getId(m)));
-                    for (Item m : byAbundance) {
-                        int id = model.graph().id(m);
-                        int have = work.get(id);
-                        if (have <= 0) continue;
-                        int take = Math.min(have, toConsume);
-                        work.consume(id, take);
-                        toConsume -= take;
-                        if (toConsume <= 0) break;
-                    }
-                }
-            }
-        }
+    /**
+     * Craft-all clicks for direct crafts: each click covers up to {@code perClick} crafts,
+     * plus {@code extraClicks}.
+     */
+    static int directClicks(int crafts, int perClick, int extraClicks) {
+        int limit = Math.max(1, perClick);
+        int clicks = (crafts + limit - 1) / limit + extraClicks;
+        return Math.max(1, Math.min(clicks, crafts));
     }
 }

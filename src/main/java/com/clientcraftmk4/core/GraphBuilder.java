@@ -108,7 +108,7 @@ public final class GraphBuilder {
             for (int i = 0; i < bestEdges.size(); i++) {
                 if (!flags[i]) {
                     for (Item option : bestEdges.get(i)) {
-                        optionToParents.computeIfAbsent(option, k -> new HashSet<>(4)).add(outputItem);
+                        optionToParents.computeIfAbsent(option, k -> new LinkedHashSet<>(4)).add(outputItem);
                     }
                 }
             }
@@ -117,13 +117,16 @@ public final class GraphBuilder {
         Queue<Item> queue = new ArrayDeque<>();
         List<Item> topologicalOrder = new ArrayList<>();
 
-        for (Item base : baseResources) {
-            topologicalOrder.add(base);
-        }
+        // Item hashes are identity-based, so HashSet/HashMap order changes between JVM runs.
+        // Base resources are sorted by registry id and the queue is seeded in recipe-book
+        // order, which keeps flat ids stable across runs; the order is still topological.
+        List<Item> sortedBases = new ArrayList<>(baseResources);
+        sortedBases.sort(BY_REGISTRY_ID);
+        topologicalOrder.addAll(sortedBases);
 
-        for (Map.Entry<Item, Integer> e : inDegree.entrySet()) {
-            if (e.getValue() == 0) {
-                queue.add(e.getKey());
+        for (Item out : index.outputs()) {
+            if (inDegree.get(out) == 0) {
+                queue.add(out);
             }
         }
 
@@ -195,9 +198,17 @@ public final class GraphBuilder {
             }
         }
 
+        List<CraftedItem> zeroIngredientRecipes = new ArrayList<>();
+        for (Item outputItem : index.outputs()) {
+            for (CraftedItem crafted : allRecipesMap.getOrDefault(outputItem, List.of())) {
+                if (crafted.ingredients().isEmpty()) zeroIngredientRecipes.add(crafted);
+            }
+        }
+
         GraphFlatData flat = buildFlatData(topologicalOrder, resolved, allRecipesMap, reverseDependencyTargets,
                 tagIndex, dependents, index);
-        return new RecipeGraph(resolved, allRecipesMap, dependents, topologicalOrder, reverseDependencyTargets, flat);
+        return new RecipeGraph(resolved, allRecipesMap, dependents, topologicalOrder, reverseDependencyTargets, flat,
+                zeroIngredientRecipes);
     }
 
     private static GraphFlatData buildFlatData(
@@ -310,21 +321,8 @@ public final class GraphBuilder {
         }
 
         Map<RecipeDisplayId, Integer> dispIdToRecIdx = new HashMap<>((int) (totalRecipes / 0.75f) + 1);
-        boolean[] recSelfConsuming = new boolean[totalRecipes];
         for (int ri = 0; ri < totalRecipes; ri++) {
             dispIdToRecIdx.put(recDispId[ri], ri);
-            int outId = recOutId[ri];
-            if (outId >= 0) {
-                for (int ei2 = recEdgeStart[ri]; ei2 < recEdgeEnd[ri]; ei2++) {
-                    for (int oi2 = edgeOptStart[ei2]; oi2 < edgeOptEnd[ei2]; oi2++) {
-                        if (optItemId[oi2] == outId) {
-                            recSelfConsuming[ri] = true;
-                            break;
-                        }
-                    }
-                    if (recSelfConsuming[ri]) break;
-                }
-            }
         }
 
         // --- Static DP-exactness flags (plan §6.3) ---
@@ -362,7 +360,7 @@ public final class GraphBuilder {
                 n, idToItem, idMap, isBaseNode, primaryRecIdx,
                 itemRecStart, itemRecEnd, itemRecFlat,
                 totalRecipes, recOutId, recOutCount, recGridSize, recDispId,
-                dispIdToRecIdx, recSelfConsuming,
+                dispIdToRecIdx,
                 recCycleSuspect, recSharingSuspect, recCrossEdgeShared, recReverseTargets,
                 recEdgeStart, recEdgeEnd,
                 totalEdges, edgeCnt, edgeOptStart, edgeOptEnd,

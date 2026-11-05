@@ -1,15 +1,56 @@
 package com.clientcraftmk4.core;
 
+import net.minecraft.SharedConstants;
+import net.minecraft.client.gui.screens.recipebook.RecipeCollection;
+import net.minecraft.core.Holder;
+import net.minecraft.core.component.DataComponentMap;
+import net.minecraft.server.Bootstrap;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.item.crafting.RecipeBookCategories;
+import net.minecraft.world.item.crafting.display.RecipeDisplayEntry;
+import net.minecraft.world.item.crafting.display.RecipeDisplayId;
+import net.minecraft.world.item.crafting.display.ShapelessCraftingRecipeDisplay;
+import net.minecraft.world.item.crafting.display.SlotDisplay;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.OptionalInt;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Journal/rollback mechanics of {@link WorkMap} — pure logic, no Minecraft
- * state (ids are arbitrary graph slots).
+ * Journal/rollback mechanics of {@link WorkMap}. Most tests use arbitrary graph slots;
+ * the {@code restoreBase} tests fill from a real two-ingredient recipe graph, so the
+ * flat ids come from the same fill path the resolver uses.
  */
 class WorkMapTest {
+
+    private static RecipeGraph graph;
+
+    @BeforeAll
+    static void setUp() {
+        SharedConstants.tryDetectVersion();
+        Bootstrap.bootStrap();
+        // A headless test never loads the vanilla datapack, so item holders have no
+        // component map bound; the graph build only reads item identity and counts.
+        for (Item item : List.of(Items.OAK_PLANKS, Items.BIRCH_PLANKS, Items.STICK)) {
+            ((Holder.Reference<Item>) item.builtInRegistryHolder()).bindComponents(DataComponentMap.EMPTY);
+        }
+        // oak + birch -> stick: the graph holds both planks (base) and the stick (output).
+        RecipeDisplayEntry stick = new RecipeDisplayEntry(new RecipeDisplayId(1),
+                new ShapelessCraftingRecipeDisplay(
+                        List.of(item(Items.OAK_PLANKS), item(Items.BIRCH_PLANKS)),
+                        item(Items.STICK), SlotDisplay.Empty.INSTANCE),
+                OptionalInt.empty(), RecipeBookCategories.CRAFTING_MISC, Optional.empty());
+        TagIndex tags = new TagIndex();
+        RecipeIndex index = RecipeIndex.build(List.of(new RecipeCollection(List.of(stick))), tags);
+        graph = GraphBuilder.build(index, tags);
+    }
 
     @Test
     void addConsumeProduceTrackCounts() {
@@ -148,5 +189,54 @@ class WorkMapTest {
         assertEquals(1, wm.get(3));
         assertEquals(2, wm.get(400));
         assertTrue(wm.presentSize() >= 2);
+    }
+
+    @Test
+    void restoreBaseMatchesFreshFillAndIsReusable() {
+        Map<Item, Integer> inventory = Map.of(Items.OAK_PLANKS, 3);
+        WorkMap fresh = WorkMap.from(inventory, graph);
+        WorkMap wm = WorkMap.from(inventory, graph);
+        for (int round = 0; round < 2; round++) {
+            wm.consume(id(Items.OAK_PLANKS), 2);
+            // Birch and stick were not in the inventory at the fill, so they are appended.
+            wm.produce(id(Items.BIRCH_PLANKS), 5);
+            wm.produce(id(Items.STICK), 4);
+            assertEquals(1, wm.get(id(Items.OAK_PLANKS)));
+            assertEquals(3, wm.presentSize());
+
+            wm.restoreBase();
+            assertSameState(fresh, wm);
+        }
+    }
+
+    @Test
+    void restoreBaseRewindsJournalToStart() {
+        WorkMap wm = WorkMap.from(Map.of(Items.OAK_PLANKS, 3), graph);
+        wm.consume(id(Items.OAK_PLANKS), 1);
+        wm.produce(id(Items.STICK), 2);
+        assertTrue(wm.mark() > 0);
+
+        wm.restoreBase();
+        assertEquals(0, wm.mark());
+    }
+
+    // --- helpers -------------------------------------------------------------
+
+    private static int id(Item item) {
+        return graph.id(item);
+    }
+
+    private static void assertSameState(WorkMap expected, WorkMap actual) {
+        assertEquals(expected.presentSize(), actual.presentSize(), "present size");
+        for (int i = 0; i < expected.presentSize(); i++) {
+            assertEquals(expected.presentIdAt(i), actual.presentIdAt(i), "present id at " + i);
+        }
+        for (int id = 0; id < graph.flat().n(); id++) {
+            assertEquals(expected.get(id), actual.get(id), "count of id " + id);
+        }
+    }
+
+    private static SlotDisplay item(Item item) {
+        return new SlotDisplay.ItemSlotDisplay(item.builtInRegistryHolder());
     }
 }

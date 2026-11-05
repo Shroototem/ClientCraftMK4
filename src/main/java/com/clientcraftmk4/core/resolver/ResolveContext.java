@@ -9,6 +9,7 @@ import com.clientcraftmk4.core.RecipeGraph;
 import com.clientcraftmk4.core.RecipeIndex;
 import com.clientcraftmk4.core.TagIndex;
 import com.clientcraftmk4.core.WorkMap;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.tags.TagKey;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
@@ -30,8 +31,8 @@ import java.util.Set;
  * <p>Subtle behaviours preserved (plan §1.4): MAX_DEPTH 10; inProgress
  * re-entry guard; root-output cycle guard; tag fallback at depth ≤ 1 only;
  * sub-craft surplus retention ({@code produce(outputCount - 1)}); sub-recipe
- * order = recipe-book order; tag fallback scan is deterministic (insertion
- * order instead of MK4's undefined HashMap order — plan §7.3).
+ * order = recipe-book order; tag fallback picks are deterministic (ties by
+ * registry id instead of MK4's undefined HashMap order — plan §7.3).
  *
  * <p>Slot order (issue #8): ingredient slots are resolved least-flexible-first
  * ({@link RecipeIndex#resolveSlots}) — type-specific ingredients reserve their
@@ -199,16 +200,18 @@ public final class ResolveContext {
             // registry holder.is(tag) walk per present item was the hottest registry
             // call in modpacks. Issue #8: draw from the most abundant member first so
             // pool consumers leave scarce types (the ones a specific recipe may still
-            // need) untouched; ties keep the deterministic id order.
+            // need) untouched; ties go to the lower registry id, so the scan order of
+            // the working map does not matter.
             GraphFlatData f = graph.flat();
             BitSet bits = tags.flatTagBits(tag);
             int best = -1, bestCount = 0;
             for (int i = 0; i < work.presentSize(); i++) {
                 int pid = work.presentIdAt(i);
                 int count = work.get(pid);
-                if (count <= bestCount) continue;
+                if (count <= 0 || count < bestCount) continue;
                 Item it = f.idToItem()[pid];
                 if (it.equals(alreadyTried)) continue;
+                if (count == bestCount && BuiltInRegistries.ITEM.getId(it) >= BuiltInRegistries.ITEM.getId(f.idToItem()[best])) continue;
                 boolean matches = bits != null ? bits.get(pid) : it.builtInRegistryHolder().is(tag);
                 if (matches) {
                     best = pid;

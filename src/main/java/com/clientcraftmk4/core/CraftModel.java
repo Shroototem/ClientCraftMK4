@@ -78,19 +78,17 @@ public final class CraftModel {
     }
 
     /** The recipe graph (DAG + flat arrays), built once per model on the calling thread. */
-    public static RecipeGraph graph() {
-        CraftModel model = current();
-        if (model == null) return null;
-        RecipeGraph g = model.graph;
+    public RecipeGraph graph() {
+        RecipeGraph g = graph;
         if (g != null) return g;
         // Built under a dedicated lock so the ~30ms build never blocks index readers
         // holding LOCK; double-checked so concurrent callers share one build.
         synchronized (GRAPH_LOCK) {
-            g = model.graph;
+            g = graph;
             if (g == null) {
                 long t0 = ClientCraftConfig.debugLogging ? System.nanoTime() : 0;
-                g = GraphBuilder.build(model.recipeIndex(), model.tagIndex());
-                model.graph = g;
+                g = GraphBuilder.build(recipeIndex, tagIndex);
+                graph = g;
                 if (ClientCraftConfig.debugLogging) {
                     LOG.info("[CC] Graph build: {} items, {} recipes ({}ms)",
                             g.flat().n(), g.flat().totalRecipes(),

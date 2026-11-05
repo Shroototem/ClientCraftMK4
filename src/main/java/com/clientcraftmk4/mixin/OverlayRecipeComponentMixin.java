@@ -197,14 +197,10 @@ public class OverlayRecipeComponentMixin {
         if (inResult) {
             RecipeDisplayEntry target = VariantState.getActiveVariant();
             RecipeCollection activeColl = VariantState.getActiveCollection();
-            // Only act on a recipe that can actually be placed in the open grid and
-            // whose ingredient grid is fully craftable (no gray/purple tiles). A 3x3
-            // recipe viewed from the 2x2 inventory would otherwise be placed as its
-            // top-left 2x2 subset and could craft a different item.
-            OverlayBuilder.refreshActiveGridCraftability();
-            if (target != null && activeColl != null
-                    && RecipeDisplays.fitsInGrid(target.display(), GameContext.gridSize())
-                    && grid.isFullyCraftable()) {
+            // Only act on a recipe the planner can craft from the physical inventory. This
+            // also rejects a 3x3 recipe viewed from the 2x2 inventory, which would otherwise
+            // be placed as its top-left 2x2 subset and could craft a different item.
+            if (target != null && activeColl != null && OverlayBuilder.canCraft(target)) {
                 // Setting these makes vanilla's subsequent tryPlaceRecipe fire —
                 // no extra AutoCrafter call here, that would double-craft (§14.4).
                 this.lastRecipeClicked = target.id();
@@ -303,7 +299,7 @@ public class OverlayRecipeComponentMixin {
         OverlayBuilder.IngredientGrid grid = OverlayBuilder.getActiveGrid();
         if (grid == null) return;
 
-        OverlayBuilder.refreshActiveGridCraftability();
+        OverlayBuilder.refreshActiveGridForFrame();
 
         int gridPixelSize = 3 * TILE_SIZE;
         int overlayW = gridPixelSize + 2 * BORDER;
@@ -392,31 +388,28 @@ public class OverlayRecipeComponentMixin {
         // of the ingredient grid, so recipes with different output amounts are
         // distinguishable while cycling variants.
         if (active != null) {
-            CraftModel model = CraftModel.current();
-            if (model != null) {
-                ItemStack result = RecipeDisplays.resolveResult(active.display(), model.tagIndex());
-                if (!result.isEmpty()) {
-                    int panelY = uiY + (gridPixelSize + 2 * BORDER - RESULT_PANEL_WIDTH) / 2;
-                    int panelX = uiX + overlayW + RESULT_PANEL_GAP;
-                    context.blitSprite(RenderPipelines.GUI_TEXTURED, OVERLAY_RECIPE,
-                            panelX, panelY, RESULT_PANEL_WIDTH, RESULT_PANEL_WIDTH);
-                    context.fill(panelX + BORDER, panelY + BORDER,
-                            panelX + RESULT_PANEL_WIDTH - BORDER, panelY + RESULT_PANEL_WIDTH - BORDER, 0xFF8B8B8B);
+            ItemStack result = grid.result();
+            if (!result.isEmpty()) {
+                int panelY = uiY + (gridPixelSize + 2 * BORDER - RESULT_PANEL_WIDTH) / 2;
+                int panelX = uiX + overlayW + RESULT_PANEL_GAP;
+                context.blitSprite(RenderPipelines.GUI_TEXTURED, OVERLAY_RECIPE,
+                        panelX, panelY, RESULT_PANEL_WIDTH, RESULT_PANEL_WIDTH);
+                context.fill(panelX + BORDER, panelY + BORDER,
+                        panelX + RESULT_PANEL_WIDTH - BORDER, panelY + RESULT_PANEL_WIDTH - BORDER, 0xFF8B8B8B);
 
-                    int iconX = panelX + (RESULT_PANEL_WIDTH - 16) / 2;
-                    int iconY = panelY + (RESULT_PANEL_WIDTH - 16) / 2;
-                    context.item(result, iconX, iconY);
-                    context.itemDecorations(Minecraft.getInstance().font, result, iconX, iconY);
+                int iconX = panelX + (RESULT_PANEL_WIDTH - 16) / 2;
+                int iconY = panelY + (RESULT_PANEL_WIDTH - 16) / 2;
+                context.item(result, iconX, iconY);
+                context.itemDecorations(Minecraft.getInstance().font, result, iconX, iconY);
 
-                    if (mouseX >= panelX && mouseX < panelX + RESULT_PANEL_WIDTH
-                            && mouseY >= panelY && mouseY < panelY + RESULT_PANEL_WIDTH) {
-                        Minecraft mc = Minecraft.getInstance();
-                        context.setComponentTooltipForNextFrame(
-                                mc.font,
-                                clientcraft$tooltipFor(result),
-                                mouseX, mouseY,
-                                result.get(DataComponents.TOOLTIP_STYLE));
-                    }
+                if (mouseX >= panelX && mouseX < panelX + RESULT_PANEL_WIDTH
+                        && mouseY >= panelY && mouseY < panelY + RESULT_PANEL_WIDTH) {
+                    Minecraft mc = Minecraft.getInstance();
+                    context.setComponentTooltipForNextFrame(
+                            mc.font,
+                            clientcraft$tooltipFor(result),
+                            mouseX, mouseY,
+                            result.get(DataComponents.TOOLTIP_STYLE));
                 }
             }
         }

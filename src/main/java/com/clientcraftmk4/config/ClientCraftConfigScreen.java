@@ -37,16 +37,20 @@ public class ClientCraftConfigScreen extends Screen {
                     ClientCraftConfig.debugLogging = value;
                 }));
 
-        addRenderableWidget(Button.builder(Component.literal("Done"), button -> {
-            ClientCraftConfig.save();
-            ResolveCache.clearAll();
-            //? if >=26.2 {
-            minecraft.gui.setScreen(parent);
-            //?}
-            //? if <26.2 {
-            /*minecraft.setScreen(parent);*/
-            //?}
-        }).bounds(centerX, y + 114, 200, 20).build());
+        addRenderableWidget(Button.builder(Component.literal("Done"), button -> onClose())
+                .bounds(centerX, y + 114, 200, 20).build());
+    }
+
+    @Override
+    public void onClose() {
+        ClientCraftConfig.save();
+        ResolveCache.clearAll();
+        //? if >=26.2 {
+        minecraft.gui.setScreen(parent);
+        //?}
+        //? if <26.2 {
+        /*minecraft.setScreen(parent);*/
+        //?}
     }
 
     private static class DelaySlider extends AbstractSliderButton {

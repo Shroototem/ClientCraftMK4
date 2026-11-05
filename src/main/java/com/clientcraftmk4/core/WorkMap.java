@@ -13,9 +13,9 @@ import java.util.Map;
  * resolver (plan §6.4). A snapshot is a single head-pointer into an undo log; rolling back
  * replays the log backwards, restoring only the mutations that were actually made.
  *
- * <p>A deterministic id-ordered "present" list tracks every item id that has ever had
- * a positive count, so tag-fallback scans (which MK4 performed over a HashMap's undefined
- * iteration order) are stable across runs (plan §7.3 decision).
+ * <p>A "present" list tracks every item id that has ever had a positive count. Tag-fallback
+ * scans walk it and break ties by registry id, so their picks do not depend on its order
+ * (plan §7.3 decision).
  *
  * <p>This class is deliberately vanilla-free so it can be unit tested in isolation.
  */
@@ -24,9 +24,10 @@ public final class WorkMap {
     private int[] log;              // (itemId, delta) pairs
     private int head;               // next free slot in the log
 
-    private int[] present;    // item ids that have ever had a positive count, sorted by id
+    private int[] present;    // item ids that have ever had a positive count: sorted within the fill, append-only after
     private int presentSize;
     private boolean[] inPresent;
+    private int basePresentSize;   // present-list length right after the last fill
 
     public WorkMap(int capacity) {
         int cap = Math.max(16, capacity);
@@ -89,26 +90,28 @@ public final class WorkMap {
 
     private void fillFrom(Map<Item, Integer> inventory, RecipeGraph graph) {
         GraphFlatData f = graph.flat();
-        if (f == null) return;
-        // Single idMap.get per entry, counts written directly, then one int[] sort for the
-        // deterministic present order. No ArrayList, no Comparator lambda hashing per comparison
-        // (the old comparingInt+getOrDefault hashed O(n log n) times per reset).
-        int touched = 0;
-        int[] ids = new int[inventory.size()];
-        for (Map.Entry<Item, Integer> e : inventory.entrySet()) {
-            Integer id = f.idMap().get(e.getKey());
-            if (id == null || id < 0 || id >= count.length) continue;
-            count[id] = e.getValue();
-            ids[touched++] = id;
-        }
-        Arrays.sort(ids, 0, touched);
-        for (int k = 0; k < touched; k++) {
-            int id = ids[k];
-            if (count[id] > 0 && !inPresent[id]) {
-                inPresent[id] = true;
-                present[presentSize++] = id;
+        if (f != null) {
+            // Single idMap.get per entry, counts written directly, then one int[] sort for the
+            // deterministic present order. No ArrayList, no Comparator lambda hashing per comparison
+            // (the old comparingInt+getOrDefault hashed O(n log n) times per reset).
+            int touched = 0;
+            int[] ids = new int[inventory.size()];
+            for (Map.Entry<Item, Integer> e : inventory.entrySet()) {
+                Integer id = f.idMap().get(e.getKey());
+                if (id == null || id < 0 || id >= count.length) continue;
+                count[id] = e.getValue();
+                ids[touched++] = id;
+            }
+            Arrays.sort(ids, 0, touched);
+            for (int k = 0; k < touched; k++) {
+                int id = ids[k];
+                if (count[id] > 0 && !inPresent[id]) {
+                    inPresent[id] = true;
+                    present[presentSize++] = id;
+                }
             }
         }
+        basePresentSize = presentSize;
     }
 
     public int get(int id) {
@@ -149,6 +152,13 @@ public final class WorkMap {
             head -= 2;
             count[log[head]] -= log[head + 1];
         }
+    }
+
+    /** Restores the state of the last fill (resetTo/from) in O(changes): identical to refilling. */
+    public void restoreBase() {
+        rollbackTo(0);
+        for (int i = presentSize - 1; i >= basePresentSize; i--) inPresent[present[i]] = false;
+        presentSize = basePresentSize;
     }
 
     public int presentSize() {

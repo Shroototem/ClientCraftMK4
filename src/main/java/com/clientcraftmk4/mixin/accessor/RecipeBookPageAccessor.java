@@ -1,6 +1,7 @@
 package com.clientcraftmk4.mixin.accessor;
 
 import net.minecraft.client.gui.screens.recipebook.OverlayRecipeComponent;
+import net.minecraft.client.gui.screens.recipebook.RecipeBookComponent;
 import net.minecraft.client.gui.screens.recipebook.RecipeBookPage;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.gen.Accessor;
@@ -13,4 +14,7 @@ public interface RecipeBookPageAccessor {
 
     @Accessor("totalPages")
     int getTotalPages();
+
+    @Accessor("parent")
+    RecipeBookComponent<?> getParent();
 }

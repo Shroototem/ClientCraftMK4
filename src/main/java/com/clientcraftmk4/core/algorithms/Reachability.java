@@ -18,10 +18,9 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * Fixed-point reachability over the graph's topological order (port of MK4's
- * computeReachableFromTree). Iterates only over the not-yet-reachable items,
- * shrinking the work list as items resolve, because the topo order is based on
- * primary recipe edges only.
+ * Fixed-point reachability (port of MK4's computeReachableFromTree) as a worklist over
+ * the graph's dependents: each newly reachable item rechecks only its parent recipes,
+ * seeded from the zero-ingredient recipes.
  */
 public final class Reachability {
     private Reachability() {}
@@ -35,18 +34,10 @@ public final class Reachability {
         // ArrayList.it.remove() memmoves (O(n^2)); this is O(recipes + edges).
         ArrayDeque<Item> queue = new ArrayDeque<>(reachable.size());
         for (Item item : reachable) queue.add(item);
-        // Seed: zero-ingredient recipes are trivially reachable even with an empty inventory
-        // (the old fixpoint scan caught these via its unconditional first pass over topoOrder).
-        for (Item item : graph.topoOrder()) {
-            if (reachable.contains(item)) continue;
-            for (CraftedItem recipe : graph.recipesOf(item)) {
-                if (recipe.gridSize() > gridSize) continue;
-                if (recipe.ingredients().isEmpty()) {
-                    reachable.add(item);
-                    queue.add(item);
-                    break;
-                }
-            }
+        // Seed: zero-ingredient recipes are trivially reachable even with an empty inventory.
+        for (CraftedItem recipe : graph.zeroIngredientRecipes()) {
+            if (recipe.gridSize() > gridSize) continue;
+            if (reachable.add(recipe.item())) queue.add(recipe.item());
         }
         while (!queue.isEmpty()) {
             Item newly = queue.poll();

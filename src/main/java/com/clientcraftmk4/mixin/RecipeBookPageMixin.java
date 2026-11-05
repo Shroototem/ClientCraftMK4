@@ -12,6 +12,7 @@ import net.minecraft.client.gui.screens.recipebook.RecipeCollection;
 import net.minecraft.client.input.MouseButtonEvent;
 import net.minecraft.util.context.ContextMap;
 import net.minecraft.world.item.crafting.display.RecipeDisplayEntry;
+import net.minecraft.world.item.crafting.display.RecipeDisplayId;
 import net.minecraft.world.item.crafting.display.SlotDisplayContext;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
@@ -44,6 +45,12 @@ public class RecipeBookPageMixin implements RecipeBookPageCycleAccessor {
 
     @Shadow
     private int totalPages;
+
+    @Shadow
+    private RecipeDisplayId lastClickedRecipe;
+
+    @Shadow
+    private RecipeCollection lastClickedRecipeCollection;
 
     @Shadow
     private void updateButtonsForPage() {}
@@ -130,6 +137,9 @@ public class RecipeBookPageMixin implements RecipeBookPageCycleAccessor {
             );
             VariantState.setActiveOverlay(overlay);
 
+            // This return skips vanilla's reset, so the caller would otherwise re-place the last left-click.
+            lastClickedRecipe = null;
+            lastClickedRecipeCollection = null;
             cir.setReturnValue(true);
             return;
         }

@@ -1,13 +1,12 @@
 package com.clientcraftmk4.craft;
 
 import com.clientcraftmk4.config.ClientCraftConfig;
+import com.clientcraftmk4.core.GameContext;
 import com.clientcraftmk4.core.InventoryProvider;
 import com.clientcraftmk4.core.algorithms.CraftPlanner;
 import com.clientcraftmk4.pipeline.ResolvePipeline;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.gui.screens.inventory.CraftingScreen;
-import net.minecraft.client.gui.screens.inventory.InventoryScreen;
 import net.minecraft.world.inventory.AbstractCraftingMenu;
 import net.minecraft.world.inventory.ContainerInput;
 import net.minecraft.world.item.crafting.display.RecipeDisplayEntry;
@@ -20,8 +19,8 @@ import java.util.List;
 
 /**
  * Tick-driven craft executor — ported from MK4 mostly verbatim (plan §7.4).
- * One static step list, executed all-in-one-tick when {@code delayTicks == 0},
- * otherwise one step every {@code delayTicks + 1} ticks, via
+ * One static step list, executed when {@code delayTicks == 0} (capped per tick on a remote
+ * server), otherwise one step every {@code delayTicks + 1} ticks, via
  * {@code handlePlaceRecipe} + {@code handleContainerInput(QUICK_MOVE)}.
  *
  * <p>The MK4 {@code batchMode} flag is replaced by {@link #isRunning()}: while a
@@ -34,15 +33,20 @@ public class AutoCrafter {
 
     public enum Mode { ONCE, STACK, ALL }
 
-    /** Result from CraftPlanner.plan containing the step list and whether craftAll can be used. */
-    public record CraftPlan(List<List<RecipeDisplayId>> cycles, boolean directCraft) {}
+    /** Recipe steps placed by one click; craftAll is passed to handlePlaceRecipe for each. */
+    public record Cycle(List<RecipeDisplayId> steps, boolean craftAll) {}
 
-    private static List<RecipeDisplayId> steps;
-    private static boolean craftAll;
+    /** Result from CraftPlanner.plan: the cycles in execution order. */
+    public record CraftPlan(List<Cycle> cycles) {}
+
+    private record PlannedStep(RecipeDisplayId id, boolean craftAll) {}
+
+    private static List<PlannedStep> steps;
     private static int stepIndex;
     private static int tickCounter;
     private static long startTimeNs;
     private static int totalSteps;
+    private static final int MAX_STEPS_PER_TICK = 12;   // 2 packets per step
 
     // Stability polling: after craft completes, wait for inventory to stop changing
     private static boolean pendingBatchClear = false;
@@ -68,11 +72,12 @@ public class AutoCrafter {
         if (plan == null || plan.cycles().isEmpty()) return;
 
         // Flatten all cycles into a single step list
-        List<RecipeDisplayId> flat = new ArrayList<>();
-        for (List<RecipeDisplayId> cycle : plan.cycles()) flat.addAll(cycle);
+        List<PlannedStep> flat = new ArrayList<>();
+        for (Cycle cycle : plan.cycles()) {
+            for (RecipeDisplayId id : cycle.steps()) flat.add(new PlannedStep(id, cycle.craftAll()));
+        }
 
         steps = flat;
-        craftAll = plan.directCraft();
         stepIndex = 0;
         tickCounter = 0;
         totalSteps = flat.size();
@@ -117,16 +122,23 @@ public class AutoCrafter {
             int delay = ClientCraftConfig.delayTicks;
             if (delay <= 0) {
                 long tExec = ClientCraftConfig.debugLogging ? System.nanoTime() : 0;
-                for (RecipeDisplayId step : steps) {
-                    executeStep(client, handler, step);
+                // Cap the burst on a remote server (packet limiter); singleplayer runs it all at once.
+                int from = stepIndex;
+                int budget = client.isLocalServer() ? steps.size() : MAX_STEPS_PER_TICK;
+                int end = Math.min(from + budget, steps.size());
+                while (stepIndex < end) {
+                    executeStep(client, handler, steps.get(stepIndex++));
                 }
                 if (ClientCraftConfig.debugLogging) {
                     long execNs = System.nanoTime() - tExec;
+                    int ran = stepIndex - from;
                     LOG.info("[CC] Execute steps: {}ms for {} steps ({}us/step)",
-                            execNs / 1_000_000, steps.size(), steps.size() > 0 ? execNs / 1_000 / steps.size() : 0);
+                            execNs / 1_000_000, ran, ran > 0 ? execNs / 1_000 / ran : 0);
                 }
-                logCompletion();
-                steps = null;
+                if (stepIndex >= steps.size()) {
+                    logCompletion();
+                    steps = null;
+                }
             } else {
                 if (tickCounter++ >= delay) {
                     tickCounter = 0;
@@ -152,21 +164,12 @@ public class AutoCrafter {
         pendingBatchTicks = 0;
     }
 
-    private static void executeStep(Minecraft client, AbstractCraftingMenu handler, RecipeDisplayId step) {
-        client.gameMode.handlePlaceRecipe(handler.containerId, step, craftAll);
+    private static void executeStep(Minecraft client, AbstractCraftingMenu handler, PlannedStep step) {
+        client.gameMode.handlePlaceRecipe(handler.containerId, step.id(), step.craftAll());
         client.gameMode.handleContainerInput(handler.containerId, 0, 0, ContainerInput.QUICK_MOVE, client.player);
     }
 
     private static AbstractCraftingMenu getHandler() {
-        Minecraft client = Minecraft.getInstance();
-        //? if >=26.2 {
-        if (client.gui.screen() instanceof CraftingScreen s) return s.getMenu();
-        if (client.gui.screen() instanceof InventoryScreen s) return s.getMenu();
-        //?}
-        //? if <26.2 {
-        /*if (client.screen instanceof CraftingScreen s) return s.getMenu();
-        if (client.screen instanceof InventoryScreen s) return s.getMenu();*/
-        //?}
-        return null;
+        return GameContext.craftingMenu();
     }
 }

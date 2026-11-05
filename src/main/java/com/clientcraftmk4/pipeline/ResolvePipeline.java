@@ -9,6 +9,7 @@ import com.clientcraftmk4.core.InventorySnapshot;
 import com.clientcraftmk4.craft.AutoCrafter;
 import net.minecraft.client.ClientRecipeBook;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.gui.screens.recipebook.RecipeCollection;
 import net.minecraft.client.gui.screens.recipebook.SearchRecipeBookCategory;
 import org.slf4j.Logger;
@@ -43,6 +44,10 @@ public final class ResolvePipeline {
         return t;
     });
     private static volatile Consumer<ResolveResult> onPublished = r -> {};
+    // The screen that registered onPublished; the callback is dropped once it is no longer open.
+    private static volatile Screen onPublishedOwner;
+    // Render thread only: the request key whose full-resolve retry was already submitted.
+    private static long lastFailedKey = -1;
 
     private ResolvePipeline() {}
 
@@ -50,8 +55,28 @@ public final class ResolvePipeline {
         return latest;
     }
 
-    public static void setOnPublished(Consumer<ResolveResult> callback) {
+    public static void setOnPublished(Screen owner, Consumer<ResolveResult> callback) {
+        onPublishedOwner = owner;
         onPublished = callback;
+    }
+
+    /** Hands a result to the callback, unless the screen that registered it has closed. */
+    private static void notifyPublished(ResolveResult r) {
+        if (onPublishedOwner != GameContext.currentScreen()) {
+            dropCallback();
+            return;
+        }
+        onPublished.accept(r);
+    }
+
+    /** Releases the callback once its screen has closed. Called every client tick. */
+    public static void dropCallbackIfScreenClosed() {
+        if (onPublishedOwner != GameContext.currentScreen()) dropCallback();
+    }
+
+    private static void dropCallback() {
+        onPublished = r -> {};
+        onPublishedOwner = null;
     }
 
     /** Entry point used by the {@code ClientRecipeBook.getCollection} mixin. */
@@ -67,11 +92,11 @@ public final class ResolvePipeline {
         List<RecipeCollection> allCrafting = book.getCollection(SearchRecipeBookCategory.CRAFTING);
         submit(new ResolveRequest(allCrafting, gridSize,
                 ResolveRequest.cacheKey(snap.generation(), gridSize), model.modelGeneration(), snap,
-                latest, InventoryProvider.lastChangedTags()));
+                latest));
 
         ResolveResult cur = latest;
         if (cur.collections().isEmpty()) {
-            // First open (or after a recipe reload): show a placeholder so the tab is
+            // First open, or after ResolveCache.clearAll: show a placeholder so the tab is
             // populated instantly while the background resolve runs.
             if (ClientCraftConfig.debugLogging) {
                 LOG.info("[CC] Tab: returning placeholder ({} collections)", allCrafting.size());
@@ -86,12 +111,12 @@ public final class ResolvePipeline {
     public static void submit(ResolveRequest r) {
         if (AutoCrafter.isRunning()) return;    // MK4's batchMode gate
         ResolveResult cur = latest;
-        if (cur.cacheKey() == r.cacheKey() && !cur.collections().isEmpty()) return;
+        if (cur.cacheKey() == r.cacheKey() && cur.modelGeneration() == r.modelGeneration() && !cur.collections().isEmpty()) return;
         if (!computing.compareAndSet(false, true)) {
             // Already computing: keep at most one queued request, and never queue a
             // duplicate of the in-flight request (the worker will publish its result).
             ResolveRequest p = pending.get();
-            if (p == null || p.cacheKey() != r.cacheKey()) {
+            if (p == null || p.cacheKey() != r.cacheKey() || p.modelGeneration() != r.modelGeneration()) {
                 pending.set(r);
             }
             return;
@@ -117,22 +142,20 @@ public final class ResolvePipeline {
             long t0 = debug ? System.nanoTime() : 0;
             CountEngine.Previous prev = null;
             ResolveResult p = r.previous();
-            if (p != null && p.snapshot() != null) {
+            // A different model means a full resolve: the previous counts don't apply.
+            if (p != null && p.snapshot() != null && p.modelGeneration() == r.modelGeneration()) {
                 prev = new CountEngine.Previous(p.counts(), p.containerCraftable(), p.snapshot(),
-                        ResolveRequest.gridSizeOf(p.cacheKey()));
+                        ResolveRequest.gridSizeOf(p.cacheKey()), p.tagState());
             }
-            var counts = CountEngine.compute(r.allCrafting(), r.gridSize(), r.snapshot(), r.modelGeneration(),
-                    prev, r.changedTags());
+            var counts = CountEngine.compute(r.allCrafting(), r.gridSize(), r.snapshot(), r.modelGeneration(), prev);
             if (counts.isEmpty()) {
                 // Stale (model advanced / no world) — the newer queued request will follow.
                 if (ClientCraftConfig.debugLogging) {
                     LOG.info("[CC] Resolve: result discarded (stale model or empty)");
                 }
-                // MK4's retry: re-run the callback so the tab re-submits against the
-                // fresh model even if no explicit refresh arrives.
+                // Re-render with the last published result; the next tab read picks up the fresh model.
                 RenderSync.run(() -> {
-                    Consumer<ResolveResult> cb = onPublished;
-                    if (cb != null) cb.accept(latest);
+                    notifyPublished(latest);
                     drainPending(-1);
                 });
                 posted = true;
@@ -148,31 +171,36 @@ public final class ResolvePipeline {
             // we just published is dropped instead of recomputed.
             RenderSync.run(() -> {
                 if (CraftModel.generation() != r.modelGeneration()) {
-                    // Recipes changed mid-compute: don't publish stale data; re-run the
-                    // callback so the tab re-submits against the fresh model (MK4's retry).
+                    // Recipes changed mid-compute: don't publish stale data; re-render with the
+                    // last published result.
                     if (ClientCraftConfig.debugLogging) {
                         LOG.info("[CC] Resolve: publish discarded (model generation advanced {} -> {})",
                                 r.modelGeneration(), CraftModel.generation());
                     }
-                    Consumer<ResolveResult> cb = onPublished;
-                    if (cb != null) cb.accept(latest);
+                    notifyPublished(latest);
                     drainPending(-1);
                     return;
                 }
                 latest = result;
-                Consumer<ResolveResult> cb = onPublished;
-                if (cb != null) cb.accept(result);
+                notifyPublished(result);
                 drainPending(r.cacheKey());
             });
             posted = true;
-        } catch (Exception e) {
-            LOG.error("[CC] Background resolve failed", e);
-            // Self-heal: re-run the callback so the tab re-submits instead of staying
-            // stuck on the placeholder.
+        } catch (Throwable t) {
+            LOG.error("[CC] Background resolve failed", t);
+            // Bounded retry: one full resolve (no incremental input, in case it caused the
+            // failure) per request key, then give up. The callback alone won't resubmit,
+            // because applyFilteredResults hits its memo, so the retry is explicit.
             RenderSync.run(() -> {
-                Consumer<ResolveResult> cb = onPublished;
-                if (cb != null) cb.accept(latest);
-                drainPending(-1);
+                notifyPublished(latest);
+                computing.set(false);
+                ResolveRequest next = pending.getAndSet(null);
+                if (next != null) {
+                    submit(next);
+                } else if (lastFailedKey != r.cacheKey()) {
+                    lastFailedKey = r.cacheKey();
+                    submit(r.withoutPrevious());
+                }
             });
             posted = true;
         } finally {
@@ -248,11 +276,6 @@ public final class ResolvePipeline {
         computing.set(false);
         pending.set(null);
         latest = ResolveResult.EMPTY;
-        onPublished = r -> {};
-    }
-
-    /** Clears the published result only (recipe reload). */
-    public static void resetLatest() {
-        latest = ResolveResult.EMPTY;
+        dropCallback();
     }
 }

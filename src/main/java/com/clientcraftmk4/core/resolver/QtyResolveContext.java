@@ -9,6 +9,7 @@ import com.clientcraftmk4.core.RecipeGraph;
 import com.clientcraftmk4.core.RecipeIndex;
 import com.clientcraftmk4.core.TagIndex;
 import com.clientcraftmk4.core.WorkMap;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.tags.TagKey;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
@@ -105,6 +106,13 @@ public final class QtyResolveContext {
         return o;
     }
 
+    /** When true, a deficit no single recipe covers may combine recipes one craft at a time. */
+    private boolean splitDeficits;
+
+    public void setSplitDeficits(boolean splitDeficits) {
+        this.splitDeficits = splitDeficits;
+    }
+
     public boolean resolveQty(RecipeDisplayEntry entry, WorkMap work, int qty,
                               List<RecipeDisplayId> stepsOut, Set<Item> inProgress,
                               int depth, Item rootOutput) {
@@ -182,6 +190,23 @@ public final class QtyResolveContext {
             }
             work.rollbackTo(mark);
         }
+        // No single recipe covers the deficit: combine them one craft at a time. Depth-limited
+        // like the tag fallback, because this runs on the failure path.
+        if (splitDeficits && depth <= 1 && deficit > 1 && subs.size() > 1) {
+            int id = graph.id(item);
+            int splitMark = work.mark();
+            int stepsStart = stepsOut != null ? stepsOut.size() : 0;
+            for (int u = 0; u < deficit; u++) {
+                if (work.get(id) > 0) {
+                    work.consume(id, 1);
+                } else if (!trySubCraftQty(item, 1, work, stepsOut, inProgress, depth, rootOutput)) {
+                    work.rollbackTo(splitMark);
+                    rollbackSteps(stepsOut, stepsStart);
+                    return false;
+                }
+            }
+            return true;
+        }
         return false;
     }
 
@@ -197,16 +222,17 @@ public final class QtyResolveContext {
             BitSet bits = tags.flatTagBits(tag);
             // Issue #8: drain the most abundant matching member first, so pool draws
             // leave scarce types for specific recipes that may still need them. Ties
-            // keep the deterministic id order (present is sorted by id).
+            // go to the lower registry id, so the working map's scan order is irrelevant.
             int need = deficit;
             while (need > 0) {
                 int best = -1, bestCount = 0;
                 for (int i = 0; i < work.presentSize(); i++) {
                     int pid = work.presentIdAt(i);
                     int count = work.get(pid);
-                    if (count <= bestCount) continue;
+                    if (count <= 0 || count < bestCount) continue;
                     Item it = f.idToItem()[pid];
                     if (it.equals(alreadyTried)) continue;
+                    if (count == bestCount && BuiltInRegistries.ITEM.getId(it) >= BuiltInRegistries.ITEM.getId(f.idToItem()[best])) continue;
                     boolean matches = bits != null ? bits.get(pid) : it.builtInRegistryHolder().is(tag);
                     if (matches) {
                         best = pid;
